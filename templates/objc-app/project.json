@@ -1,0 +1,9 @@
+{
+  "name": "ObjCExample",
+  "bundleIdentifier": "com.example.objcexample",
+  "deploymentTarget": "16.0",
+  "sources": ["Sources"],
+  "infoPlist": "Info.plist",
+  "entitlements": "Entitlements.plist",
+  "frameworks": ["UIKit", "Foundation"]
+}

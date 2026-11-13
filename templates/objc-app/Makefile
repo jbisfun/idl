@@ -12,7 +12,7 @@ OBJ := $(BUILD)/obj/main.o
 
 include $(ROOT)/mk/ios-toolchain.mk
 
-.PHONY: ipa app clean verify
+.PHONY: ipa app project clean verify
 
 $(OBJ): Sources/main.m
 	@mkdir -p $(@D) $(MODULE_CACHE)
@@ -43,5 +43,8 @@ ipa: app
 verify:
 	@$(PYTHON) $(ROOT)/tools/verify_ipa.py $(IPA) --bundle-id $(BUNDLE_ID)
 
+project:
+	@$(PYTHON) $(ROOT)/tools/pbxprojgen.py project.json
+
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) $(APP).xcodeproj

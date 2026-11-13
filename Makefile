@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help check test objc swift xtool examples clean
+.PHONY: help check test objc swift xtool projects examples clean
 
 help:
 	@printf '%s\n' \
@@ -10,6 +10,7 @@ help:
 	  'make objc      build the Objective-C example IPA' \
 	  'make swift     build the Swift example IPA' \
 	  'make xtool     build the xtool/SwiftPM example IPA' \
+	  'make projects  generate example .xcodeproj directories' \
 	  'make examples  build and validate all example IPAs' \
 	  'make clean     remove generated files'
 
@@ -30,7 +31,11 @@ xtool:
 	@python3 tools/verify_ipa.py templates/xtool-swiftpm/xtool/XtoolExample.ipa \
 	  --bundle-id com.example.xtoolapp --allow-unsigned
 
-examples: check test objc swift xtool
+projects:
+	@$(MAKE) -C templates/objc-app project
+	@$(MAKE) -C templates/swift-app project
+
+examples: check test objc swift xtool projects
 
 clean:
 	@$(MAKE) -C templates/objc-app clean

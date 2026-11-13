@@ -11,7 +11,7 @@ IPA := $(BUILD)/$(APP).ipa
 
 include $(ROOT)/mk/ios-toolchain.mk
 
-.PHONY: ipa app clean verify
+.PHONY: ipa app project clean verify
 
 $(APP_DIR)/$(APP): Sources/main.swift
 	@mkdir -p $(@D) $(MODULE_CACHE)
@@ -38,5 +38,8 @@ ipa: app
 verify:
 	@$(PYTHON) $(ROOT)/tools/verify_ipa.py $(IPA) --bundle-id $(BUNDLE_ID)
 
+project:
+	@$(PYTHON) $(ROOT)/tools/pbxprojgen.py project.json
+
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) $(APP).xcodeproj

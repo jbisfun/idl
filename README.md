@@ -12,6 +12,7 @@ Info.plist processing, ad-hoc signing, IPA packaging, and validation.
 - `templates/objc-app` — programmatic UIKit app built with Objective-C/ARC.
 - `templates/swift-app` — programmatic UIKit app built with Swift.
 - `templates/xtool-swiftpm` — minimal Objective-C UIKit app packaged as a SwiftPM project for `xtool dev`.
+- `tools/pbxprojgen.py` — deterministic `.xcodeproj/project.pbxproj` and shared scheme generator for single-target iOS apps.
 - `tools/plisttool.py` — expand Xcode-style `$(VAR)` values and edit plists;
   also converts `.xcstrings` catalogs into `.strings`/`.stringsdict` files.
 - `tools/verify_ipa.py` — checks ZIP integrity, bundle metadata, executable mode,
@@ -57,6 +58,43 @@ top of its Makefile:
     APP := MyApp
     BUNDLE_ID := com.example.myapp
     MIN_IOS := 16.0
+
+## Generate an Xcode project
+
+Create a `project.json` next to your sources:
+
+    {
+      "name": "MyApp",
+      "bundleIdentifier": "com.example.myapp",
+      "deploymentTarget": "16.0",
+      "sources": ["Sources"],
+      "resources": ["Resources"],
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist",
+      "frameworks": ["UIKit", "Foundation"],
+      "swiftVersion": "5.0"
+    }
+
+Then generate the project and shared scheme:
+
+    python3 tools/pbxprojgen.py path/to/project.json
+
+By default this writes `MyApp.xcodeproj` beside the manifest. Use `--output`
+to choose another path. IDs are derived from stable content keys, so running the
+generator twice produces the same project file instead of a noisy UUID diff.
+Source and resource directories are scanned recursively; asset catalogs and
+other Xcode package directories are kept as single resource references.
+
+The Objective-C and Swift templates include manifests:
+
+    make projects
+    make -C templates/objc-app project
+    make -C templates/swift-app project
+
+The current generator intentionally targets one iOS application target. It
+supports C, C++, Objective-C, Objective-C++, Swift, resources, system
+frameworks, Info.plist, entitlements, Debug/Release configurations, and a
+shared runnable scheme.
 
 ## xtool SwiftPM project
 
