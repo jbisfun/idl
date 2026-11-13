@@ -1,0 +1,4 @@
+version: 1
+bundleID: com.example.xtoolapp
+product: XtoolExample
+infoPath: xtool-support/Info.plist

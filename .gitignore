@@ -1,0 +1,11 @@
+build/
+.build/
+.bsp/
+.swiftpm/
+xtool/
+ModuleCache/
+__pycache__/
+*.py[cod]
+*.ipa
+*.app/
+.DS_Store
