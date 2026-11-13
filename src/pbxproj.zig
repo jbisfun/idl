@@ -10,7 +10,23 @@ const fsutil = @import("fsutil.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+pub const Profile = struct {
+    output_dir: []const u8,
+    sign: bool,
+    bundle_id: []const u8,
+    info_plist: []const u8,
+    entitlements: ?[]const u8,
+    opt: []const u8,
+    swift_opt: []const u8,
+    debug_symbols: bool,
+    defines: []const []const u8,
+    cflags: []const []const u8,
+    swiftflags: []const []const u8,
+    ldflags: []const []const u8,
+};
+
 pub const Manifest = struct {
+    profiles: ?[2]Profile = null,
     name: []const u8,
     bundle_id: []const u8,
     deployment_target: []const u8 = "16.0",
@@ -27,18 +43,18 @@ pub const Manifest = struct {
 };
 
 const file_types = [_]struct { []const u8, []const u8 }{
-    .{ ".c", "sourcecode.c.c" },          .{ ".cc", "sourcecode.cpp.cpp" },
-    .{ ".cpp", "sourcecode.cpp.cpp" },    .{ ".cxx", "sourcecode.cpp.cpp" },
-    .{ ".h", "sourcecode.c.h" },          .{ ".hpp", "sourcecode.cpp.h" },
-    .{ ".m", "sourcecode.c.objc" },       .{ ".mm", "sourcecode.cpp.objcpp" },
-    .{ ".swift", "sourcecode.swift" },    .{ ".s", "sourcecode.asm" },
-    .{ ".S", "sourcecode.asm" },          .{ ".plist", "text.plist.xml" },
-    .{ ".json", "text.json" },            .{ ".xcassets", "folder.assetcatalog" },
-    .{ ".xcstrings", "text.json.xcstrings" }, .{ ".storyboard", "file.storyboard" },
-    .{ ".xib", "file.xib" },              .{ ".strings", "text.plist.strings" },
+    .{ ".c", "sourcecode.c.c" },                   .{ ".cc", "sourcecode.cpp.cpp" },
+    .{ ".cpp", "sourcecode.cpp.cpp" },             .{ ".cxx", "sourcecode.cpp.cpp" },
+    .{ ".h", "sourcecode.c.h" },                   .{ ".hpp", "sourcecode.cpp.h" },
+    .{ ".m", "sourcecode.c.objc" },                .{ ".mm", "sourcecode.cpp.objcpp" },
+    .{ ".swift", "sourcecode.swift" },             .{ ".s", "sourcecode.asm" },
+    .{ ".S", "sourcecode.asm" },                   .{ ".plist", "text.plist.xml" },
+    .{ ".json", "text.json" },                     .{ ".xcassets", "folder.assetcatalog" },
+    .{ ".xcstrings", "text.json.xcstrings" },      .{ ".storyboard", "file.storyboard" },
+    .{ ".xib", "file.xib" },                       .{ ".strings", "text.plist.strings" },
     .{ ".stringsdict", "text.plist.stringsdict" }, .{ ".metal", "sourcecode.metal" },
-    .{ ".bundle", "wrapper.plug-in" },    .{ ".framework", "wrapper.framework" },
-    .{ ".xcdatamodeld", "wrapper.xcdatamodel" }, .{ ".mlmodelc", "folder.mlmodelc" },
+    .{ ".bundle", "wrapper.plug-in" },             .{ ".framework", "wrapper.framework" },
+    .{ ".xcdatamodeld", "wrapper.xcdatamodel" },   .{ ".mlmodelc", "folder.mlmodelc" },
 };
 
 pub fn fileType(path: []const u8) []const u8 {
@@ -351,27 +367,59 @@ pub const Generator = struct {
             break;
         };
         if (g.m.entitlements) |e| try target_common.append(.{ .key = "CODE_SIGN_ENTITLEMENTS", .value = .{ .str = try g.projectRelative(e) } });
-        const target_configs = try g.configurationList("target", try g.concat(target_common.items, &.{
-            .{ .key = "SWIFT_ACTIVE_COMPILATION_CONDITIONS", .value = .{ .str = "DEBUG $(inherited)" } },
-            .{ .key = "SWIFT_OPTIMIZATION_LEVEL", .value = .{ .str = "-Onone" } },
-        }), try g.concat(target_common.items, &.{
-            .{ .key = "SWIFT_OPTIMIZATION_LEVEL", .value = .{ .str = "-O" } },
-        }));
+        const target_configs = if (g.m.profiles) |profiles|
+            try g.configurationList("target", try g.profileSettings(target_common.items, profiles[0]), try g.profileSettings(target_common.items, profiles[1]))
+        else
+            try g.configurationList("target", try g.concat(target_common.items, &.{
+                .{ .key = "SWIFT_ACTIVE_COMPILATION_CONDITIONS", .value = .{ .str = "DEBUG $(inherited)" } },
+                .{ .key = "SWIFT_OPTIMIZATION_LEVEL", .value = .{ .str = "-Onone" } },
+            }), try g.concat(target_common.items, &.{
+                .{ .key = "SWIFT_OPTIMIZATION_LEVEL", .value = .{ .str = "-O" } },
+            }));
 
-        const target_body = try std.fmt.allocPrint(a,
+        const target_body = try std.fmt.allocPrint(
+            a,
             "{{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {s};\n\t\t\tbuildPhases = (\n\t\t\t\t{s},\n\t\t\t\t{s},\n\t\t\t\t{s},\n\t\t\t);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = {s};\n\t\t\tproductName = {s};\n\t\t\tproductReference = {s};\n\t\t\tproductType = \"com.apple.product-type.application\";\n\t\t}}",
             .{ try g.ref(target_configs), try g.ref(sources_phase), try g.ref(frameworks_phase), try g.ref(resources_phase), try quote(a, g.m.name), try quote(a, g.m.name), try g.ref(product_ref) },
         );
         try g.objects[@intFromEnum(Section.PBXNativeTarget)].append(a, .{ .id = g.target_id, .comment = g.m.name, .body = target_body });
         try g.comments.put(a, g.target_id, g.m.name);
 
-        const project_body = try std.fmt.allocPrint(a,
+        const project_body = try std.fmt.allocPrint(
+            a,
             "{{\n\t\t\tisa = PBXProject;\n\t\t\tattributes = {{\n\t\t\t\tBuildIndependentTargetsInParallel = 1;\n\t\t\t\tLastSwiftUpdateCheck = 1600;\n\t\t\t\tLastUpgradeCheck = 1600;\n\t\t\t}};\n\t\t\tbuildConfigurationList = {s};\n\t\t\tcompatibilityVersion = \"Xcode 14.0\";\n\t\t\tdevelopmentRegion = en;\n\t\t\thasScannedForEncodings = 0;\n\t\t\tknownRegions = (en, Base);\n\t\t\tmainGroup = {s};\n\t\t\tproductRefGroup = {s};\n\t\t\tprojectDirPath = \"\";\n\t\t\tprojectRoot = \"\";\n\t\t\ttargets = (\n\t\t\t\t{s} /* {s} */ ,\n\t\t\t);\n\t\t}}",
             .{ try g.ref(project_configs), try g.ref(main_group), try g.ref(products_group), g.target_id, g.m.name },
         );
         try g.objects[@intFromEnum(Section.PBXProject)].append(a, .{ .id = g.project_id, .comment = "Project object", .body = project_body });
         try g.comments.put(a, g.project_id, "Project object");
         return g.render();
+    }
+
+    fn profileSettings(g: *Generator, common: []const Setting, p: Profile) ![]Setting {
+        var out = std.StringArrayHashMap(@TypeOf(@as(Setting, undefined).value)).init(g.a);
+        for (common) |v| try out.put(v.key, v.value);
+        try out.put("PRODUCT_BUNDLE_IDENTIFIER", .{ .str = p.bundle_id });
+        try out.put("CONFIGURATION_BUILD_DIR", .{ .str = try std.fmt.allocPrint(g.a, "$(SRCROOT)/{s}", .{p.output_dir}) });
+        try out.put("CODE_SIGNING_ALLOWED", .{ .str = if (p.sign) "YES" else "NO" });
+        try out.put("INFOPLIST_FILE", .{ .str = try g.projectRelative(p.info_plist) });
+        _ = out.swapRemove("CODE_SIGN_ENTITLEMENTS");
+        if (p.entitlements) |e| try out.put("CODE_SIGN_ENTITLEMENTS", .{ .str = try g.projectRelative(e) });
+        try out.put("GCC_OPTIMIZATION_LEVEL", .{ .str = if (std.mem.startsWith(u8, p.opt, "-O")) p.opt[2..] else "s" });
+        try out.put("SWIFT_OPTIMIZATION_LEVEL", .{ .str = p.swift_opt });
+        try out.put("DEBUG_INFORMATION_FORMAT", .{ .str = "dwarf" });
+        try out.put("GCC_GENERATE_DEBUGGING_SYMBOLS", .{ .str = if (p.debug_symbols) "YES" else "NO" });
+        try out.put("GCC_PREPROCESSOR_DEFINITIONS", .{ .list = p.defines });
+        var conditions = std.ArrayList([]const u8).init(g.a);
+        for (p.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try conditions.append(d);
+        try out.put("SWIFT_ACTIVE_COMPILATION_CONDITIONS", .{ .list = conditions.items });
+        try out.put("OTHER_CFLAGS", .{ .list = p.cflags });
+        try out.put("OTHER_SWIFT_FLAGS", .{ .list = p.swiftflags });
+        var link_flags = std.ArrayList([]const u8).init(g.a);
+        for (p.ldflags) |f| try link_flags.appendSlice(&.{ "-Xlinker", f });
+        try out.put("OTHER_LDFLAGS", .{ .list = link_flags.items });
+        const result = try g.a.alloc(Setting, out.count());
+        for (out.keys(), out.values(), result) |k, v, *item| item.* = .{ .key = k, .value = v };
+        return result;
     }
 
     fn render(g: *Generator) ![]const u8 {
@@ -578,11 +626,11 @@ test "deterministic project with sources, resources and frameworks" {
     const second = try f.read("GeneratedApp.xcodeproj/project.pbxproj");
     try testing.expectEqualStrings(first, second);
     for ([_][]const u8{
-        "isa = PBXProject;",                                                "productType = \"com.apple.product-type.application\";",
-        "PRODUCT_BUNDLE_IDENTIFIER = com.example.generated;",               "IPHONEOS_DEPLOYMENT_TARGET = 16.0;",
-        "main.swift in Sources",                                            "Helper.m in Sources",
-        "data.json in Resources",                                           "UIKit.framework in Frameworks",
-        "Foundation.framework in Frameworks",                               "\"$(inherited)\",",
+        "isa = PBXProject;",                                  "productType = \"com.apple.product-type.application\";",
+        "PRODUCT_BUNDLE_IDENTIFIER = com.example.generated;", "IPHONEOS_DEPLOYMENT_TARGET = 16.0;",
+        "main.swift in Sources",                              "Helper.m in Sources",
+        "data.json in Resources",                             "UIKit.framework in Frameworks",
+        "Foundation.framework in Frameworks",                 "\"$(inherited)\",",
         "PRODUCT_NAME = \"$(TARGET_NAME)\";",
     }) |needle| try testing.expect(contains(first, needle));
     try testing.expect(!contains(first, "Helper.h in Sources"));

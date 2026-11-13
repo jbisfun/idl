@@ -8,11 +8,55 @@ All commands accept `--help`, e.g. `idl build --help`.
     idl build MyApp -j 8   # one target, 8 parallel compile jobs
     idl -v build           # print every command (or: idl build -v)
 
-C-family objects are reused when the source, every header listed in clang's
-`.d` dependency file, and the exact compile command are unchanged (the
-command is stored in `<object>.cmd`). Linking reruns only when an input or the
-link command changed. The app bundle is assembled from scratch every time, so
-deleted resources never stay behind. Signing and packaging always run again.
+C-family objects reuse clang's `.d` header dependencies, input mtimes and a
+command/tool-version fingerprint in `<object>.cmd`. Linking reruns when its
+inputs or command/tool fingerprint change.
+
+For direct targets, compiled resources use SHA-256 content fingerprints,
+including directory membership, deployment target, strictness, idl and external
+resource compiler identities. Same-size edits with preserved mtimes, additions,
+deletions and changed compiler versions invalidate the cache. Cached output
+content is checked too: missing or corrupted files are rebuilt.
+
+If the executable, resource outputs, generated metadata, entitlements and signer
+are unchanged, the bundle, signature and IPA are reused. Otherwise a new payload
+is assembled in `Payload.partial`, signed and packaged; deleted resources cannot
+linger. `idl build -v` reports cache hits. `idl clean MyApp -c debug` clears that
+profile's artifacts/cache. Old content-addressed resource entries remain until
+cleaned. xtool still manages its own incremental build and packaging.
+
+## Strict preflight and build profiles
+
+    idl check --strict -c release MyApp  # tools + inputs + resources, no app compile
+    idl build --strict -c debug MyApp
+    idl build --strict -c release --gen
+    idl install "JPs iPhone" -c debug MyApp
+    idl gen -c debug MyApp
+
+Before compiling any application source, idl checks tools for *all selected
+targets*, executes compiler/helper version probes (including `idl-actool`, so
+missing shared-runtime libraries are caught), processes metadata, prepares
+resources and checks their complete bundle-output plan. A bad later target
+therefore cannot cause an earlier target to be compiled first. Resource
+preparation may run resource compilers and populate caches during `idl check`.
+Nothing is installed or downloaded.
+
+`--strict` (or `strict: true` in YAML) rejects unsupported IB elements/attributes,
+unresolved references and compiler warnings; unsupported Core Data, Metal and
+Core ML inputs; and unsupported asset package types. Missing storyboard/nib
+resources (including scene-manifest references), duplicate generated/raw outputs,
+reserved-output collisions and inconsistent bundle identities always fail.
+Permissive mode diagnoses unsupported inputs instead of silently ignoring them.
+Strictness does not certify UIKit runtime compatibility or eliminate documented
+safe-area/color approximations.
+
+Builds, preflight, project generation and clean hold a nonblocking OS lock at
+`<target>/.idl/build.lock`. Conflicts fail with a `build directory busy` message;
+there is no stale PID file to remove. The lock is per target directory, across
+profiles, because xtool and generated project files share paths. Do not delete
+`.idl/` while an operation is running. Different target directories can build
+concurrently. See [configuration](configuration.md#configurations) for profile
+merging and output paths.
 
 ## Regenerate project files
 

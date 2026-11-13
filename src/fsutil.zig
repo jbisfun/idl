@@ -8,7 +8,7 @@ const posix = std.posix;
 
 pub const source_extensions = [_][]const u8{ ".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".swift", ".s", ".S", ".metal" };
 /// Directories that Xcode treats as a single opaque file.
-pub const package_extensions = [_][]const u8{ ".xcassets", ".bundle", ".framework", ".xcdatamodeld", ".mlmodelc" };
+pub const package_extensions = [_][]const u8{ ".xcassets", ".bundle", ".framework", ".storyboardc", ".nib", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".mlmodelc", ".mlpackage" };
 
 pub fn oneOf(value: []const u8, comptime set: []const []const u8) bool {
     inline for (set) |s| if (std.mem.eql(u8, value, s)) return true;

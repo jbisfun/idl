@@ -34,8 +34,8 @@ fn report(path: []const u8, changed: bool) void {
 pub fn xtoolYml(a: Allocator, t: Target) ![]const u8 {
     var b = std.ArrayList(u8).init(a);
     const w = b.writer();
-    try w.print("# " ++ marker ++ "; edit idlproj.yml instead.\nversion: 1\nbundleID: {s}\nproduct: {s}\ninfoPath: {s}\n", .{ t.bundle_id, t.name, ".idl/Info.plist" });
-    if (t.entitlements != null or t.entitlement_values != null) try w.writeAll("entitlementsPath: .idl/Entitlements.plist\n");
+    try w.print("# " ++ marker ++ "; edit idlproj.yml instead.\nversion: 1\nbundleID: {s}\nproduct: {s}\ninfoPath: {s}\n", .{ t.bundle_id, t.name, t.infoPath() });
+    if (t.entitlementsPath()) |e| try w.print("entitlementsPath: {s}\n", .{e});
     return b.items;
 }
 
@@ -100,6 +100,8 @@ pub fn packageSwift(a: Allocator, t: Target) ![]const u8 {
         var settings = std.ArrayList([]const u8).init(a);
         var flags = std.ArrayList([]const u8).init(a);
         if (has_objc) try flags.append("-fobjc-arc");
+        try flags.append(t.opt);
+        if (t.debug_symbols) try flags.append("-g");
         try flags.appendSlice(t.cflags);
         if (flags.items.len > 0) {
             var fb = std.ArrayList(u8).init(a);
@@ -126,14 +128,19 @@ pub fn packageSwift(a: Allocator, t: Target) ![]const u8 {
         for (t.defines) |d| {
             var db = std.ArrayList(u8).init(a);
             try db.appendSlice(".define(");
+            if (std.mem.indexOfScalar(u8, d, '=') != null) continue;
             try swiftString(db.writer(), d);
             try db.append(')');
             try settings.append(db.items);
         }
-        if (t.swiftflags.len > 0) {
+        var swift_flags = std.ArrayList([]const u8).init(a);
+        try swift_flags.append(t.swift_opt);
+        if (t.debug_symbols) try swift_flags.append("-g");
+        try swift_flags.appendSlice(t.swiftflags);
+        if (swift_flags.items.len > 0) {
             var fb = std.ArrayList(u8).init(a);
             try fb.appendSlice(".unsafeFlags(");
-            try swiftStringList(fb.writer(), t.swiftflags);
+            try swiftStringList(fb.writer(), swift_flags.items);
             try fb.append(')');
             try settings.append(fb.items);
         }
@@ -228,16 +235,21 @@ pub const Options = struct {
 };
 
 /// Both project formats consume the same expanded metadata as direct builds.
+pub fn genXcodeMetadata(a: Allocator, t: Target) !void {
+    if (t.profile == null or t.variants == null) try genMetadata(a, t);
+    if (t.variants) |variants| for (variants) |v| try genMetadata(a, v);
+}
+
 pub fn genMetadata(a: Allocator, t: Target) !void {
     var env = try std.process.getEnvMap(a);
-    const path = try t.path(a, ".idl/Info.plist");
+    const path = try t.path(a, t.infoPath());
     const xml = try metadata.processInfoPlist(a, t, &env, null);
     const tagged = try std.mem.replaceOwned(u8, a, xml, "<plist", "<!-- " ++ marker ++ "; edit YAML instead. -->\n<plist");
-    try fsutil.rejectSymlinkComponents(a, t.dir, ".idl/Info.plist");
+    try fsutil.rejectSymlinkComponents(a, t.dir, t.infoPath());
     report(path, try writeGenerated(a, path, tagged));
     if (try metadata.entitlements(a, t, &env)) |ent| {
-        const ep = try t.path(a, ".idl/Entitlements.plist");
-        try fsutil.rejectSymlinkComponents(a, t.dir, ".idl/Entitlements.plist");
+        const ep = try t.path(a, t.entitlementsPath().?);
+        try fsutil.rejectSymlinkComponents(a, t.dir, t.entitlementsPath().?);
         const et = try std.mem.replaceOwned(u8, a, ent, "<plist", "<!-- " ++ marker ++ "; edit YAML instead. -->\n<plist");
         report(ep, try writeGenerated(a, ep, et));
     }
@@ -246,7 +258,7 @@ pub fn genMetadata(a: Allocator, t: Target) !void {
 pub fn generate(a: Allocator, tc: *const Toolchain, t: Target, opts: Options) !void {
     if (t.builder == .xtool) try genXtool(a, t);
     if (opts.xcodeproj and t.xcodeproj) {
-        try genMetadata(a, t);
+        try genXcodeMetadata(a, t);
         const out = try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
         report(try pbxproj.generateProject(a, t.manifest(), t.dir, out), true);
     }
@@ -289,7 +301,7 @@ test "Package.swift for an Objective-C xtool target" {
         \\            name: "App",
         \\            path: "Sources/App",
         \\            publicHeadersPath: "include",
-        \\            cSettings: [.unsafeFlags(["-fobjc-arc"])],
+        \\            cSettings: [.unsafeFlags(["-fobjc-arc", "-Os"])],
         \\            linkerSettings: [.linkedFramework("UIKit")]
         \\        ),
         \\    ]
@@ -321,7 +333,7 @@ test "project metadata is emitted from YAML without input plists" {
     const t = cfg.targets[0];
     try genMetadata(a, t);
     try genMetadata(a, t); // deterministic and accepts its own marker
-    const p = try @import("plist.zig").readFile(a, try t.path(a, ".idl/Info.plist"));
+    const p = try @import("plist.zig").readFile(a, try t.path(a, t.infoPath()));
     defer p.deinit();
     try std.testing.expectEqualStrings("Main", (try p.getString(a, "UIMainStoryboardFile")).?);
     try std.testing.expect(try p.get(a, "UILaunchScreen") == null);

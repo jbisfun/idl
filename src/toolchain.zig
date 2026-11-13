@@ -22,6 +22,7 @@ pub const Toolchain = struct {
     cc: ?[]const u8,
     cxx: ?[]const u8,
     swiftc: ?[]const u8,
+    identities: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn init(a: Allocator, cfg: config.ToolchainConfig, root: []const u8) !Toolchain {
         var env = try std.process.getEnvMap(a);
@@ -85,8 +86,8 @@ pub const Toolchain = struct {
     pub fn langOf(path: []const u8) ?Lang {
         const sfx = fsutil.suffix(path);
         const table = [_]struct { []const u8, Lang }{
-            .{ ".c", .c },     .{ ".m", .objc },   .{ ".mm", .objcxx }, .{ ".cc", .cxx },
-            .{ ".cpp", .cxx }, .{ ".cxx", .cxx },  .{ ".s", .asm_ },    .{ ".S", .asm_ },
+            .{ ".c", .c },         .{ ".m", .objc },  .{ ".mm", .objcxx }, .{ ".cc", .cxx },
+            .{ ".cpp", .cxx },     .{ ".cxx", .cxx }, .{ ".s", .asm_ },    .{ ".S", .asm_ },
             .{ ".swift", .swift },
         };
         for (table) |e| if (std.mem.eql(u8, e[0], sfx)) return e[1];
@@ -96,7 +97,7 @@ pub const Toolchain = struct {
     /// clang flags for one C-family source (without -c/-o).
     pub fn cflags(t: *const Toolchain, target: config.Target, lang: Lang, module_cache: []const u8) ![]const []const u8 {
         var f = std.ArrayList([]const u8).init(t.a);
-        try f.appendSlice(&.{ "-target", try t.triple(target), "-isysroot", t.sdk.?, target.opt, "-g0", "-fmodules", try std.fmt.allocPrint(t.a, "-fmodules-cache-path={s}", .{module_cache}), "-fno-common", "-MMD", "-MP" });
+        try f.appendSlice(&.{ "-target", try t.triple(target), "-isysroot", t.sdk.?, target.opt, if (target.debug_symbols) "-g" else "-g0", "-fmodules", try std.fmt.allocPrint(t.a, "-fmodules-cache-path={s}", .{module_cache}), "-fno-common", "-MMD", "-MP" });
         switch (lang) {
             .objc => try f.appendSlice(&.{ "-fobjc-arc", "-fobjc-weak", "-std=gnu17" }),
             .cxx => try f.appendSlice(&.{ "-std=gnu++20", "-stdlib=libc++" }),
@@ -112,12 +113,13 @@ pub const Toolchain = struct {
     pub fn swiftflags(t: *const Toolchain, target: config.Target, module_cache: []const u8) ![]const []const u8 {
         var f = std.ArrayList([]const u8).init(t.a);
         try f.appendSlice(&.{
-            "-target",            try t.triple(target), "-sdk",          t.sdk.?,
-            "-resource-dir",      t.swift_resource_dir, "-I",            t.platform_lib_dir,
-            "-L",                 t.platform_lib_dir,   "-module-cache-path", module_cache,
-            target.swift_opt,     "-wmo",               "-suppress-warnings", "-module-name",
+            "-target",        try t.triple(target), "-sdk",               t.sdk.?,
+            "-resource-dir",  t.swift_resource_dir, "-I",                 t.platform_lib_dir,
+            "-L",             t.platform_lib_dir,   "-module-cache-path", module_cache,
+            target.swift_opt, "-wmo",               "-suppress-warnings", "-module-name",
             target.name,
         });
+        if (target.debug_symbols) try f.append("-g");
         if (target.bridging_header) |h| try f.appendSlice(&.{ "-import-objc-header", try target.path(t.a, h) });
         for (target.include_dirs) |inc| try f.appendSlice(&.{ "-I", try target.path(t.a, inc) });
         // Swift conditions are flags only; NAME=VALUE defines apply to C-family code.
@@ -140,9 +142,8 @@ pub const Toolchain = struct {
     pub fn clangLink(t: *const Toolchain, target: config.Target, objects: []const []const u8, out: []const u8, need_cxx: bool) ![]const []const u8 {
         var f = std.ArrayList([]const u8).init(t.a);
         try f.appendSlice(&.{
-            t.cc.?,                                 "-target",                        try t.triple(target), "-isysroot", t.sdk.?,
-            "-fuse-ld=lld",                         try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}),
-            "-Wl,-dead_strip",                      "-Wl,-headerpad_max_install_names", t.clang_rt.?,
+            t.cc.?,         "-target",                                               try t.triple(target), "-isysroot",                        t.sdk.?,
+            "-fuse-ld=lld", try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}), "-Wl,-dead_strip",    "-Wl,-headerpad_max_install_names", t.clang_rt.?,
         });
         try f.appendSlice(objects);
         try f.appendSlice(&.{ "-o", out });
@@ -155,16 +156,49 @@ pub const Toolchain = struct {
         try f.append(t.swiftc.?);
         try f.appendSlice(try t.swiftflags(target, module_cache));
         try f.appendSlice(&.{
-            "-use-ld=lld",   try std.fmt.allocPrint(t.a, "-ld-path={s}", .{t.ld64}),
-            "-Xlinker",      "-dead_strip",
-            "-Xlinker",      "-headerpad_max_install_names",
-            "-Xlinker",      t.clang_rt.?,
+            "-use-ld=lld", try std.fmt.allocPrint(t.a, "-ld-path={s}", .{t.ld64}),
+            "-Xlinker",    "-dead_strip",
+            "-Xlinker",    "-headerpad_max_install_names",
+            "-Xlinker",    t.clang_rt.?,
         });
         try f.appendSlice(swift_sources);
         try f.appendSlice(objects);
         try f.appendSlice(&.{ "-o", out });
         try t.linkInputs(&f, target, need_cxx);
         return f.items;
+    }
+
+    /// Probe once per invocation. The identity includes version output and
+    /// executable bytes, not just the configured path (swiftly uses proxies).
+    pub fn identity(t: *Toolchain, path: []const u8, probe: bool) ![]const u8 {
+        return t.identityWithArg(path, if (probe) "--version" else null);
+    }
+
+    pub fn signerIdentity(t: *Toolchain) ![]const u8 {
+        return t.identityWithArg(try t.ldid(), "-h");
+    }
+
+    fn identityWithArg(t: *Toolchain, path: []const u8, probe_arg: ?[]const u8) ![]const u8 {
+        if (t.identities.get(path)) |id| return id;
+        const resolved = std.fs.cwd().realpathAlloc(t.a, path) catch return diag.fail("missing tool: {s}", .{path});
+        var f: @import("buildstate.zig").Fingerprint = .{};
+        f.add(path);
+        f.add(try @import("buildstate.zig").treeDigest(t.a, resolved));
+        if (probe_arg) |arg| {
+            const result = std.process.Child.run(.{ .allocator = t.a, .argv = &.{ path, arg }, .env_map = &t.env, .max_output_bytes = 1 << 20 }) catch |err|
+                return diag.fail("cannot execute {s}: {s}", .{ path, @errorName(err) });
+            if (result.term != .Exited or result.term.Exited != 0)
+                return diag.fail("{s} {s} failed; check the executable and shared runtime: {s}", .{ path, arg, result.stderr });
+            f.add(result.stdout);
+            f.add(result.stderr);
+        }
+        const id = try f.finish(t.a);
+        try t.identities.put(t.a, path, id);
+        return id;
+    }
+
+    pub fn selfIdentity(t: *Toolchain) ![]const u8 {
+        return t.identity(try std.fs.selfExePathAlloc(t.a), false);
     }
 
     // ------------------------------------------------------------- ldid

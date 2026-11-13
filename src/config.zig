@@ -42,6 +42,12 @@ pub const Target = struct {
     min_ios: []const u8 = "16.0",
     arch: []const u8 = "arm64",
     opt: []const u8 = "-Os",
+    debug_symbols: bool = false,
+    strict: bool = false,
+    /// Selected profile; null preserves the unprofiled legacy output paths.
+    profile: ?[]const u8 = null,
+    variants: ?*const [2]Target = null,
+    configurations: ?ynode.Map = null,
     swift_opt: []const u8 = "-O",
     build_dir: []const u8 = "build",
     version: []const u8 = "1.0",
@@ -75,6 +81,21 @@ pub const Target = struct {
     configuration: []const u8 = "release",
     package_swift: bool = true,
 
+    pub fn infoPath(t: Target) []const u8 {
+        if (t.profile) |p| return if (std.mem.eql(u8, p, "debug")) ".idl/debug/Info.plist" else ".idl/release/Info.plist";
+        return ".idl/Info.plist";
+    }
+
+    pub fn entitlementsPath(t: Target) ?[]const u8 {
+        if (t.entitlements == null and t.entitlement_values == null) return null;
+        if (t.profile) |p| return if (std.mem.eql(u8, p, "debug")) ".idl/debug/Entitlements.plist" else ".idl/release/Entitlements.plist";
+        return ".idl/Entitlements.plist";
+    }
+
+    fn pbxProfile(t: Target) pbxproj.Profile {
+        return .{ .bundle_id = t.bundle_id, .info_plist = t.infoPath(), .entitlements = t.entitlementsPath(), .opt = t.opt, .swift_opt = t.swift_opt, .debug_symbols = t.debug_symbols, .defines = t.defines, .cflags = t.cflags, .swiftflags = t.swiftflags, .ldflags = t.ldflags, .output_dir = t.build_dir, .sign = t.signs() };
+    }
+
     pub fn manifest(t: Target) pbxproj.Manifest {
         return .{
             .name = t.name,
@@ -85,8 +106,9 @@ pub const Target = struct {
             .swift_version = t.swift_version,
             .device_family = t.device_family,
             .app_icon = t.app_icon,
-            .info_plist = ".idl/Info.plist",
-            .entitlements = if (t.entitlements != null or t.entitlement_values != null) ".idl/Entitlements.plist" else null,
+            .info_plist = t.infoPath(),
+            .entitlements = t.entitlementsPath(),
+            .profiles = if (t.variants) |v| .{ v[0].pbxProfile(), v[1].pbxProfile() } else null,
             .frameworks = t.frameworks,
             .sources = t.sources,
             .resources = t.resources,
@@ -108,7 +130,7 @@ pub const Target = struct {
     pub fn ipaPath(t: Target, a: Allocator) ![]const u8 {
         return switch (t.builder) {
             .direct => std.fmt.allocPrint(a, "{s}/{s}.ipa", .{ try t.buildPath(a), t.name }),
-            .xtool => std.fmt.allocPrint(a, "{s}/xtool/{s}.ipa", .{ t.dir, t.name }),
+            .xtool => if (t.profile != null) std.fmt.allocPrint(a, "{s}/{s}.ipa", .{ try t.buildPath(a), t.name }) else std.fmt.allocPrint(a, "{s}/xtool/{s}.ipa", .{ t.dir, t.name }),
         };
     }
 };
@@ -151,16 +173,23 @@ pub fn find(a: Allocator, start: []const u8) ![]const u8 {
 // ---------------------------------------------------------------- loading
 
 const target_keys = [_][]const u8{
-    "name",          "dir",              "builder",       "bundle_id",       "min_ios",         "arch",
-    "opt",           "swift_opt",        "build_dir",     "version",         "build_number",    "swift_version",
-    "device_family", "app_icon",         "sources",       "resources",       "info_plist",      "info",
-    "plist_vars",    "entitlements",     "frameworks",    "weak_frameworks", "libraries",       "defines",
-    "include_dirs",  "cflags",           "swiftflags",    "ldflags",         "bridging_header", "sign",
-    "xcodeproj",     "compile_commands", "configuration", "package_swift",
+    "debug_symbols",   "strict",           "configurations",
+    "name",            "dir",              "builder",
+    "bundle_id",       "min_ios",          "arch",
+    "opt",             "swift_opt",        "build_dir",
+    "version",         "build_number",     "swift_version",
+    "device_family",   "app_icon",         "sources",
+    "resources",       "info_plist",       "info",
+    "plist_vars",      "entitlements",     "frameworks",
+    "weak_frameworks", "libraries",        "defines",
+    "include_dirs",    "cflags",           "swiftflags",
+    "ldflags",         "bridging_header",  "sign",
+    "xcodeproj",       "compile_commands", "configuration",
+    "package_swift",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
 const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
-const top_keys = [_][]const u8{ "toolchain", "defaults", "targets" };
+const top_keys = [_][]const u8{ "toolchain", "defaults", "targets", "configurations" };
 
 fn checkKeys(m: ynode.Map, allowed: []const []const u8, where: []const u8) !void {
     outer: for (m.keys) |k| {
@@ -275,7 +304,7 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     };
 
     inline for (std.meta.fields(Target)) |field| {
-        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id"))) continue;
+        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants"))) continue;
         const value = m.get(field.name) orelse if (defaults) |d| d.get(field.name) else null;
         if (value) |v| {
             if (comptime std.mem.eql(u8, field.name, "entitlements")) {
@@ -316,6 +345,75 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
 }
 
 pub fn parse(a: Allocator, source: []const u8, path: []const u8) !Config {
+    return parseConfiguration(a, source, path, null);
+}
+
+/// Maps merge recursively, sequences replace, null explicitly clears a value.
+fn merge(a: Allocator, base: ynode.Map, overlay: ynode.Map) anyerror!ynode.Map {
+    var result = std.StringArrayHashMap(Node).init(a);
+    for (base.keys, base.values) |k, v| try result.put(k, v);
+    for (overlay.keys, overlay.values) |k, v| {
+        var value = v;
+        if (result.get(k)) |old| if (old == .map and v == .map) {
+            value = .{ .map = try merge(a, old.map, v.map) };
+        };
+        try result.put(k, value);
+    }
+    return .{ .keys = result.keys(), .values = result.values() };
+}
+
+const empty_map: ynode.Map = .{ .keys = &.{}, .values = &.{} };
+
+fn configurationMap(a: Allocator, node: ?Node, where: []const u8) !ynode.Map {
+    const c: Ctx = .{ .a = a, .where = where };
+    const m = (try c.map(node orelse .null, "configurations")) orelse return empty_map;
+    try checkKeys(m, &.{ "debug", "release" }, where);
+    for (m.keys, m.values) |k, v| {
+        const settings = (try c.map(v, k)) orelse return diag.fail("{s}.{s} must be a mapping", .{ where, k });
+        try checkKeys(settings, &.{ "bundle_id", "opt", "swift_opt", "debug_symbols", "defines", "info", "entitlements", "plist_vars", "build_dir", "cflags", "swiftflags", "ldflags", "strict", "sign" }, where);
+        for ([_][]const u8{ "name", "dir", "builder", "configurations", "configuration" }) |reserved|
+            if (settings.get(reserved) != null) return diag.fail("{s}: '{s}' is not a profile override", .{ where, reserved });
+    }
+    return m;
+}
+
+fn profileTarget(a: Allocator, root: []const u8, index: usize, base: ynode.Map, global: ynode.Map, name: []const u8) !Target {
+    const builtin_source = if (std.mem.eql(u8, name, "debug"))
+        "opt: -O0\nswift_opt: -Onone\ndebug_symbols: true\n"
+    else
+        "opt: -Os\nswift_opt: -O\ndebug_symbols: false\n";
+    var settings = try merge(a, base, (try ynode.parse(a, builtin_source, "builtin profile")).map);
+    // Disable a YAML debug entitlement in release without manufacturing an
+    // entitlement file for applications that requested no capabilities.
+    if (std.mem.eql(u8, name, "release")) {
+        if (base.get("entitlements")) |v| if (v == .map and v.map.get("get-task-allow") != null) {
+            const overrides = (try ynode.parse(a, "entitlements:\n  get-task-allow: false\n", "release entitlements")).map;
+            settings = try merge(a, settings, overrides);
+        };
+    }
+    if (global.get(name)) |v| settings = try merge(a, settings, v.map);
+    const local = try configurationMap(a, base.get("configurations"), "target configurations");
+    if (local.get(name)) |v| settings = try merge(a, settings, v.map);
+    var t = try loadTarget(a, root, index, .{ .map = settings }, null);
+    t.profile = name;
+    t.configuration = name;
+    t.build_dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ t.build_dir, name });
+    if (std.mem.eql(u8, name, "debug")) {
+        var flags = std.ArrayList([]const u8).init(a);
+        try flags.appendSlice(t.defines);
+        var has_debug = false;
+        for (t.defines) |d| if (std.mem.eql(u8, d, "DEBUG")) {
+            has_debug = true;
+        };
+        if (!has_debug) try flags.append("DEBUG");
+        t.defines = flags.items;
+    }
+    return t;
+}
+
+pub fn parseConfiguration(a: Allocator, source: []const u8, path: []const u8, profile: ?[]const u8) !Config {
+    if (profile) |name| if (!fsutil.oneOf(name, &.{ "debug", "release" }))
+        return diag.fail("unknown configuration '{s}'; expected debug or release", .{name});
     const root_node = try ynode.parse(a, source, path);
     const top = switch (root_node) {
         .map => |m| m,
@@ -346,6 +444,7 @@ pub fn parse(a: Allocator, source: []const u8, path: []const u8) !Config {
         for (default_forbidden) |k| if (d.get(k) != null) return diag.fail("defaults: '{s}' must be set per target", .{k});
     }
 
+    const global_profiles = try configurationMap(a, top.get("configurations"), "configurations");
     const targets_node = top.get("targets") orelse return diag.fail("{s}: 'targets' is required", .{path});
     const items = switch (targets_node) {
         .list => |l| l,
@@ -354,7 +453,13 @@ pub fn parse(a: Allocator, source: []const u8, path: []const u8) !Config {
     if (items.len == 0) return diag.fail("{s}: 'targets' must not be empty", .{path});
     const targets = try a.alloc(Target, items.len);
     for (items, targets, 0..) |item, *t, i| {
-        t.* = try loadTarget(a, root, i, item, defaults);
+        if (item != .map) return diag.fail("targets[{d}] must be a mapping", .{i});
+        const base = try merge(a, defaults orelse empty_map, item.map);
+        const variants = try a.create([2]Target);
+        variants[0] = try profileTarget(a, root, i, base, global_profiles, "debug");
+        variants[1] = try profileTarget(a, root, i, base, global_profiles, "release");
+        t.* = if (profile) |name| variants[if (std.mem.eql(u8, name, "debug")) @as(usize, 0) else 1] else try loadTarget(a, root, i, .{ .map = base }, null);
+        t.variants = variants;
         for (targets[0..i]) |prev| if (std.mem.eql(u8, prev.name, t.name)) return diag.fail("duplicate target name '{s}'", .{t.name});
     }
     cfg.targets = targets;
@@ -362,10 +467,14 @@ pub fn parse(a: Allocator, source: []const u8, path: []const u8) !Config {
 }
 
 pub fn load(a: Allocator, path: []const u8) !Config {
+    return loadConfiguration(a, path, null);
+}
+
+pub fn loadConfiguration(a: Allocator, path: []const u8, profile: ?[]const u8) !Config {
     const abs = try std.fs.cwd().realpathAlloc(a, path);
     const source = std.fs.cwd().readFileAlloc(a, abs, 4 << 20) catch |err|
         return diag.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
-    return parse(a, source, abs);
+    return parseConfiguration(a, source, abs, profile);
 }
 
 // ------------------------------------------------------------------ tests
@@ -427,4 +536,44 @@ test "rejects bad configs" {
             return err;
         };
     }
+}
+
+test "debug and release profiles isolate outputs and deep merge metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source =
+        \\defaults:
+        \\  defines: [BASE]
+        \\  info:
+        \\    NSCameraUsageDescription: Camera
+        \\configurations:
+        \\  debug:
+        \\    bundle_id: com.example.debug
+        \\    entitlements:
+        \\      get-task-allow: true
+        \\  release:
+        \\    entitlements:
+        \\      get-task-allow: false
+        \\targets:
+        \\  - name: App
+        \\    bundle_id: com.example.app
+        \\    info:
+        \\      CFBundleDisplayName: App
+        \\    configurations:
+        \\      debug:
+        \\        info:
+        \\          CFBundleDisplayName: App Debug
+    ;
+    const d = (try parseConfiguration(a, source, "/project/idlproj.yml", "debug")).targets[0];
+    const rel = (try parseConfiguration(a, source, "/project/idlproj.yml", "release")).targets[0];
+    try testing.expectEqualStrings("-O0", d.opt);
+    try testing.expect(d.debug_symbols);
+    try testing.expectEqualStrings("com.example.debug", d.bundle_id);
+    try testing.expectEqualStrings("App Debug", d.info.?.get("CFBundleDisplayName").?.scalar.text);
+    try testing.expect(d.info.?.get("NSCameraUsageDescription") != null);
+    try testing.expectEqualStrings("build/debug", d.build_dir);
+    try testing.expectEqualStrings("build/release", rel.build_dir);
+    try testing.expectEqualStrings("false", rel.entitlement_values.?.get("get-task-allow").?.scalar.text);
+    try testing.expectError(error.Invalid, parseConfiguration(a, source, "/project/idlproj.yml", "typo"));
 }

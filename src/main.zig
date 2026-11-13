@@ -43,12 +43,15 @@ const usage_text =
     \\Project commands (read idlproj.yml):
     \\  build [target...]      build, sign, package and verify IPAs (default: all targets)
     \\  gen [target...]        generate .xcodeproj, xtool.yml/Package.swift, compile_commands.json
-    \\  check                  verify the Linux iOS toolchain
+    \\  check [target...]      preflight tools and resources (no app compilation)
     \\  list                   list configured targets
     \\  clean [target...]      remove build outputs
     \\  xcodeproj <target>     generate one Xcode project (optionally to --output)
     \\  install <device> [target...]
     \\                         build, then sign + install through the running Jimpactor
+    \\
+    \\Build/check/install: --strict rejects unsupported inputs.
+    \\Project commands: -c debug|release selects isolated profile outputs.
     \\
     \\Jimpactor commands (need the Jimpactor tray app running):
     \\  devices list           list devices Jimpactor can install to
@@ -151,8 +154,12 @@ fn parseSub(a: Allocator, comptime name: []const u8, comptime params: anytype, c
 const Project = struct { cfg: config.Config, tc: Toolchain };
 
 fn loadProject(a: Allocator, g: Global) !Project {
+    return loadProjectConfiguration(a, g, null);
+}
+
+fn loadProjectConfiguration(a: Allocator, g: Global, profile: ?[]const u8) !Project {
     const path = g.file orelse try config.find(a, ".");
-    const cfg = try config.load(a, path);
+    const cfg = try config.loadConfiguration(a, path, profile);
     return .{ .cfg = cfg, .tc = try Toolchain.init(a, cfg.toolchain, cfg.root) };
 }
 
@@ -206,6 +213,8 @@ fn cmdDevices(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
 
 fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
+        \\    --strict         Reject unsupported inputs instead of warnings.
         \\-h, --help          Show this help.
         \\    --ipa <path>    Install this IPA instead of building targets.
         \\    --no-build      Install the targets' existing IPAs without rebuilding.
@@ -227,9 +236,12 @@ fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         if (res.positionals[1].len > 0) return diag.fail("install: give either --ipa or targets, not both", .{});
         try ipas.append(try std.fs.cwd().realpathAlloc(a, ipa));
     } else {
-        var p = try loadProject(a, g);
-        for (try p.cfg.select(a, res.positionals[1])) |t| {
-            const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0 });
+        var p = try loadProjectConfiguration(a, g, res.args.configuration);
+        const targets = try p.cfg.select(a, res.positionals[1]);
+        var session: ?builder.Session = if (res.args.@"no-build" == 0) try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0) else null;
+        defer if (session) |*s| s.release();
+        for (targets, 0..) |t, i| {
+            const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.?.prepared[i], .strict = res.args.strict != 0 });
             if (fsutil.kind(ipa) != .file) return diag.fail("{s} does not exist; run `idl build {s}` first", .{ ipa, t.name });
             try ipas.append(ipa);
         }
@@ -243,6 +255,8 @@ fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
 
 fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
+        \\    --strict         Reject unsupported inputs instead of warnings.
         \\-h, --help          Show this help.
         \\-j, --jobs <usize>  Parallel compile jobs (default: toolchain.jobs or CPU count).
         \\-v, --verbose       Print every command that is run.
@@ -251,12 +265,14 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         \\
     );
     const res = try parseSub(a, "build", &params, parsers, iter);
-    var p = try loadProject(a, g);
+    var p = try loadProjectConfiguration(a, g, res.args.configuration);
     const targets = try p.cfg.select(a, res.positionals[0]);
+    var session = try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0);
+    defer session.release();
     var ipas = std.ArrayList([]const u8).init(a);
-    for (targets) |t| {
+    for (targets, 0..) |t, i| {
         if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
-        try ipas.append(try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0 }));
+        try ipas.append(try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0 }));
     }
     diag.info("\nbuilt {d} IPA(s):", .{ipas.items.len});
     for (ipas.items) |ipa| diag.info("  {s}", .{ipa});
@@ -265,13 +281,17 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
 
 fn cmdGen(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
         \\<target>...
         \\
     );
     const res = try parseSub(a, "gen", &params, parsers, iter);
-    var p = try loadProject(a, g);
-    for (try p.cfg.select(a, res.positionals[0])) |t| {
+    var p = try loadProjectConfiguration(a, g, res.args.configuration);
+    const targets = try p.cfg.select(a, res.positionals[0]);
+    const locks = try builder.lockTargets(a, targets);
+    defer for (locks) |*lock| lock.release();
+    for (targets) |t| {
         diag.info("==> {s}", .{t.name});
         try codegen.generate(a, &p.tc, t, .{});
     }
@@ -279,31 +299,36 @@ fn cmdGen(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
 
 fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help  Show this help.
+        \\-h, --help                  Show this help.
+        \\-c, --configuration <str>   Build profile: debug or release.
+        \\    --strict                Reject unsupported inputs.
+        \\<target>...
         \\
     );
-    _ = try parseSub(a, "check", &params, parsers, iter);
-    // A project file is optional for `check`; defaults are used without one.
+    const res = try parseSub(a, "check", &params, parsers, iter);
     const path: ?[]const u8 = g.file orelse (config.find(a, ".") catch null);
-    var cfg_tc: config.ToolchainConfig = .{};
-    var root: []const u8 = try std.fs.cwd().realpathAlloc(a, ".");
-    if (path) |p| {
-        const cfg = try config.load(a, p);
-        cfg_tc = cfg.toolchain;
-        root = cfg.root;
-        diag.info("{s:<16} {s}", .{ "project", cfg.path });
+    if (path) |file| {
+        const cfg = try config.loadConfiguration(a, file, res.args.configuration);
+        var tc = try Toolchain.init(a, cfg.toolchain, cfg.root);
+        _ = try tc.check(); // informational inventory; requirements are target-specific
+        var session = try builder.prepareAll(a, &tc, try cfg.select(a, res.positionals[0]), res.args.strict != 0, g.verbose);
+        defer session.release();
+        diag.info("preflight passed (no application sources compiled)", .{});
+    } else {
+        if (res.positionals[0].len > 0 or res.args.configuration != null) return diag.fail("check: target/profile selection requires idlproj.yml", .{});
+        const tc = try Toolchain.init(a, .{}, try std.fs.cwd().realpathAlloc(a, "."));
+        if (!try tc.check()) return diag.fail("toolchain incomplete", .{});
     }
-    const tc = try Toolchain.init(a, cfg_tc, root);
-    if (!try tc.check()) return diag.fail("toolchain incomplete", .{});
 }
 
 fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
         \\
     );
-    _ = try parseSub(a, "list", &params, parsers, iter);
-    const p = try loadProject(a, g);
+    const res = try parseSub(a, "list", &params, parsers, iter);
+    const p = try loadProjectConfiguration(a, g, res.args.configuration);
     for (p.cfg.targets) |t| {
         const rel = try std.fs.path.relative(a, p.cfg.root, t.dir);
         diag.info("{s:<20} {s:<7} {s:<32} iOS {s:<6} {s}", .{ t.name, @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
@@ -312,13 +337,17 @@ fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
 
 fn cmdClean(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
         \\<target>...
         \\
     );
     const res = try parseSub(a, "clean", &params, parsers, iter);
-    const p = try loadProject(a, g);
-    for (try p.cfg.select(a, res.positionals[0])) |t| try builder.clean(a, t);
+    const p = try loadProjectConfiguration(a, g, res.args.configuration);
+    const targets = try p.cfg.select(a, res.positionals[0]);
+    const locks = try builder.lockTargets(a, targets);
+    defer for (locks) |*lock| lock.release();
+    for (targets) |t| try builder.clean(a, t);
 }
 
 fn cmdVerify(a: Allocator, iter: *std.process.ArgIterator) !void {
@@ -351,17 +380,20 @@ fn cmdInit(a: Allocator, iter: *std.process.ArgIterator) !void {
 
 fn cmdXcodeproj(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
+        \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help           Show this help.
         \\-o, --output <path>  Output .xcodeproj (default: <target dir>/<Name>.xcodeproj).
         \\<target>
         \\
     );
     const res = try parseSub(a, "xcodeproj", &params, parsers, iter);
-    const p = try loadProject(a, g);
+    const p = try loadProjectConfiguration(a, g, res.args.configuration);
     const name = res.positionals[0] orelse return diag.fail("xcodeproj: expected a target name", .{});
     const t = (try p.cfg.select(a, &.{name}))[0];
     const out = res.args.output orelse try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
-    try codegen.genMetadata(a, t);
+    var lock = try @import("buildstate.zig").Lock.acquire(a, t.dir);
+    defer lock.release();
+    try codegen.genXcodeMetadata(a, t);
     diag.info("{s}", .{try pbxproj.generateProject(a, t.manifest(), t.dir, out)});
 }
 
@@ -425,6 +457,7 @@ fn cmdXcstrings(a: Allocator, iter: *std.process.ArgIterator) !void {
 
 fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
     const params = comptime clap.parseParamsComptime(
+        \\    --strict         Reject unsupported IB features.
         \\-h, --help           Show this help.
         \\-o, --output <path>  Output .nib / .storyboardc (default: next to the input).
         \\-d, --dump           Print the objects of a compiled .nib (or of the compiled input).
@@ -437,15 +470,18 @@ fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
     const out = std.io.getStdOut().writer();
     const show_types = res.args.types != 0;
     const sfx = fsutil.suffix(input);
+    if (res.args.strict != 0 and fsutil.oneOf(sfx, &.{ ".xib", ".storyboard" })) try ibtool.validate(a, input, true);
     if (std.mem.eql(u8, sfx, ".xib")) {
-        const bytes, _ = try ibtool.compileXib(a, input);
+        const bytes, const result = try ibtool.compileXib(a, input);
+        if (res.args.strict != 0 and result.warnings > 0) return diag.fail("ibtool: {d} compiler warning(s) in strict mode", .{result.warnings});
         if (res.args.dump != 0 and res.args.output == null) return nib.dump(a, bytes, out, show_types, "");
         const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.nib", .{input[0 .. input.len - sfx.len]});
         try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = bytes });
         diag.info("wrote {s}", .{dest});
     } else if (std.mem.eql(u8, sfx, ".storyboard")) {
         const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.storyboardc", .{input[0 .. input.len - sfx.len]});
-        _ = try ibtool.compileStoryboard(a, input, dest);
+        const result = try ibtool.compileStoryboard(a, input, dest);
+        if (res.args.strict != 0 and result.warnings > 0) return diag.fail("ibtool: {d} compiler warning(s) in strict mode", .{result.warnings});
         diag.info("wrote {s}", .{dest});
     } else {
         const bytes = std.fs.cwd().readFileAlloc(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
@@ -455,6 +491,8 @@ fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
 }
 
 test {
+    _ = @import("buildstate.zig");
+    _ = @import("resources.zig");
     _ = @import("ynode.zig");
     _ = @import("plist.zig");
     _ = @import("xcstrings.zig");

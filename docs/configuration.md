@@ -1,10 +1,11 @@
 # idlproj.yml reference
 
-`idlproj.yml` is the only configuration file. It has three top-level keys:
+`idlproj.yml` is the only configuration file. It has four top-level keys:
 
 ```yaml
 toolchain: { ... }   # optional: where the compilers and SDK live
 defaults:  { ... }   # optional: target keys applied to every target
+configurations: { ... } # optional: debug/release overrides
 targets:   [ ... ]   # required: one entry per app
 ```
 
@@ -54,6 +55,8 @@ they must stay inside it (no absolute paths, no `..`).
 | `arch` | `arm64` | target architecture |
 | `opt` | `-Os` | optimization flag for C-family code |
 | `swift_opt` | `-O` | optimization flag for Swift |
+| `debug_symbols` | `false` | emit DWARF in C-family and Swift objects |
+| `strict` | `false` | reject unsupported resources and IB features rather than warn/skip |
 | `swift_version` | `5.0` | written to the Xcode project |
 | `defines` | `[]` | `NAME` or `NAME=VALUE`. Both forms go to C-family code; only `NAME` goes to Swift |
 | `include_dirs` | `[]` | `-I` for clang and swiftc |
@@ -66,8 +69,9 @@ they must stay inside it (no absolute paths, no `..`).
 | `build_dir` | `build` | where objects, the app bundle and the IPA go |
 
 If a target has any `.swift` file, swiftc compiles all Swift sources in one
-whole-module invocation and links the clang-compiled objects. Otherwise clang
-links. C++ sources add `-lc++`.
+whole-module compilation and links the clang-compiled objects. Debug builds
+compile Swift to a persistent `.swift.o` and link separately, retaining DWARF
+without requiring `dsymutil`. Otherwise clang links. C++ sources add `-lc++`.
 
 ### Bundle
 
@@ -135,7 +139,9 @@ files are errors, never silently ignored.
 `idl gen` and `idl xcodeproj` write `.idl/Info.plist` and, when configured,
 `.idl/Entitlements.plist` inside each target directory. Xcode and xtool reference
 these generated files. Run `idl gen` after editing YAML before building in
-Xcode; values are expanded at generation time, not per Xcode configuration.
+Xcode. Both `.idl/debug/` and `.idl/release/` metadata sets are also generated;
+Xcode configurations reference their matching set. Variables are expanded at
+generation time using each profile, not re-evaluated from YAML by Xcode.
 Direct builds generate bundle metadata themselves; xtool metadata is regenerated
 before each xtool build. `.idl/` is disposable and should be gitignored.
 
@@ -156,10 +162,59 @@ file without that marker. To keep a hand-written `Package.swift`, set
 An xtool target must have exactly one `sources` entry: the SwiftPM target
 directory.
 
+## configurations
+
+Select with `-c debug` / `--configuration release` on `build`, `install`,
+`check`, `gen`, `xcodeproj`, `list` and `clean`:
+
+```yaml
+configurations:
+  debug:
+    info:
+      CFBundleDisplayName: My App Debug
+  release:
+    defines: [PRODUCTION]
+    entitlements:
+      get-task-allow: false
+
+targets:
+  - name: MyApp
+    bundle_id: com.example.myapp
+    configurations:
+      debug:
+        bundle_id: com.example.myapp.debug
+        entitlements:
+          get-task-allow: true
+```
+
+Built-in debug settings: `opt: -O0`, `swift_opt: -Onone`, `debug_symbols: true`,
+and an additional `DEBUG` define. Built-in release settings: `-Os`, `-O`, no
+DWARF; an inherited YAML `get-task-allow` is set to false. Profile overrides
+can explicitly change those defaults. No entitlement file is manufactured
+for an app that requested no capabilities. For a legacy entitlement-file
+input, explicitly override entitlements in the release profile if needed.
+
+Precedence, lowest first: `defaults` -> target -> built-in profile -> global
+`configurations.<name>` -> target `configurations.<name>`. Mappings merge
+recursively, lists replace rather than append, and `~` clears an optional
+value. `DEBUG` is appended after merging for debug builds.
+
+Supported profile overrides: `bundle_id`, `opt`, `swift_opt`, `debug_symbols`,
+`defines`, `info`, `entitlements`, `plist_vars`, `build_dir`, `cflags`,
+`swiftflags`, `ldflags`, `strict`, `sign`. Targets, source lists and dependencies
+are not profile-dependent. Unknown profile names/keys are errors.
+
+Profile output paths are `<build_dir>/debug/` and `<build_dir>/release/`, for
+both builders (xtool's IPA is copied to that profile path). Xcode receives
+matching optimization, defines, debug-symbol, signing and metadata settings.
+With no `-c`, legacy flags and output paths are preserved; the old target
+`configuration:` key still chooses xtool's underlying configuration.
+
 ## defaults
 
 `defaults:` accepts any target key except `name`, `dir` and `bundle_id`. A
-target's own value replaces the default; lists are replaced, not merged.
+target overrides defaults recursively for mappings (`info`, `entitlements`, etc.);
+lists are replaced, not merged, and `~` clears an optional mapping/value.
 
 ## Complete example
 

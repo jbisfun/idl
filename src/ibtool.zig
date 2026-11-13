@@ -392,6 +392,7 @@ fn parseView(c: *Ctx, e: *const Element, parent: ?*Obj, class: []const u8) anyer
     try o.set(a, "UIClipsToBounds", .{ .boolean = e.is("clipsSubviews", "YES") });
     try o.set(a, "UIAutoresizingMask", .{ .int = 36 }); // flexible right + bottom margin
     try o.set(a, "UIAutoresizeSubviews", .{ .boolean = true });
+    if (e.get("opaque") != null) try o.set(a, "UIOpaque", .{ .boolean = e.is("opaque", "YES") });
     if (e.is("hidden", "YES")) try o.set(a, "UIHidden", .{ .boolean = true });
     if (e.is("userInteractionEnabled", "NO")) try o.set(a, "UIUserInteractionDisabled", .{ .boolean = true });
     if (try floatAttr(c, e, "alpha")) |alpha| try o.set(a, "UIAlpha", .{ .double = alpha });
@@ -412,6 +413,10 @@ fn parseLabel(c: *Ctx, e: *const Element, parent: ?*Obj) anyerror!*Obj {
     const o = try parseView(c, e, parent, if (c.is_prototype_list) "UITableViewLabel" else "UILabel");
     try o.setIfEmpty(c.a, "UIUserInteractionDisabled", .{ .boolean = true });
     try o.setIfEmpty(c.a, "UIViewContentHuggingPriority", .{ .str = "{251, 251}" });
+    if (e.get("lineBreakMode")) |mode| {
+        const index = indexOf(&.{ "wordWrap", "characterWrap", "clip", "headTruncation", "tailTruncation", "middleTruncation" }, mode) orelse return diag.fail("unknown lineBreakMode {s}", .{mode});
+        try o.set(c.a, "UILineBreakMode", .{ .int = @intCast(index) });
+    }
     if (try intAttr(c, e, "numberOfLines")) |n| try o.set(c.a, "UINumberOfLines", .{ .int = n });
     if (e.get("textAlignment")) |ta| if (indexOf(&.{ "natural", "left", "center", "right", "justified" }, ta)) |i| {
         // NSTextAlignment: left 0, center 1, right 2, justified 3, natural 4.
@@ -583,11 +588,11 @@ fn parseOutlet(c: *Ctx, e: *const Element, parent: *Obj) anyerror!void {
 }
 
 const event_masks = std.StaticStringMap(i64).initComptime(.{
-    .{ "touchDown", 1 << 0 },           .{ "touchDownRepeat", 1 << 1 },  .{ "touchDragInside", 1 << 2 },
-    .{ "touchDragOutside", 1 << 3 },    .{ "touchDragEnter", 1 << 4 },   .{ "touchDragExit", 1 << 5 },
-    .{ "touchUpInside", 1 << 6 },       .{ "touchUpOutside", 1 << 7 },   .{ "touchCancel", 1 << 8 },
-    .{ "valueChanged", 1 << 12 },       .{ "primaryActionTriggered", 1 << 13 }, .{ "editingDidBegin", 1 << 16 },
-    .{ "editingChanged", 1 << 17 },     .{ "editingDidEnd", 1 << 18 },   .{ "editingDidEndOnExit", 1 << 19 },
+    .{ "touchDown", 1 << 0 },        .{ "touchDownRepeat", 1 << 1 },         .{ "touchDragInside", 1 << 2 },
+    .{ "touchDragOutside", 1 << 3 }, .{ "touchDragEnter", 1 << 4 },          .{ "touchDragExit", 1 << 5 },
+    .{ "touchUpInside", 1 << 6 },    .{ "touchUpOutside", 1 << 7 },          .{ "touchCancel", 1 << 8 },
+    .{ "valueChanged", 1 << 12 },    .{ "primaryActionTriggered", 1 << 13 }, .{ "editingDidBegin", 1 << 16 },
+    .{ "editingChanged", 1 << 17 },  .{ "editingDidEnd", 1 << 18 },          .{ "editingDidEndOnExit", 1 << 19 },
 });
 
 fn parseAction(c: *Ctx, e: *const Element, parent: *Obj) anyerror!void {
@@ -1177,12 +1182,12 @@ test "compile a xib with outlets, actions, colors, fonts and constraints" {
     try testing.expectEqual(@as(usize, 1), res.warnings); // the "ghost" constraint
     const text = try dumpText(a, bytes);
     for ([_][]const u8{
-        "UIClassSwapper",           "UIClassName = @",        "\"MyView\"",
-        "UIRuntimeEventConnection", "\"go:\"",                "UIEventMask = 64",
-        "UIRuntimeOutletConnection", "\"view\"",              "UICenter = (160, 240)",
-        "UIBounds = (0, 0, 320, 480)", "UIFontTraits = 2",    "UIRed = 0.1",
+        "UIClassSwapper",                "UIClassName = @",      "\"MyView\"",
+        "UIRuntimeEventConnection",      "\"go:\"",              "UIEventMask = 64",
+        "UIRuntimeOutletConnection",     "\"view\"",             "UICenter = (160, 240)",
+        "UIBounds = (0, 0, 320, 480)",   "UIFontTraits = 2",     "UIRed = 0.1",
         "NSRGB = \"1.000 1.000 1.000\"", "NSFirstAttribute = 9", "UIButtonContent",
-        "\"Go\"",                   "UITextAlignment = 1",
+        "\"Go\"",                        "UITextAlignment = 1",
     }) |needle| {
         if (std.mem.indexOf(u8, text, needle) == null) {
             std.debug.print("missing {s} in:\n{s}\n", .{ needle, text });
@@ -1274,4 +1279,113 @@ test "non-iOS documents are rejected" {
     try writeTmp(tmp.dir, "Mac.xib", "<document targetRuntime=\"MacOSX.Cocoa\"><objects/></document>");
     const path = try tmp.dir.realpathAlloc(arena.allocator(), "Mac.xib");
     try testing.expectError(error.Invalid, compileXib(arena.allocator(), path));
+}
+
+test "strict validation rejects unsupported elements and unresolved outlets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "Strict.xib" });
+    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><stackView id=\"s\"/></objects></document>" });
+    try testing.expectError(error.Invalid, validate(a, path, true));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "stackView") != null);
+    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><connections><outlet property=\"missing\" destination=\"ghost\"/></connections></view></objects></document>" });
+    try testing.expectError(error.Invalid, validate(a, path, true));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "ghost") != null);
+    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><rect key=\"frame\" x=\"0\" y=\"0\" width=\"10\" height=\"10\"/></view></objects></document>" });
+    try validate(a, path, true);
+}
+
+/// Scan the entire input, including children of unsupported objects. Permissive
+/// builds diagnose omissions; strict builds reject them before app compilation.
+pub fn validate(a: Allocator, path: []const u8, strict: bool) !void {
+    const doc, const root = try loadDoc(a, path);
+    var ids = std.StringHashMap(*const Element).init(a);
+    try collectIds(doc, root, &ids);
+    try validateElement(doc, root, &ids, strict);
+    if (root.nonEmpty("initialViewController")) |id| {
+        const entry = ids.get(id) orelse return diag.fail("{s}: initial view controller '{s}' does not exist", .{ doc.name, id });
+        if (!inSet(entry.tag, &.{ "viewController", "navigationController", "tableViewController" }))
+            return diag.fail("{s}: initial view controller '{s}' is not a supported controller", .{ doc.name, id });
+    }
+}
+
+fn collectIds(doc: *Doc, e: *const Element, ids: *std.StringHashMap(*const Element)) anyerror!void {
+    if (e.nonEmpty("id")) |id| {
+        const entry = try ids.getOrPut(id);
+        if (entry.found_existing) return diag.fail("{s}:{d}: duplicate IB object id '{s}'", .{ doc.name, e.line, id });
+        entry.value_ptr.* = e;
+    }
+    for (e.children) |child| try collectIds(doc, child, ids);
+}
+
+fn issue(doc: *Doc, e: *const Element, strict: bool, comptime fmt: []const u8, args: anytype) !void {
+    if (strict) return diag.fail("{s}:{d}: " ++ fmt, .{ doc.name, e.line } ++ args);
+    doc.warn(e, fmt, args);
+}
+
+fn inSet(value: []const u8, names: []const []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, value, n)) return true;
+    return false;
+}
+
+fn validateElement(doc: *Doc, e: *const Element, ids: *const std.StringHashMap(*const Element), strict: bool) anyerror!void {
+    // IB design-time metadata and structural containers do not enter a nib.
+    const metadata_tags = [_][]const u8{ "document", "objects", "scenes", "scene", "resources", "systemColor", "namedColor", "device", "dependencies", "deployment", "plugIn", "capability", "point", "size", "nil", "simulatedScreenMetrics", "simulatedOrientationMetrics", "simulatedStatusBarMetrics", "freeformSimulatedSizeMetrics" };
+    const tag = std.meta.stringToEnum(Tag, e.tag);
+    if (tag == null and !inSet(e.tag, &metadata_tags))
+        try issue(doc, e, strict, "unsupported Interface Builder element <{s}>", .{e.tag});
+    for ([_][]const u8{ "destination", "firstItem", "secondItem", "textLabel", "detailTextLabel", "imageView" }) |key| {
+        if (e.nonEmpty(key)) |id| if (!ids.contains(id))
+            try issue(doc, e, strict, "{s} refers to missing object '{s}'", .{ key, id });
+    }
+    if (tag) |t| {
+        // Reject semantic attributes that the port cannot encode; design-time
+        // IDs, canvas settings and inferred layout hints are intentionally ignored.
+        const common = [_][]const u8{ "id", "key", "userLabel", "sceneMemberID", "customClass", "restorationIdentifier", "misplaced", "fixedFrame", "ambiguous", "horizontalHuggingPriority", "verticalHuggingPriority", "horizontalCompressionResistancePriority", "verticalCompressionResistancePriority" };
+        const view_attrs = [_][]const u8{ "contentMode", "clipsSubviews", "translatesAutoresizingMaskIntoConstraints", "hidden", "userInteractionEnabled", "alpha", "tag", "text", "opaque" };
+        const is_view = inSet(e.tag, &.{ "view", "label", "button", "imageView", "textView", "textField", "scrollView", "switch", "slider", "searchBar", "navigationBar", "visualEffectView", "tableView", "tableViewCell", "tableViewCellContentView", "activityIndicatorView", "progressView" });
+        for (e.attrs) |attr| {
+            if (inSet(attr.name, &common) or (is_view and inSet(attr.name, &view_attrs))) continue;
+            const supported = switch (t) {
+                .placeholder => inSet(attr.name, &.{"placeholderIdentifier"}),
+                .viewController, .navigationController, .tableViewController => inSet(attr.name, &.{"storyboardIdentifier"}),
+                .label => inSet(attr.name, &.{ "numberOfLines", "textAlignment", "lineBreakMode" }),
+                .button => inSet(attr.name, &.{"buttonType"}),
+                .navigationBar => inSet(attr.name, &.{ "translucent", "barStyle" }),
+                .tableView => inSet(attr.name, &.{ "separatorStyle", "rowHeight", "dataMode" }),
+                .tableViewCell => inSet(attr.name, &.{ "textLabel", "detailTextLabel", "imageView", "reuseIdentifier", "style", "selectionStyle", "indentationWidth", "indentationLevel", "accessoryType", "editingAccessoryType", "showsReorderControl" }),
+                .state => inSet(attr.name, &.{"title"}),
+                .outlet => inSet(attr.name, &.{ "property", "destination" }),
+                .action => inSet(attr.name, &.{ "selector", "destination", "eventType" }),
+                .segue => inSet(attr.name, &.{ "destination", "kind", "identifier", "relationship", "modalPresentationStyle", "modalTransitionStyle", "animates", "splitViewControllerTargetIndex", "trigger" }),
+                .viewControllerLayoutGuide => inSet(attr.name, &.{"type"}),
+                .constraint => inSet(attr.name, &.{ "firstItem", "firstAttribute", "secondItem", "secondAttribute", "constant", "priority", "multiplier", "relation" }),
+                .navigationItem => inSet(attr.name, &.{"title"}),
+                .barButtonItem => inSet(attr.name, &.{ "style", "enabled", "title", "systemItem" }),
+                .blurEffect => inSet(attr.name, &.{"style"}),
+                .color => inSet(attr.name, &.{ "red", "green", "blue", "white", "alpha", "colorSpace", "customColorSpace", "systemColor", "cocoaTouchSystemColor", "name" }),
+                .rect => inSet(attr.name, &.{ "x", "y", "width", "height" }),
+                .inset => inSet(attr.name, &.{ "minX", "maxX", "minY", "maxY" }),
+                .autoresizingMask => inSet(attr.name, &.{ "flexibleMinX", "widthSizable", "flexibleMaxX", "flexibleMinY", "heightSizable", "flexibleMaxY" }),
+                .textInputTraits => inSet(attr.name, &.{"secureTextEntry"}),
+                .fontDescription => inSet(attr.name, &.{ "type", "style", "name", "pointSize", "family" }),
+                else => false,
+            };
+            if (!supported) try issue(doc, e, strict, "unsupported attribute {s} on <{s}>", .{ attr.name, e.tag });
+        }
+    }
+    for (e.children) |child| try validateElement(doc, child, ids, strict);
+}
+
+test "storyboard initial entry must be a controller not just an existing id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "Bad.storyboard", .data = "<document initialViewController=\"label\"><scenes><scene><objects><viewController id=\"vc\" sceneMemberID=\"viewController\"><view key=\"view\" id=\"view\"><subviews><label id=\"label\"/></subviews></view></viewController></objects></scene></scenes></document>" });
+    try testing.expectError(error.Invalid, validate(a, try tmp.dir.realpathAlloc(a, "Bad.storyboard"), true));
 }

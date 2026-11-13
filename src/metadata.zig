@@ -91,6 +91,10 @@ pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap
     }
     var vars = try buildVars(a, t);
     try plist.expand(a, root.node, &vars, env);
+    for ([_][2][]const u8{ .{ "CFBundleExecutable", t.name }, .{ "CFBundleIdentifier", t.bundle_id }, .{ "CFBundlePackageType", "APPL" } }) |expected| {
+        const value = (try root.getString(a, expected[0])) orelse return diag.fail("{s}: {s} must be a string", .{ t.name, expected[0] });
+        if (!std.mem.eql(u8, value, expected[1])) return diag.fail("{s}: {s} is '{s}', expected '{s}'; configure identity on the target, not in info", .{ t.name, expected[0], value, expected[1] });
+    }
     return root.toXml(a);
 }
 
@@ -116,4 +120,12 @@ pub fn entitlements(a: Allocator, t: Target, env: ?*const std.process.EnvMap) !?
     var vars = try buildVars(a, t);
     try plist.expand(a, root.node, &vars, env);
     return try root.toXml(a);
+}
+
+test "metadata identity overrides must agree with the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try @import("config.zig").parse(a, "targets:\n  - name: App\n    bundle_id: com.example.app\n    info:\n      CFBundleExecutable: Missing\n", "/project/idlproj.yml");
+    try std.testing.expectError(error.Invalid, processInfoPlist(a, cfg.targets[0], null, null));
 }

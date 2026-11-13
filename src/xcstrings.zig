@@ -53,11 +53,18 @@ fn lessThan(_: void, l: []const u8, r: []const u8) bool {
     return std.mem.lessThan(u8, l, r);
 }
 
+fn validateLanguage(language: []const u8) !void {
+    if (language.len == 0) return diag.fail("empty String Catalog language", .{});
+    for (language) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_')
+        return diag.fail("invalid String Catalog language '{s}'; expected a language identifier, not a path", .{language});
+}
+
 pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
     const root = std.json.parseFromSliceLeaky(Json, a, source, .{}) catch |err|
         return diag.fail("invalid xcstrings JSON: {s}", .{@errorName(err)});
     const catalog = obj(root) orelse return diag.fail("xcstrings root must be an object", .{});
     const source_language = str(catalog.get("sourceLanguage")) orelse "en";
+    try validateLanguage(source_language);
     const entries = obj(catalog.get("strings")) orelse return diag.fail("xcstrings is missing \"strings\"", .{});
 
     var strings: std.StringArrayHashMapUnmanaged(Table) = .empty;
@@ -78,6 +85,7 @@ pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
         var loc_it = localizations.iterator();
         while (loc_it.next()) |loc| {
             const language = loc.key_ptr.*;
+            try validateLanguage(language);
             const localization = obj(loc.value_ptr.*) orelse continue;
             const plural_map: ?std.json.ObjectMap = if (obj(localization.get("variations"))) |v| obj(v.get("plural")) else null;
             if (plural_map) |plural| {
@@ -153,4 +161,12 @@ test "catalog conversion" {
     try std.testing.expect(std.mem.indexOf(u8, dict, "<string>%lld item</string>") != null);
     try std.testing.expectEqualStrings("@", formatSpecifier("%1$@ things"));
     try std.testing.expectEqualStrings("d", formatSpecifier("%d"));
+}
+
+test "string catalog language must be a single safe directory name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.Invalid, convert(arena.allocator(), "{\"sourceLanguage\":\"bad/lang\",\"strings\":{\"Hello\":{}}}", tmp.dir));
 }

@@ -2,7 +2,8 @@
 
 `idl` is a single Zig executable (libplist is compiled in; only libc is linked dynamically). It reads `idlproj.yml` and
 either generates files or runs external compilers. It contains no
-general-purpose build system: dependencies are tracked per object file.
+general-purpose task language: it tracks compiler dependencies, prepares a
+collision-checked resource plan, and caches resource and bundle outputs.
 
 ```
 idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Package.swift, compile_commands.json
@@ -25,6 +26,8 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/config.zig` | `idlproj.yml` schema, merging `defaults`, validation, upward file search |
 | `src/ynode.zig` | lossless YAML view on zig-yaml's parse tree (keeps scalar text; strips comments) |
 | `src/toolchain.zig` | SDK/compiler/ldid discovery, compiler and linker flag sets, `idl check` |
+| `src/resources.zig` | resource cache, strict validation, output collision plan and storyboard/nib reference checks |
+| `src/buildstate.zig` | SHA-256 tree fingerprints, cache records/output integrity and per-directory OS locks |
 | `src/builder.zig` | parallel incremental compile, link, bundle assembly, signing, packaging, xtool runs, clean |
 | `src/codegen.zig` | `xtool.yml`, `Package.swift`, `compile_commands.json`, protection against overwriting non-generated files |
 | `src/pbxproj.zig` | deterministic Xcode project + scheme; atomic, symlink-safe publishing |
@@ -67,9 +70,8 @@ All dependencies are pinned in `build.zig.zon`:
 
 - **Deterministic codegen.** Xcode object IDs are
   `SHA1("pbxprojgen:<section>:<key>")[0..12]`, so the same input always gives
-  the same `project.pbxproj`. The output is byte-identical to the earlier
-  Python generator, so projects regenerate without diffs after the
-  migration.
+  the same `project.pbxproj`. Low-level IDs retain compatibility with the earlier
+  Python generator; profile-specific settings intentionally extend the output.
 - **Safe publishing.** A new `.xcodeproj` is written to a private sibling
   directory and moved into place with directory-FD-relative, no-follow
   operations (`fstatat(AT_SYMLINK_NOFOLLOW)`, `openat(O_NOFOLLOW)`,
@@ -77,9 +79,19 @@ All dependencies are pinned in `build.zig.zon`:
   redirect the write. Unit tests cover this.
 - **Never overwrite hand-written files.** Generated source-tree files carry a
   marker, and files without it are left alone.
-- **Incremental builds.** Each object has a `.cmd` file with its exact
-  command line, and clang's `-MMD` depfile lists its headers. A change to
-  either recompiles the object.
+- **Preflight before compilation.** All selected tools are probed before any
+  resource compiler runs; all resource plans are prepared before application
+  compilation starts. Strict mode rejects unsupported/omitted inputs.
+- **Incremental builds.** Each object has a `.cmd` command/tool fingerprint and
+  clang's `-MMD` depfile lists headers. Resources use SHA-256 content-addressed
+  cache entries and verify their output tree on hits. Bundling/signing/ZIP skip
+  only if input fingerprints and both the payload and IPA integrity match.
+- **Locking.** Build/check/gen/clean hold OS advisory locks in `.idl/build.lock`.
+  Lock files are never unlinked during cleanup; closing the descriptor releases
+  the lock. Builds acquire every selected lock before modifying outputs.
+- **Profile generation.** YAML maps deep-merge into resolved debug/release
+  targets. Metadata for each is written under `.idl/<profile>/`; Xcode receives
+  both profiles, while xtool's manifests describe the selected profile.
 - **Reproducible IPAs.** Entries are sorted, timestamps are fixed and Unix
   modes are preserved. Deflate is used only when it makes an entry smaller.
 - **Scoped environment.** The swiftly bin directory is appended to `PATH`, not

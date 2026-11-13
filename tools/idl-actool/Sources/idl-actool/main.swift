@@ -48,6 +48,10 @@ func json(_ value: Any) -> String {
 }
 
 let args = CommandLine.arguments
+if args.count == 2 && args[1] == "--version" {
+    print("idl-actool 1 (AssetKit 1.0.0)")
+    exit(0)
+}
 guard args.count == 4 else {
     fail("usage: idl-actool <catalog.xcassets> <output-dir> <deployment-target>")
 }

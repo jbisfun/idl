@@ -19,7 +19,7 @@ The build steps come from the Linux build used by LiveContainer.
     zig build                     # builds ./zig-out/bin/idl (Zig 0.14.1)
     ./zig-out/bin/idl check       # verify the toolchain
     zig build actool              # optional: .xcassets compiler (needs swift)
-    ./zig-out/bin/idl build       # build every example in ./idlproj.yml
+    ./zig-out/bin/idl build --strict -c release  # preflight, then build every example
 
 Install on a phone through the running Jimpactor tray app:
 
@@ -30,6 +30,17 @@ Start a new app:
 
     idl init MyApp --lang swift --bundle-id com.example.myapp
     cd MyApp && idl build
+
+## Build automation
+
+    idl check --strict -c release
+    idl build --strict -c debug MyApp
+    idl build --strict -c release MyApp
+
+YAML `configurations:` overrides flags, bundle identity, metadata and entitlements.
+Debug/release artifacts are isolated. Direct builds cache resource compilation,
+bundling, signing and packaging; concurrent build/gen/clean operations are locked.
+See [workflows](docs/workflows.md#strict-preflight-and-build-profiles).
 
 ## Layout
 

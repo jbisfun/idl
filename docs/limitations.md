@@ -11,8 +11,8 @@
 
 ## Xcode-only build steps
 
-These tools are macOS binaries with no Linux replacement here. `idl` skips
-their inputs with a warning:
+These tools have no Linux replacement here. Permissive builds warn and skip
+their inputs; `--strict` rejects them before app compilation:
 
 - Core Data models (`.xcdatamodeld`, `momc`).
 - Metal shaders (`.metal`) are listed in generated Xcode projects but are not
@@ -41,7 +41,8 @@ reverse-engineered NIB writer. Apple's format is undocumented, so:
   class, frame and colors but none of their own attributes. Anything else (stack
   views, collection views, tab bar controllers, images, gesture recognizers,
   user-defined runtime attributes, trait variations, localization) is skipped
-  silently or with a warning.
+  with diagnostics in permissive builds; strict builds reject unsupported nodes
+  and attributes before app compilation.
 - **Safe-area layout guides** are treated as the view that owns them, so a
   constraint to the safe area pins to the view's edge instead.
 - Constraints that refer to unsupported objects are dropped with a warning.
@@ -73,7 +74,8 @@ binary because AssetKit is a Swift library.
   `.appiconset` the catalog has.
 - One `.xcassets` per target. Merge catalogs if you have several.
 - SVG images need `rsvg-convert` (librsvg) on PATH.
-- The catalog is recompiled on every build.
+- Catalogs, storyboards, XIBs and strings are cached by input content and compiler
+  identity. Direct-target bundling/signing/packaging also skip unchanged outputs.
 
 ## Project model
 
@@ -83,15 +85,20 @@ binary because AssetKit is a Swift library.
   copied to `Frameworks/` and ad-hoc signed, and `@executable_path/Frameworks`
   is always an rpath. Building frameworks or extensions from source is not
   supported.
-- There is one build configuration: `opt`/`swift_opt` select it. The
-  generated Xcode project still has Debug and Release.
+- Debug/release profiles are supported. Arbitrary additional configurations and
+  profile-dependent source/dependency graphs are not. Omitting `-c` preserves
+  the legacy unprofiled flags/output paths.
+- Debug symbols stay in object files; no `.dSYM` archive/export is produced.
+- C-family incremental compilation remains mtime/depfile-based; content-based
+  caching applies to resources and final bundle/IPA state. This is a local cache,
+  not a cross-machine hermetic/reproducible build guarantee.
 - Resources are flattened into the bundle root like Xcode does, except that
   `*.lproj/` folders and package directories (`.bundle`, `.framework`,
   `.mlmodelc`) are kept. Two resources with the same file name are an error.
   A `.xcstrings` file and an `.lproj/Localizable.strings` resource that
   produce the same language file will conflict.
-- Swift is built in a single whole-module invocation, so changing any Swift
-  file recompiles all Swift in the target.
+- Swift uses whole-module compilation, so changing a Swift source recompiles
+  all Swift in the target. Debug compilation and linking are separate steps.
 - Objective-C cannot call Swift: no `<Module>-Swift.h` header is generated.
   Swift can call Objective-C through `bridging_header`.
 - Swift `defines` must be plain flags. `NAME=VALUE` only applies to C-family
@@ -99,6 +106,10 @@ binary because AssetKit is a Swift library.
 - Only `arm64` device builds are tested. There is no simulator SDK.
 
 ## xtool builder
+
+- `resources:` orchestration currently requires `builder: direct`. The generated
+  SwiftPM package does not declare arbitrary resource paths; idl errors rather
+  than silently omitting them. xtool manages its own build and packaging cache.
 
 - SwiftPM cannot mix Swift and C-family files in one target, so an xtool
   target is either all Swift or all C/Objective-C. Use `builder: direct` for
@@ -110,6 +121,12 @@ binary because AssetKit is a Swift library.
   complex, write your own and set `package_swift: false`.
 
 ## Toolchain
+
+- `idl-actool` must support `--version`; rebuild it with `zig build actool` when
+  upgrading idl from a version whose helper lacked that command.
+- xtool's entitlement-rewrite path can drop executable ZIP permission bits.
+  idl normalizes the main executable's ZIP metadata without changing its code
+  bytes or signature, then performs normal IPA verification.
 
 - xtool's `ld64.lld` prints `This version of lld does not support linking for
   platform iOS`. The output is correct: the Mach-O has `LC_BUILD_VERSION`
