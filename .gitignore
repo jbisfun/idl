@@ -1,12 +1,26 @@
+# zig
+.zig-cache/
+zig-out/
+
+# idl build outputs and codegen
 build/
+.idl/
+*.ipa
+*.app/
+*.xcodeproj/
+*.xcent
+compile_commands.json
+examples/xtool-swiftpm/Package.swift
+examples/xtool-swiftpm/xtool.yml
+
+# xtool / SwiftPM
 .build/
 .bsp/
 .swiftpm/
 xtool/
 ModuleCache/
+
+# leftovers from the old Python tooling
 __pycache__/
-*.py[cod]
-*.ipa
-*.app/
-*.xcodeproj/
+
 .DS_Store

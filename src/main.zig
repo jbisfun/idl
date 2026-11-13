@@ -1,0 +1,350 @@
+//! idl — iOS development on Linux. Reads idlproj.yml, generates project files
+//! and orchestrates clang/swiftc/ldid/xtool to produce IPAs.
+const std = @import("std");
+const clap = @import("clap");
+const diag = @import("diag.zig");
+const config = @import("config.zig");
+const fsutil = @import("fsutil.zig");
+const builder = @import("builder.zig");
+const codegen = @import("codegen.zig");
+const pbxproj = @import("pbxproj.zig");
+const plist = @import("plist.zig");
+const xcstrings = @import("xcstrings.zig");
+const verify = @import("verify.zig");
+const scaffold = @import("scaffold.zig");
+const Toolchain = @import("toolchain.zig").Toolchain;
+
+const Allocator = std.mem.Allocator;
+
+// zig-yaml logs every token at debug level; keep output clean in Debug builds.
+pub const std_options: std.Options = .{ .log_level = .warn };
+
+const Command = enum { build, gen, check, list, clean, verify, init, xcodeproj, plist, xcstrings, help };
+
+const main_params = clap.parseParamsComptime(
+    \\-h, --help           Show help (also: idl <command> --help).
+    \\-f, --file <path>    idlproj.yml to use (default: search upward from the current directory).
+    \\-v, --verbose        Print every command that is run.
+    \\<command>
+    \\
+);
+
+const main_parsers = .{
+    .path = clap.parsers.string,
+    .command = clap.parsers.enumeration(Command),
+};
+
+const usage_text =
+    \\usage: idl [-f idlproj.yml] [-v] <command> [args]
+    \\
+    \\Project commands (read idlproj.yml):
+    \\  build [target...]      build, sign, package and verify IPAs (default: all targets)
+    \\  gen [target...]        generate .xcodeproj, xtool.yml/Package.swift, compile_commands.json
+    \\  check                  verify the Linux iOS toolchain
+    \\  list                   list configured targets
+    \\  clean [target...]      remove build outputs
+    \\  xcodeproj <target>     generate one Xcode project (optionally to --output)
+    \\
+    \\Standalone commands:
+    \\  init <Name>            scaffold a new app with an idlproj.yml
+    \\  verify <ipa>           structural IPA validation (ZIP CRCs, plist, Mach-O)
+    \\  plist                  expand $(VARS) and edit a plist (Xcode Info.plist processing)
+    \\  xcstrings <in> <dir>   convert a String Catalog to .strings/.stringsdict
+    \\
+    \\Global options:
+    \\
+;
+
+const Global = struct {
+    file: ?[]const u8,
+    verbose: bool,
+};
+
+pub fn main() !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var iter = try std.process.ArgIterator.initWithAllocator(a);
+    _ = iter.next();
+    var parse_diag: clap.Diagnostic = .{};
+    const res = clap.parseEx(clap.Help, &main_params, main_parsers, &iter, .{
+        .diagnostic = &parse_diag,
+        .allocator = a,
+        .terminating_positional = 0,
+    }) catch |err| {
+        parse_diag.report(std.io.getStdErr().writer(), err) catch {};
+        return 2;
+    };
+    const stdout = std.io.getStdOut().writer();
+    const command = res.positionals[0] orelse {
+        try stdout.writeAll(usage_text);
+        try clap.help(stdout, clap.Help, &main_params, .{});
+        return if (res.args.help != 0) 0 else 2;
+    };
+    if (res.args.help != 0 or command == .help) {
+        try stdout.writeAll(usage_text);
+        try clap.help(stdout, clap.Help, &main_params, .{});
+        return 0;
+    }
+    const global: Global = .{ .file = res.args.file, .verbose = res.args.verbose != 0 };
+
+    dispatch(a, command, &iter, global) catch |err| switch (err) {
+        error.Invalid => {
+            std.io.getStdErr().writer().print("error: {s}\n", .{diag.msg}) catch {};
+            return 1;
+        },
+        error.Usage => return 2,
+        error.HelpShown => return 0,
+        else => return err,
+    };
+    return 0;
+}
+
+fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: Global) !void {
+    switch (command) {
+        .build => try cmdBuild(a, iter, g),
+        .gen => try cmdGen(a, iter, g),
+        .check => try cmdCheck(a, iter, g),
+        .list => try cmdList(a, iter, g),
+        .clean => try cmdClean(a, iter, g),
+        .verify => try cmdVerify(a, iter),
+        .init => try cmdInit(a, iter),
+        .xcodeproj => try cmdXcodeproj(a, iter, g),
+        .plist => try cmdPlist(a, iter),
+        .xcstrings => try cmdXcstrings(a, iter),
+        .help => unreachable,
+    }
+}
+
+/// Parse a subcommand's arguments; prints help/diagnostics itself.
+fn parseSub(a: Allocator, comptime name: []const u8, comptime params: anytype, comptime value_parsers: anytype, iter: *std.process.ArgIterator) !clap.ResultEx(clap.Help, params, value_parsers) {
+    var d: clap.Diagnostic = .{};
+    const res = clap.parseEx(clap.Help, params, value_parsers, iter, .{ .diagnostic = &d, .allocator = a }) catch |err| {
+        d.report(std.io.getStdErr().writer(), err) catch {};
+        std.io.getStdErr().writer().print("see: idl {s} --help\n", .{name}) catch {};
+        return error.Usage;
+    };
+    if (res.args.help != 0) {
+        const out = std.io.getStdOut().writer();
+        try out.print("usage: idl {s} ", .{name});
+        try clap.usage(out, clap.Help, params);
+        try out.writeAll("\n\n");
+        try clap.help(out, clap.Help, params, .{});
+        return error.HelpShown;
+    }
+    return res;
+}
+
+const Project = struct { cfg: config.Config, tc: Toolchain };
+
+fn loadProject(a: Allocator, g: Global) !Project {
+    const path = g.file orelse try config.find(a, ".");
+    const cfg = try config.load(a, path);
+    return .{ .cfg = cfg, .tc = try Toolchain.init(a, cfg.toolchain, cfg.root) };
+}
+
+const parsers = .{
+    .path = clap.parsers.string,
+    .str = clap.parsers.string,
+    .target = clap.parsers.string,
+    .usize = clap.parsers.int(usize, 10),
+    .lang = clap.parsers.enumeration(scaffold.Lang),
+};
+
+fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help          Show this help.
+        \\-j, --jobs <usize>  Parallel compile jobs (default: toolchain.jobs or CPU count).
+        \\-v, --verbose       Print every command that is run.
+        \\    --gen           Also regenerate .xcodeproj / compile_commands.json.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "build", &params, parsers, iter);
+    var p = try loadProject(a, g);
+    const targets = try p.cfg.select(a, res.positionals[0]);
+    var ipas = std.ArrayList([]const u8).init(a);
+    for (targets) |t| {
+        if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
+        try ipas.append(try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0 }));
+    }
+    diag.info("\nbuilt {d} IPA(s):", .{ipas.items.len});
+    for (ipas.items) |ipa| diag.info("  {s}", .{ipa});
+    if (targets.len > 0) diag.info("ad-hoc signatures are not provisioning; re-sign before installing.", .{});
+}
+
+fn cmdGen(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "gen", &params, parsers, iter);
+    var p = try loadProject(a, g);
+    for (try p.cfg.select(a, res.positionals[0])) |t| {
+        diag.info("==> {s}", .{t.name});
+        try codegen.generate(a, &p.tc, t, .{});
+    }
+}
+
+fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\
+    );
+    _ = try parseSub(a, "check", &params, parsers, iter);
+    // A project file is optional for `check`; defaults are used without one.
+    const path: ?[]const u8 = g.file orelse (config.find(a, ".") catch null);
+    var cfg_tc: config.ToolchainConfig = .{};
+    var root: []const u8 = try std.fs.cwd().realpathAlloc(a, ".");
+    if (path) |p| {
+        const cfg = try config.load(a, p);
+        cfg_tc = cfg.toolchain;
+        root = cfg.root;
+        diag.info("{s:<16} {s}", .{ "project", cfg.path });
+    }
+    const tc = try Toolchain.init(a, cfg_tc, root);
+    if (!try tc.check()) return diag.fail("toolchain incomplete", .{});
+}
+
+fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\
+    );
+    _ = try parseSub(a, "list", &params, parsers, iter);
+    const p = try loadProject(a, g);
+    for (p.cfg.targets) |t| {
+        const rel = try std.fs.path.relative(a, p.cfg.root, t.dir);
+        diag.info("{s:<20} {s:<7} {s:<32} iOS {s:<6} {s}", .{ t.name, @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
+    }
+}
+
+fn cmdClean(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "clean", &params, parsers, iter);
+    const p = try loadProject(a, g);
+    for (try p.cfg.select(a, res.positionals[0])) |t| try builder.clean(a, t);
+}
+
+fn cmdVerify(a: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help              Show this help.
+        \\    --bundle-id <str>   Require this CFBundleIdentifier.
+        \\    --allow-unsigned    Accept executables without LC_CODE_SIGNATURE.
+        \\<path>...
+        \\
+    );
+    const res = try parseSub(a, "verify", &params, parsers, iter);
+    if (res.positionals[0].len == 0) return diag.fail("verify: expected at least one .ipa path", .{});
+    for (res.positionals[0]) |ipa| _ = try verify.verifyFile(a, ipa, .{ .bundle_id = res.args.@"bundle-id", .allow_unsigned = res.args.@"allow-unsigned" != 0 });
+}
+
+fn cmdInit(a: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Show this help.
+        \\    --lang <lang>      objc or swift (default: swift).
+        \\    --bundle-id <str>  Bundle identifier (default: com.example.<name>).
+        \\    --dir <path>       Directory to create (default: <Name>).
+        \\<str>
+        \\
+    );
+    const res = try parseSub(a, "init", &params, parsers, iter);
+    const name = res.positionals[0] orelse return diag.fail("init: expected an app name", .{});
+    const dir = try scaffold.init(a, name, res.args.lang orelse .swift, res.args.@"bundle-id", res.args.dir);
+    diag.info("\nnext:\n  cd {s}\n  idl check\n  idl build", .{dir});
+}
+
+fn cmdXcodeproj(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help           Show this help.
+        \\-o, --output <path>  Output .xcodeproj (default: <target dir>/<Name>.xcodeproj).
+        \\<target>
+        \\
+    );
+    const res = try parseSub(a, "xcodeproj", &params, parsers, iter);
+    const p = try loadProject(a, g);
+    const name = res.positionals[0] orelse return diag.fail("xcodeproj: expected a target name", .{});
+    const t = (try p.cfg.select(a, &.{name}))[0];
+    const out = res.args.output orelse try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
+    diag.info("{s}", .{try pbxproj.generateProject(a, t.manifest(), t.dir, out)});
+}
+
+fn splitAssignment(s: []const u8) struct { []const u8, []const u8 } {
+    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return .{ s, "" };
+    return .{ s[0..eq], s[eq + 1 ..] };
+}
+
+fn cmdPlist(a: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help              Show this help.
+        \\-i, --input <path>      Input plist (XML, binary, JSON or OpenStep); omit to start empty.
+        \\-o, --output <path>     Output XML plist (required).
+        \\    --var <str>...      KEY=VALUE for $(KEY) expansion (falls back to the environment).
+        \\    --default <str>...  KEY=VALUE set only when the key is absent.
+        \\    --set <str>...      KEY=VALUE (JSON for arrays/dicts/bools/ints).
+        \\    --delete <str>...   Remove KEY.
+        \\
+    );
+    const res = try parseSub(a, "plist", &params, parsers, iter);
+    const output = res.args.output orelse return diag.fail("plist: --output is required", .{});
+    const root = if (res.args.input) |in| try plist.readFile(a, in) else plist.Plist.newDict();
+    defer root.deinit();
+    if (!root.isDict()) return diag.fail("plist root must be a dictionary", .{});
+    var vars = plist.Vars.init(a);
+    for (res.args.@"var") |s| {
+        const k, const v = splitAssignment(s);
+        try vars.put(k, v);
+    }
+    for (res.args.default) |s| {
+        const k, const v = splitAssignment(s);
+        try root.setDefault(a, k, try plist.parseCliValue(a, k, v));
+    }
+    for (res.args.set) |s| {
+        const k, const v = splitAssignment(s);
+        try root.set(a, k, try plist.parseCliValue(a, k, v));
+    }
+    for (res.args.delete) |k| try root.remove(a, k);
+    var env = try std.process.getEnvMap(a);
+    try plist.expand(a, root.node, &vars, &env);
+    const xml = try root.toXml(a);
+    if (std.fs.path.dirname(output)) |d| try std.fs.cwd().makePath(d);
+    try std.fs.cwd().writeFile(.{ .sub_path = output, .data = xml });
+}
+
+fn cmdXcstrings(a: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\<path>
+        \\<path>
+        \\
+    );
+    const res = try parseSub(a, "xcstrings", &params, parsers, iter);
+    const input = res.positionals[0] orelse return diag.fail("xcstrings: expected <input.xcstrings> <outdir>", .{});
+    const outdir = res.positionals[1] orelse return diag.fail("xcstrings: expected <input.xcstrings> <outdir>", .{});
+    const source = std.fs.cwd().readFileAlloc(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
+    var dir = try std.fs.cwd().makeOpenPath(outdir, .{});
+    defer dir.close();
+    try xcstrings.convert(a, source, dir);
+}
+
+test {
+    _ = @import("ynode.zig");
+    _ = @import("plist.zig");
+    _ = @import("xcstrings.zig");
+    _ = @import("fsutil.zig");
+    _ = @import("pbxproj.zig");
+    _ = @import("zip.zig");
+    _ = @import("macho.zig");
+    _ = @import("verify.zig");
+    _ = @import("config.zig");
+    _ = @import("toolchain.zig");
+    _ = @import("codegen.zig");
+    _ = @import("builder.zig");
+    _ = @import("scaffold.zig");
+}

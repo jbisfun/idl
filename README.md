@@ -1,140 +1,51 @@
 # iOS development on Linux
 
-A small, working toolkit for building Objective-C and Swift iOS apps on Linux.
-It extracts the reusable pieces of the Linux build used by LiveContainer:
-Darwin SDK discovery, clang/Swift compiler flags, `ld64.lld`, compiler-rt,
-Info.plist processing, ad-hoc signing, IPA packaging, and validation.
+`idl` is a small Zig tool that builds Objective-C, Swift, C and C++ iOS apps
+on Linux. One file, `idlproj.yml`, configures the toolchain and every app.
+From that file `idl`:
 
-## What is included
+- generates code: deterministic `.xcodeproj` projects with a shared scheme,
+  `xtool.yml` + `Package.swift` for xtool, and `compile_commands.json` for
+  clangd / sourcekit-lsp
+- runs builds: it calls clang, swiftc, xtool's `ld64.lld` and `ldid`,
+  processes Info.plist, copies resources, ad-hoc signs, writes the IPA, and
+  checks the result
 
-- `mk/ios-toolchain.mk` — shared GNU Make configuration for clang, Swift,
-  the xtool Darwin SDK, `ld64.lld`, compiler-rt, ldid, packaging, and checks.
-- `templates/objc-app` — programmatic UIKit app built with Objective-C/ARC.
-- `templates/swift-app` — programmatic UIKit app built with Swift.
-- `templates/xtool-swiftpm` — minimal Objective-C UIKit app packaged as a SwiftPM project for `xtool dev`.
-- `tools/pbxprojgen.py` — deterministic `.xcodeproj/project.pbxproj` and shared scheme generator for single-target iOS apps.
-- `tools/plisttool.py` — expand Xcode-style `$(VAR)` values and edit plists;
-  also converts `.xcstrings` catalogs into `.strings`/`.stringsdict` files.
-- `tools/verify_ipa.py` — checks ZIP integrity, bundle metadata, executable mode,
-  Mach-O magic, and optionally load commands with `llvm-objdump`.
-- `xcconfigs/` — generic bundle-ID/team configuration patterns for Xcode projects.
+The build steps come from the Linux build used by LiveContainer.
 
-## Requirements
+## Quick start
 
-Install a Linux Swift toolchain with [swiftly], install [xtool], then download
-its Darwin SDK:
+    xtool setup                   # Darwin SDK -> ~/.swiftpm/swift-sdks/darwin.artifactbundle
+    zig build                     # builds ./zig-out/bin/idl (Zig 0.14.1)
+    ./zig-out/bin/idl check       # verify the toolchain
+    ./zig-out/bin/idl build       # build every example in ./idlproj.yml
 
-    xtool setup
-    make check
+Start a new app:
 
-The default SDK location is:
+    idl init MyApp --lang swift --bundle-id com.example.myapp
+    cd MyApp && idl build
 
-    ~/.swiftpm/swift-sdks/darwin.artifactbundle
+## Layout
 
-Override it with `DARWIN_SDK_BUNDLE=/path/to/darwin.artifactbundle`.
-The Makefiles expect `swiftc` and `clang` from a modern Swift toolchain. The
-Swiftly bin directory is appended to `PATH` automatically.
+    idlproj.yml        configuration for the examples in this repository
+    build.zig(.zon)    Zig build; pulls zig-clap, zig-yaml and libplist
+    src/               the idl tool (see docs/architecture.md)
+    examples/          ObjC, Swift and xtool/SwiftPM apps, plus xcconfig patterns
+    docs/              documentation
 
-## Build the examples
+## Documentation
 
-    make objc
-    make swift
-    make examples
+- [Getting started](docs/getting-started.md)
+- [idlproj.yml reference](docs/configuration.md)
+- [Common workflows](docs/workflows.md)
+- [Known limitations](docs/limitations.md)
+- [Architecture](docs/architecture.md)
 
-Outputs:
+## Tests
 
-    templates/objc-app/build/ObjCExample.ipa
-    templates/swift-app/build/SwiftExample.ipa
-    templates/xtool-swiftpm/xtool/XtoolExample.ipa
+    zig build test       # unit tests (config, plist, pbxproj, zip, Mach-O, codegen)
+    zig build check      # idl check
+    zig build examples   # idl build --gen for every example (real arm64 builds)
 
-The direct Makefile examples receive an ldid ad-hoc signature so their bundles
-are structurally complete; the default xtool `ipa` target is unsigned. Neither
-is an Apple provisioning profile: re-sign the IPA with your normal
-sideloading/signing tool before installing it.
-
-Each template can be copied and renamed. Its important configuration is near the
-top of its Makefile:
-
-    APP := MyApp
-    BUNDLE_ID := com.example.myapp
-    MIN_IOS := 16.0
-
-## Generate an Xcode project
-
-Create a `project.json` next to your sources:
-
-    {
-      "name": "MyApp",
-      "bundleIdentifier": "com.example.myapp",
-      "deploymentTarget": "16.0",
-      "sources": ["Sources"],
-      "resources": ["Resources"],
-      "infoPlist": "Info.plist",
-      "entitlements": "Entitlements.plist",
-      "frameworks": ["UIKit", "Foundation"],
-      "swiftVersion": "5.0"
-    }
-
-Then generate the project and shared scheme:
-
-    python3 tools/pbxprojgen.py path/to/project.json
-
-By default this writes `MyApp.xcodeproj` beside the manifest. Use `--output`
-to choose another path. IDs are derived from stable content keys, so running the
-generator twice produces the same project file instead of a noisy UUID diff.
-Source and resource directories are scanned recursively; asset catalogs and
-other Xcode package directories are kept as single resource references.
-
-The Objective-C and Swift templates include manifests:
-
-    make projects
-    make -C templates/objc-app project
-    make -C templates/swift-app project
-
-The current generator intentionally targets one iOS application target. It
-supports C, C++, Objective-C, Objective-C++, Swift, resources, system
-frameworks, Info.plist, entitlements, Debug/Release configurations, and a
-shared runnable scheme.
-
-## xtool SwiftPM project
-
-The xtool template demonstrates the smaller path for a SwiftPM-compatible app:
-
-    cp -r templates/xtool-swiftpm MyApp
-    cd MyApp
-    xtool dev build -c release --ipa
-
-Use the direct Makefile templates when you need exact control, a mixed-language
-build, custom framework/dylib targets, or an existing Xcode project that cannot
-be represented as a Swift package.
-
-## Reusable compiler/linker configuration
-
-`mk/ios-toolchain.mk` exports:
-
-- `SDK`, `SWIFT_RESOURCE_DIR`, `PLATFORM_LIB_DIR`
-- `CC`, `CXX`, `SWIFTC`, `LD64`, `CLANG_RT`, `LDID`
-- `IOS_CFLAGS`, `IOS_OBJCFLAGS`, `IOS_CXXFLAGS`
-- `IOS_SWIFTFLAGS`, `IOS_LDFLAGS`, `IOS_SWIFT_LDFLAGS`
-
-Notable details learned from real Linux builds:
-
-- Use xtool's `toolset/bin/orig/ld64.lld`; the host linker may reject modern
-  arm64e SDK stubs.
-- Swift needs the Darwin SDK's `-resource-dir`, or `SwiftShims` is missing.
-- Link `libclang_rt.ios.a` for helpers such as `__isPlatformVersionAtLeast`.
-- On Linux, framework/header paths are case-sensitive.
-- Xcode tools such as `actool`, `ibtool`, and `xcstringstool` are macOS binaries;
-  use programmatic UI and the included plist/xcstrings helper, or prebuild assets.
-- Sign embedded frameworks/extensions before signing the containing executable.
-
-## Tests and validation
-
-    make test
-    make examples
-
-`make examples` performs real arm64 iOS compilation, links and signs both apps,
-packages IPAs, verifies ZIP CRCs, and runs `tools/verify_ipa.py`.
-
-[swiftly]: https://www.swift.org/install/linux/
-[xtool]: https://github.com/xtool-org/xtool
+Ad-hoc `ldid` signatures are not provisioning. Re-sign an IPA with your usual
+signing or sideloading tool before you install it.

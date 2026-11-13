@@ -1,0 +1,28 @@
+.{
+    .name = .idl,
+    .version = "0.1.0",
+    .fingerprint = 0xfdd2aa6d8a8624e1,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.10.0.tar.gz",
+            .hash = "clap-0.10.0-oBajB434AQBDh-Ei3YtoKIRxZacVPF1iSwp3IX_ZB8f0",
+        },
+        .yaml = .{
+            .url = "https://github.com/kubkon/zig-yaml/archive/refs/tags/0.1.1.tar.gz",
+            .hash = "zig_yaml-0.1.0-C1161miEAgBCwL3YAEQZwV_4GyaaT2Xqj9nKB6hNe_TL",
+        },
+        .libplist = .{
+            .url = "git+https://github.com/libimobiledevice/libplist?ref=2.8.1#678b1a34693b86ae1787fa470dcb7203ffd0ef3f",
+            .hash = "N-V-__8AAOJ8XABuk8XuBSKoGz6r5jr4yTsg5JmiG7SG-lof",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "LICENSE",
+        "README.md",
+    },
+}

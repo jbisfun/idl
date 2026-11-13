@@ -1,0 +1,51 @@
+# idlproj.yml: the single configuration file for `idl`.
+# Full reference: docs/configuration.md
+#
+#   zig build                      # builds ./zig-out/bin/idl
+#   ./zig-out/bin/idl check        # verify toolchain
+#   ./zig-out/bin/idl build        # build every target below
+#   ./zig-out/bin/idl gen          # regenerate .xcodeproj / xtool.yml / Package.swift
+
+toolchain:
+  sdk_bundle: ~/.swiftpm/swift-sdks/darwin.artifactbundle   # from `xtool setup`
+  swiftly_bin: ~/.local/share/swiftly/bin                   # appended to PATH
+  cc: clang
+  cxx: clang++
+  swiftc: swiftc
+  ldid: ldid                      # name on PATH or a path
+  jobs: 0                         # 0 = one per CPU
+
+# Applied to every target unless the target overrides the key.
+defaults:
+  min_ios: "16.0"
+  arch: arm64
+  opt: -Os
+  frameworks: [UIKit, Foundation]
+  compile_commands: true
+
+targets:
+  - name: ObjCExample
+    dir: examples/objc-app
+    bundle_id: com.example.objcexample
+    sources: [Sources]
+    info_plist: Info.plist
+    entitlements: Entitlements.plist
+    xcodeproj: true
+
+  - name: SwiftExample
+    dir: examples/swift-app
+    bundle_id: com.example.swiftexample
+    sources: [Sources]
+    info_plist: Info.plist
+    entitlements: Entitlements.plist
+    swift_version: "5.0"
+    xcodeproj: true
+
+  - name: XtoolExample
+    builder: xtool
+    dir: examples/xtool-swiftpm
+    bundle_id: com.example.xtoolapp
+    sources: [Sources/XtoolExample]
+    info_plist: xtool-support/Info.plist
+    frameworks: [UIKit]
+    configuration: release
