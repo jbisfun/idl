@@ -77,11 +77,30 @@ For a value that differs between machines or CI runs, reference an
 environment variable directly: an unknown `$(VAR)` falls back to the process
 environment.
 
-## Install on a device
+## Install on a device (through Jimpactor)
 
-`idl` signs with an ad-hoc `ldid` signature, which is not a provisioning
-profile. Re-sign the IPA with your normal tool (Jimpactor, AltStore,
-Sideloadly, `xtool dev build --sign`, ...) before you install it.
+`idl`'s ad-hoc `ldid` signature is not a provisioning profile. With the
+Jimpactor tray app running, `idl` can hand IPAs to it, and Jimpactor signs
+them with your account and installs them:
+
+    idl devices list                   # devices Jimpactor can reach
+    idl install "JPs iPhone"           # build every target, then install each IPA
+    idl install 00008130 MyApp         # device by UDID prefix, one target
+    idl install 00008130-... --no-build MyApp   # install the last build
+    idl install 00008130-... --ipa ~/Downloads/Other.ipa
+
+`<device>` is a UDID, a unique UDID prefix (4+ characters), or a device name
+(case-insensitive). `idl` resolves the device before building, so a closed
+Jimpactor or an unknown device fails early. Install progress from Jimpactor
+is printed as it arrives.
+
+Jimpactor's IPC protocol (version 1): `idl` connects to 127.0.0.1 on the port
+in `<data>/relaunch.port` and sends the token from `<data>/ipc.token`. `<data>`
+is `$XDG_CONFIG_HOME/Jimpactor` or `~/.config/Jimpactor`, or
+`toolchain.jimpactor_dir` when that's set.
+
+Without Jimpactor, re-sign the IPA with any other tool (AltStore, Sideloadly,
+`xtool dev build --sign`, ...).
 
 ## Check an IPA from anywhere
 

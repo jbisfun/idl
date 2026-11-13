@@ -32,6 +32,7 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/zip.zig` | deterministic ZIP writer (std.compress.flate) and CRC-checking reader |
 | `src/macho.zig` | Mach-O header and load-command inspection |
 | `src/verify.zig` | IPA validation used by `build` and `verify` |
+| `src/jimpactor.zig` | client for Jimpactor's local IPC protocol v1 (`devices`, `install`) |
 | `src/scaffold.zig` | `idl init` (sources are embedded from `examples/` by `build.zig`) |
 | `src/fsutil.zig` | discovery rules shared with Xcode, path validation, symlink checks |
 | `src/diag.zig` | the single user-facing error message channel |
@@ -49,7 +50,7 @@ All dependencies are pinned in `build.zig.zon`:
   and compiled from C source by `buildLibplist` in `build.zig` instead of its
   autotools build. Only the C core is built, not libplist++.
 - **Zig std**: deflate, CRC-32, SHA-1, JSON and processes. `idl` makes no
-  network requests.
+  network requests except to Jimpactor on 127.0.0.1.
 
 ## Design notes
 

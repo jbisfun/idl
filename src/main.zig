@@ -12,6 +12,7 @@ const plist = @import("plist.zig");
 const xcstrings = @import("xcstrings.zig");
 const verify = @import("verify.zig");
 const scaffold = @import("scaffold.zig");
+const jimpactor = @import("jimpactor.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
 const Allocator = std.mem.Allocator;
@@ -19,7 +20,7 @@ const Allocator = std.mem.Allocator;
 // zig-yaml logs every token at debug level; keep output clean in Debug builds.
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-const Command = enum { build, gen, check, list, clean, verify, init, xcodeproj, plist, xcstrings, help };
+const Command = enum { build, gen, check, list, clean, install, devices, verify, init, xcodeproj, plist, xcstrings, help };
 
 const main_params = clap.parseParamsComptime(
     \\-h, --help           Show help (also: idl <command> --help).
@@ -44,6 +45,11 @@ const usage_text =
     \\  list                   list configured targets
     \\  clean [target...]      remove build outputs
     \\  xcodeproj <target>     generate one Xcode project (optionally to --output)
+    \\  install <device> [target...]
+    \\                         build, then sign + install through the running Jimpactor
+    \\
+    \\Jimpactor commands (need the Jimpactor tray app running):
+    \\  devices list           list devices Jimpactor can install to
     \\
     \\Standalone commands:
     \\  init <Name>            scaffold a new app with an idlproj.yml
@@ -108,6 +114,8 @@ fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: G
         .check => try cmdCheck(a, iter, g),
         .list => try cmdList(a, iter, g),
         .clean => try cmdClean(a, iter, g),
+        .install => try cmdInstall(a, iter, g),
+        .devices => try cmdDevices(a, iter, g),
         .verify => try cmdVerify(a, iter),
         .init => try cmdInit(a, iter),
         .xcodeproj => try cmdXcodeproj(a, iter, g),
@@ -150,7 +158,84 @@ const parsers = .{
     .target = clap.parsers.string,
     .usize = clap.parsers.int(usize, 10),
     .lang = clap.parsers.enumeration(scaffold.Lang),
+    .action = clap.parsers.enumeration(DevicesAction),
+    .device = clap.parsers.string,
 };
+
+const DevicesAction = enum { list };
+
+/// Jimpactor's data dir: toolchain.jimpactor_dir from idlproj.yml if there is one, else the default.
+fn jimpactorDir(a: Allocator, g: Global) ![]const u8 {
+    var env = try std.process.getEnvMap(a);
+    const path: ?[]const u8 = g.file orelse (config.find(a, ".") catch null);
+    if (path) |p| {
+        const cfg = try config.load(a, p);
+        if (cfg.toolchain.jimpactor_dir) |d| return fsutil.expandHome(a, d, &env);
+    }
+    return jimpactor.defaultDataDir(a, &env);
+}
+
+fn printDevices(devices: []const jimpactor.Device) void {
+    if (devices.len == 0) {
+        diag.info("no devices", .{});
+        return;
+    }
+    diag.info("{s:<28} {s:<10} {s:<9} {s}", .{ "UDID", "CONNECTION", "AVAILABLE", "NAME" });
+    for (devices) |d| diag.info("{s:<28} {s:<10} {s:<9} {s}", .{ d.udid, d.connection, if (d.available) "yes" else "no", d.name });
+}
+
+fn printProgress(message: []const u8, percent: i64) void {
+    diag.info("  [{d:>3}%] {s}", .{ percent, message });
+}
+
+fn cmdDevices(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help  Show this help.
+        \\<action>
+        \\
+    );
+    const res = try parseSub(a, "devices", &params, parsers, iter);
+    switch (res.positionals[0] orelse .list) {
+        .list => printDevices(try jimpactor.listDevices(a, try jimpactorDir(a, g))),
+    }
+}
+
+fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help          Show this help.
+        \\    --ipa <path>    Install this IPA instead of building targets.
+        \\    --no-build      Install the targets' existing IPAs without rebuilding.
+        \\-j, --jobs <usize>  Parallel compile jobs.
+        \\-v, --verbose       Print every command that is run.
+        \\<device>
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "install", &params, parsers, iter);
+    const query = res.positionals[0] orelse return diag.fail("install: expected a device (UDID, UDID prefix or name; see `idl devices list`)", .{});
+    const data_dir = try jimpactorDir(a, g);
+    // Resolve the device first so a missing app or device fails before a build.
+    const device = try jimpactor.resolveDevice(try jimpactor.listDevices(a, data_dir), query);
+    if (!device.available) diag.warn("{s} is not reachable right now; Jimpactor will try anyway", .{device.name});
+
+    var ipas = std.ArrayList([]const u8).init(a);
+    if (res.args.ipa) |ipa| {
+        if (res.positionals[1].len > 0) return diag.fail("install: give either --ipa or targets, not both", .{});
+        try ipas.append(try std.fs.cwd().realpathAlloc(a, ipa));
+    } else {
+        var p = try loadProject(a, g);
+        for (try p.cfg.select(a, res.positionals[1])) |t| {
+            const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0 });
+            if (fsutil.kind(ipa) != .file) return diag.fail("{s} does not exist; run `idl build {s}` first", .{ ipa, t.name });
+            try ipas.append(ipa);
+        }
+    }
+    for (ipas.items) |ipa| {
+        diag.info("==> installing {s} on {s} ({s})", .{ std.fs.path.basename(ipa), device.name, device.udid });
+        const event = try jimpactor.send(a, data_dir, .{ .install = .{ .path = ipa, .udid = device.udid } }, printProgress);
+        diag.info("{s}", .{event.message orelse event.event});
+    }
+}
 
 fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
@@ -347,4 +432,5 @@ test {
     _ = @import("codegen.zig");
     _ = @import("builder.zig");
     _ = @import("scaffold.zig");
+    _ = @import("jimpactor.zig");
 }

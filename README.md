@@ -20,6 +20,11 @@ The build steps come from the Linux build used by LiveContainer.
     ./zig-out/bin/idl check       # verify the toolchain
     ./zig-out/bin/idl build       # build every example in ./idlproj.yml
 
+Install on a phone through the running Jimpactor tray app:
+
+    idl devices list
+    idl install "JPs iPhone" MyApp
+
 Start a new app:
 
     idl init MyApp --lang swift --bundle-id com.example.myapp
