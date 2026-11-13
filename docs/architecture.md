@@ -10,7 +10,8 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
                   └──► builder ─► clang / clang++ / swiftc ─► ld64.lld (xtool SDK)
                          │            (parallel, incremental)
                          ├─► plist (libplist): Info.plist, entitlements
-                         ├─► resources / xcstrings
+                         ├─► resources: xcstrings, ibtool (storyboard/xib ─► nib),
+                         │              idl-actool (xcassets ─► Assets.car)
                          ├─► ldid (from PATH or toolchain.ldid)
                          ├─► zip writer ─► .ipa
                          └─► verify: zip reader + plist + Mach-O parser
@@ -32,6 +33,10 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/zip.zig` | deterministic ZIP writer (std.compress.flate) and CRC-checking reader |
 | `src/macho.zig` | Mach-O header and load-command inspection |
 | `src/verify.zig` | IPA validation used by `build` and `verify` |
+| `src/ibtool.zig` | `.xib` / `.storyboard` to nib object graphs (port of davidquesada/ibtool) |
+| `src/nib.zig` | NIBArchive object model, encoder and decoder (`idl ibtool --dump`) |
+| `src/xmldom.zig` | small DOM over zig-xml's streaming reader |
+| `tools/idl-actool` | Swift wrapper around AssetKit; separate executable, built by `zig build actool` |
 | `src/jimpactor.zig` | client for Jimpactor's local IPC protocol v1 (`devices`, `install`) |
 | `src/scaffold.zig` | `idl init` (sources are embedded from `examples/` by `build.zig`) |
 | `src/fsutil.zig` | discovery rules shared with Xcode, path validation, symlink checks |
@@ -49,6 +54,11 @@ All dependencies are pinned in `build.zig.zon`:
   OpenStep plists. It is fetched as `git+https://…#2.8.1` (pinned to a commit)
   and compiled from C source by `buildLibplist` in `build.zig` instead of its
   autotools build. Only the C core is built, not libplist++.
+- **zig-xml** (ianprime0509): XML reader for Interface Builder documents.
+  Pinned to the last commit that supports Zig 0.14.
+- **AssetKit** (xtool-org): `.xcassets` to `Assets.car`, used only by
+  `tools/idl-actool` (Swift package, pinned to 1.0.0). It is not linked into
+  `idl`.
 - **Zig std**: deflate, CRC-32, SHA-1, JSON and processes. `idl` makes no
   network requests except to Jimpactor on 127.0.0.1.
 

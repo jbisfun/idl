@@ -46,6 +46,15 @@ pub const Plist = struct {
         _ = c.plist_dict_remove_item(p.node, try a.dupeZ(u8, key));
     }
 
+    pub fn toBinary(p: Plist, a: Allocator) ![]u8 {
+        var buf: [*c]u8 = null;
+        var len: u32 = 0;
+        if (c.plist_to_bin(p.node, &buf, &len) != c.PLIST_ERR_SUCCESS or buf == null)
+            return diag.fail("cannot serialize plist", .{});
+        defer c.plist_mem_free(buf);
+        return a.dupe(u8, buf[0..len]);
+    }
+
     pub fn toXml(p: Plist, a: Allocator) ![]u8 {
         var buf: [*c]u8 = null;
         var len: u32 = 0;

@@ -13,6 +13,7 @@ toolchain:
   cxx: clang++
   swiftc: swiftc
   ldid: ldid                      # name on PATH or a path
+  actool: idl-actool              # .xcassets compiler (`zig build actool`)
   jobs: 0                         # 0 = one per CPU
 
 # Applied to every target unless the target overrides the key.
@@ -28,6 +29,16 @@ targets:
     dir: examples/objc-app
     bundle_id: com.example.objcexample
     sources: [Sources]
+    info_plist: Info.plist
+    entitlements: Entitlements.plist
+    xcodeproj: true
+
+  # Storyboards, xibs and an asset catalog, compiled on Linux.
+  - name: IBExample
+    dir: examples/ib-app
+    bundle_id: com.example.ibexample
+    sources: [Sources]
+    resources: [Resources]
     info_plist: Info.plist
     entitlements: Entitlements.plist
     xcodeproj: true

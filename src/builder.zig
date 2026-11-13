@@ -9,6 +9,7 @@ const xcstrings = @import("xcstrings.zig");
 const zip = @import("zip.zig");
 const verify = @import("verify.zig");
 const codegen = @import("codegen.zig");
+const ibtool = @import("ibtool.zig");
 const ynode = @import("ynode.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
@@ -245,8 +246,9 @@ pub fn buildVars(a: Allocator, t: Target) !plist.Vars {
 }
 
 /// Info.plist with `info:` overrides applied, variables expanded and
-/// MinimumOSVersion forced to the target's deployment version.
-pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap) ![]const u8 {
+/// MinimumOSVersion forced to the target's deployment version. `generated`
+/// (keys produced by resource compilers, e.g. app icons) is merged last.
+pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap, generated: ?plist.Plist) ![]const u8 {
     const root = try plist.readFile(a, try t.path(a, t.info_plist));
     defer root.deinit();
     if (!root.isDict()) return diag.fail("{s}: root must be a dictionary", .{t.info_plist});
@@ -262,6 +264,19 @@ pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap
     for (defaults) |kv| try root.setDefault(a, kv[0], try plist.newString(a, kv[1]));
     if (t.info) |m| for (m.keys, m.values) |k, v| try root.set(a, k, try ynodeToPlist(a, k, v));
     try root.set(a, "MinimumOSVersion", try plist.newString(a, t.min_ios));
+    if (generated) |g| {
+        var it: plist.c.plist_dict_iter = null;
+        plist.c.plist_dict_new_iter(g.node, &it);
+        defer plist.c.plist_dict_free_iter(it);
+        while (true) {
+            var key: [*c]u8 = null;
+            var val: plist.c.plist_t = null;
+            plist.c.plist_dict_next_item(g.node, it, &key, &val);
+            if (val == null) break;
+            defer plist.c.plist_mem_free(key);
+            try root.set(a, std.mem.span(key), plist.c.plist_copy(val));
+        }
+    }
     var vars = try buildVars(a, t);
     try plist.expand(a, root.node, &vars, env);
     return root.toXml(a);
@@ -284,18 +299,56 @@ fn copyTree(a: Allocator, src: []const u8, dst: []const u8) !void {
     }
 }
 
-/// Copy resources into the bundle (flattened like Xcode; `*.lproj/` kept).
-/// Returns embedded frameworks that need signing.
-fn copyResources(c: Ctx, app: []const u8) ![]const []const u8 {
+const Bundled = struct {
+    /// Embedded frameworks that need signing.
+    frameworks: []const []const u8,
+    /// Info.plist keys from the asset catalog compiler (app icons).
+    info: ?plist.Plist,
+};
+
+/// Compile an asset catalog with idl-actool (AssetKit) into `app`.
+fn compileAssets(c: Ctx, rel: []const u8, src: []const u8, app: []const u8, build_dir: []const u8) !plist.Plist {
+    const a = c.a;
+    const actool = try c.tc.actool();
+    const out = try std.fs.path.join(a, &.{ build_dir, "assets", std.fs.path.basename(rel) });
+    try std.fs.cwd().deleteTree(out);
+    try std.fs.cwd().makePath(out);
+    if (!c.opts.verbose) diag.info("  ACTOOL {s}", .{rel});
+    try run(c, &.{ actool, src, out, c.t.min_ios }, c.t.dir);
+    var dir = try std.fs.cwd().openDir(out, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |e| {
+        if (e.kind != .file or std.mem.eql(u8, e.name, "assetcatalog_generated_info.json")) continue;
+        try dir.copyFile(e.name, std.fs.cwd(), try std.fs.path.join(a, &.{ app, e.name }), .{});
+    }
+    const json = try dir.readFileAlloc(a, "assetcatalog_generated_info.json", 1 << 20);
+    var node: plist.c.plist_t = null;
+    if (plist.c.plist_from_json(json.ptr, @intCast(json.len), &node) != plist.c.PLIST_ERR_SUCCESS or node == null)
+        return diag.fail("{s}: invalid output from {s}", .{ rel, actool });
+    return .{ .node = node };
+}
+
+/// Copy resources into the bundle (flattened like Xcode; `*.lproj/` kept),
+/// compiling storyboards, xibs, asset catalogs and string catalogs on the way.
+fn copyResources(c: Ctx, app: []const u8, build_dir: []const u8) !Bundled {
     const a = c.a;
     var frameworks = std.ArrayList([]const u8).init(a);
+    var info: ?plist.Plist = null;
+    var catalog: ?[]const u8 = null;
     var seen = std.StringHashMap([]const u8).init(a);
     const resources = try fsutil.discover(a, c.t.dir, c.t.resources, "resource");
     for (resources) |rel| {
         const sfx = fsutil.suffix(rel);
         const src = try c.t.path(a, rel);
-        if (fsutil.oneOf(sfx, &.{ ".xcassets", ".storyboard", ".xib", ".xcdatamodeld" })) {
-            diag.warn("{s}: skipped; compiling {s} needs Xcode tools (actool/ibtool/momc) that only run on macOS", .{ rel, sfx });
+        if (std.mem.eql(u8, sfx, ".xcdatamodeld")) {
+            diag.warn("{s}: skipped; Core Data models need Xcode's momc, which only runs on macOS", .{rel});
+            continue;
+        }
+        if (std.mem.eql(u8, sfx, ".xcassets")) {
+            if (catalog) |other| return diag.fail("only one asset catalog per target is supported ({s} and {s}); merge them", .{ other, rel });
+            catalog = rel;
+            info = try compileAssets(c, rel, src, app, build_dir);
             continue;
         }
         if (std.mem.eql(u8, sfx, ".xcstrings")) {
@@ -312,13 +365,29 @@ fn copyResources(c: Ctx, app: []const u8) ![]const []const u8 {
             if (std.mem.eql(u8, fsutil.suffix(parent), ".lproj"))
                 dest_rel = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.fs.path.basename(parent), dest_rel });
         }
+        const is_storyboard = std.mem.eql(u8, sfx, ".storyboard");
+        const is_xib = std.mem.eql(u8, sfx, ".xib");
+        if (is_storyboard or is_xib) {
+            const stem = dest_rel[0 .. dest_rel.len - sfx.len];
+            dest_rel = try std.fmt.allocPrint(a, "{s}{s}", .{ stem, if (is_storyboard) ".storyboardc" else ".nib" });
+        }
         if (seen.get(dest_rel)) |other| return diag.fail("resources {s} and {s} both map to {s} in the bundle", .{ other, rel, dest_rel });
-        for ([_][]const u8{ "Info.plist", "PkgInfo", c.t.name }) |reserved| if (std.mem.eql(u8, dest_rel, reserved))
+        for ([_][]const u8{ "Info.plist", "PkgInfo", "Assets.car", c.t.name }) |reserved| if (std.mem.eql(u8, dest_rel, reserved))
             return diag.fail("resource {s} would overwrite the bundle's {s}", .{ rel, reserved });
         try seen.put(dest_rel, rel);
-        try copyTree(a, src, try std.fs.path.join(a, &.{ app, dest_rel }));
+        const dest = try std.fs.path.join(a, &.{ app, dest_rel });
+        if (is_storyboard) {
+            if (!c.opts.verbose) diag.info("  IBTOOL {s}", .{rel});
+            if (std.fs.path.dirname(dest)) |d| try std.fs.cwd().makePath(d);
+            _ = try ibtool.compileStoryboard(a, src, dest);
+        } else if (is_xib) {
+            if (!c.opts.verbose) diag.info("  IBTOOL {s}", .{rel});
+            const bytes, _ = try ibtool.compileXib(a, src);
+            if (std.fs.path.dirname(dest)) |d| try std.fs.cwd().makePath(d);
+            try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = bytes });
+        } else try copyTree(a, src, dest);
     }
-    return frameworks.items;
+    return .{ .frameworks = frameworks.items, .info = info };
 }
 
 fn entitlementsFile(c: Ctx, build_dir: []const u8) !?[]const u8 {
@@ -357,9 +426,11 @@ fn buildDirect(c: Ctx) ![]const u8 {
     try std.fs.cwd().makePath(app);
     const app_exe = try std.fs.path.join(a, &.{ app, t.name });
     try std.fs.cwd().copyFile(exe, std.fs.cwd(), app_exe, .{ .override_mode = 0o755 });
-    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ app, "Info.plist" }), .data = try processInfoPlist(a, t, &c.tc.env) });
+    const bundled = try copyResources(c, app, build_dir);
+    defer if (bundled.info) |i| i.deinit();
+    const frameworks = bundled.frameworks;
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ app, "Info.plist" }), .data = try processInfoPlist(a, t, &c.tc.env, bundled.info) });
     try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ app, "PkgInfo" }), .data = "APPL????" });
-    const frameworks = try copyResources(c, app);
 
     if (ldid_opt) |ldid| {
         // Nested code first, then the containing executable.

@@ -176,6 +176,24 @@ pub const Toolchain = struct {
             diag.fail("missing tool: ldid ({s} not found on PATH). Install ldid (https://github.com/ProcursusTeam/ldid) or set toolchain.ldid; set `sign: false` to skip signing", .{p});
     }
 
+    // ---------------------------------------------------------- actool
+
+    fn findActool(t: *const Toolchain) !?[]const u8 {
+        const p = try fsutil.expandHome(t.a, t.cfg.actool, &t.env);
+        if (try fsutil.which(t.a, p, t.pathEnv())) |found| return found;
+        if (std.mem.indexOfScalar(u8, p, '/') != null) return null;
+        // `zig build actool` installs it next to idl.
+        const self_dir = std.fs.selfExeDirPathAlloc(t.a) catch return null;
+        const sibling = try std.fs.path.join(t.a, &.{ self_dir, p });
+        return if (fsutil.kindFollow(sibling) == .file) sibling else null;
+    }
+
+    /// Resolve the asset catalog compiler (needed only for .xcassets resources).
+    pub fn actool(t: *const Toolchain) ![]const u8 {
+        return (try t.findActool()) orelse
+            diag.fail("missing tool: {s} (needed for .xcassets). Build it with `zig build actool` in the idl repo (needs swift), or set toolchain.actool", .{t.cfg.actool});
+    }
+
     // ------------------------------------------------------------ check
 
     pub fn check(t: *const Toolchain) !bool {
@@ -193,11 +211,21 @@ pub const Toolchain = struct {
             .{ "swiftc", t.swiftc, t.swiftc != null },
             .{ "ldid", try fsutil.which(t.a, try fsutil.expandHome(t.a, t.cfg.ldid, &t.env), t.pathEnv()), true },
             .{ "xtool", try fsutil.which(t.a, t.cfg.xtool, t.pathEnv()), true },
+            .{ "actool", try t.findActool(), true },
+            .{ "rsvg-convert", try fsutil.which(t.a, "rsvg-convert", t.pathEnv()), true },
         };
         for (rows) |r| {
-            const optional = std.mem.eql(u8, r[0], "xtool");
+            const why: ?[]const u8 = if (std.mem.eql(u8, r[0], "xtool"))
+                "  (only needed for `builder: xtool`)"
+            else if (std.mem.eql(u8, r[0], "actool"))
+                "  (only needed for .xcassets; build with `zig build actool`)"
+            else if (std.mem.eql(u8, r[0], "rsvg-convert"))
+                "  (only needed for SVG images in .xcassets; librsvg)"
+            else
+                null;
+            const optional = why != null;
             const found = r[2] and r[1] != null;
-            const note = if (found) "" else if (optional) "  (only needed for `builder: xtool`)" else "  <-- missing";
+            const note = if (found) "" else why orelse "  <-- missing";
             try out.print("{s:<16} {s}{s}\n", .{ r[0], r[1] orelse "(not found)", note });
             if (!found and !optional) ok = false;
         }

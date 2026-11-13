@@ -13,6 +13,8 @@ const xcstrings = @import("xcstrings.zig");
 const verify = @import("verify.zig");
 const scaffold = @import("scaffold.zig");
 const jimpactor = @import("jimpactor.zig");
+const ibtool = @import("ibtool.zig");
+const nib = @import("nib.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
 const Allocator = std.mem.Allocator;
@@ -20,7 +22,7 @@ const Allocator = std.mem.Allocator;
 // zig-yaml logs every token at debug level; keep output clean in Debug builds.
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-const Command = enum { build, gen, check, list, clean, install, devices, verify, init, xcodeproj, plist, xcstrings, help };
+const Command = enum { build, gen, check, list, clean, install, devices, verify, init, xcodeproj, plist, xcstrings, ibtool, help };
 
 const main_params = clap.parseParamsComptime(
     \\-h, --help           Show help (also: idl <command> --help).
@@ -56,6 +58,7 @@ const usage_text =
     \\  verify <ipa>           structural IPA validation (ZIP CRCs, plist, Mach-O)
     \\  plist                  expand $(VARS) and edit a plist (Xcode Info.plist processing)
     \\  xcstrings <in> <dir>   convert a String Catalog to .strings/.stringsdict
+    \\  ibtool <file>          compile a .xib/.storyboard (-o OUT), or dump a .nib
     \\
     \\Global options:
     \\
@@ -121,6 +124,7 @@ fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: G
         .xcodeproj => try cmdXcodeproj(a, iter, g),
         .plist => try cmdPlist(a, iter),
         .xcstrings => try cmdXcstrings(a, iter),
+        .ibtool => try cmdIbtool(a, iter),
         .help => unreachable,
     }
 }
@@ -418,6 +422,37 @@ fn cmdXcstrings(a: Allocator, iter: *std.process.ArgIterator) !void {
     try xcstrings.convert(a, source, dir);
 }
 
+fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help           Show this help.
+        \\-o, --output <path>  Output .nib / .storyboardc (default: next to the input).
+        \\-d, --dump           Print the objects of a compiled .nib (or of the compiled input).
+        \\-t, --types          With --dump, show value encodings.
+        \\<path>
+        \\
+    );
+    const res = try parseSub(a, "ibtool", &params, parsers, iter);
+    const input = res.positionals[0] orelse return diag.fail("ibtool: expected a .xib, .storyboard or .nib file", .{});
+    const out = std.io.getStdOut().writer();
+    const show_types = res.args.types != 0;
+    const sfx = fsutil.suffix(input);
+    if (std.mem.eql(u8, sfx, ".xib")) {
+        const bytes, _ = try ibtool.compileXib(a, input);
+        if (res.args.dump != 0 and res.args.output == null) return nib.dump(a, bytes, out, show_types, "");
+        const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.nib", .{input[0 .. input.len - sfx.len]});
+        try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = bytes });
+        diag.info("wrote {s}", .{dest});
+    } else if (std.mem.eql(u8, sfx, ".storyboard")) {
+        const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.storyboardc", .{input[0 .. input.len - sfx.len]});
+        _ = try ibtool.compileStoryboard(a, input, dest);
+        diag.info("wrote {s}", .{dest});
+    } else {
+        const bytes = std.fs.cwd().readFileAlloc(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
+        if (!nib.isArchive(bytes)) return diag.fail("{s}: not a .xib, .storyboard or NIBArchive .nib", .{input});
+        try nib.dump(a, bytes, out, show_types, "");
+    }
+}
+
 test {
     _ = @import("ynode.zig");
     _ = @import("plist.zig");
@@ -433,4 +468,7 @@ test {
     _ = @import("builder.zig");
     _ = @import("scaffold.zig");
     _ = @import("jimpactor.zig");
+    _ = @import("xmldom.zig");
+    _ = @import("nib.zig");
+    _ = @import("ibtool.zig");
 }

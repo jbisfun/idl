@@ -8,8 +8,8 @@ From that file `idl`:
   `xtool.yml` + `Package.swift` for xtool, and `compile_commands.json` for
   clangd / sourcekit-lsp
 - runs builds: it calls clang, swiftc, xtool's `ld64.lld` and `ldid`,
-  processes Info.plist, copies resources, ad-hoc signs, writes the IPA, and
-  checks the result
+  processes Info.plist, compiles storyboards, XIBs and asset catalogs, copies
+  resources, ad-hoc signs, writes the IPA, and checks the result
 
 The build steps come from the Linux build used by LiveContainer.
 
@@ -18,6 +18,7 @@ The build steps come from the Linux build used by LiveContainer.
     xtool setup                   # Darwin SDK -> ~/.swiftpm/swift-sdks/darwin.artifactbundle
     zig build                     # builds ./zig-out/bin/idl (Zig 0.14.1)
     ./zig-out/bin/idl check       # verify the toolchain
+    zig build actool              # optional: .xcassets compiler (needs swift)
     ./zig-out/bin/idl build       # build every example in ./idlproj.yml
 
 Install on a phone through the running Jimpactor tray app:
@@ -33,9 +34,11 @@ Start a new app:
 ## Layout
 
     idlproj.yml        configuration for the examples in this repository
-    build.zig(.zon)    Zig build; pulls zig-clap, zig-yaml and libplist
+    build.zig(.zon)    Zig build; pulls zig-clap, zig-yaml, zig-xml and libplist
     src/               the idl tool (see docs/architecture.md)
-    examples/          ObjC, Swift and xtool/SwiftPM apps, plus xcconfig patterns
+    tools/idl-actool/  Swift wrapper around AssetKit for .xcassets
+    examples/          ObjC, Swift, storyboard/XIB/asset-catalog and xtool/SwiftPM
+                       apps, plus xcconfig patterns
     docs/              documentation
 
 ## Documentation
@@ -48,7 +51,7 @@ Start a new app:
 
 ## Tests
 
-    zig build test       # unit tests (config, plist, pbxproj, zip, Mach-O, codegen)
+    zig build test       # unit tests (config, plist, pbxproj, zip, Mach-O, nib, ibtool, ...)
     zig build check      # idl check
     zig build examples   # idl build --gen for every example (real arm64 builds)
 

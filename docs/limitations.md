@@ -11,18 +11,65 @@
 
 ## Xcode-only build steps
 
-These tools are macOS binaries and do not run on Linux. `idl` skips their
-inputs with a warning:
+These tools are macOS binaries with no Linux replacement here. `idl` skips
+their inputs with a warning:
 
-- asset catalogs (`.xcassets`, needs `actool`): no compiled `Assets.car` and
-  no app icon. Ship PNGs as plain resources or build the catalog on a Mac.
-- storyboards and XIBs (`ibtool`): build the UI in code. Note that
-  `UILaunchScreen` in Info.plist does not need a storyboard.
 - Core Data models (`.xcdatamodeld`, `momc`).
 - Metal shaders (`.metal`) are listed in generated Xcode projects but are not
   compiled by `direct` builds.
 
-String Catalogs (`.xcstrings`) are supported: `idl` converts them itself.
+String Catalogs (`.xcstrings`), storyboards, XIBs and asset catalogs are
+compiled on Linux, with the limits below.
+
+## Storyboards and XIBs (`idl ibtool`)
+
+The compiler is a Zig port of
+[davidquesada/ibtool](https://github.com/davidquesada/ibtool), a
+reverse-engineered NIB writer. Apple's format is undocumented, so:
+
+- **Not verified on a device yet.** The output decodes with idl's own reader and
+  has the same NIBArchive layout as Xcode's nibs, but no nib from `idl` has
+  been loaded by UIKit on a device. Test before relying on it.
+- **A subset of UIKit.** Supported elements: view controllers (plain,
+  navigation, table), `view`, `label`, `button` (title per state), `imageView`,
+  `textView`, `searchBar`, `navigationBar`/`navigationItem`/`barButtonItem`,
+  `visualEffectView` with blur/vibrancy, `tableView` with prototype cells,
+  frames, autoresizing masks, colors, fonts, constraints, outlets, actions and
+  segues (`show`, `showDetail`, `presentation`, `push`, `modal`, `replace`,
+  `custom`, and `rootViewController` relationships). `textField`, `switch`,
+  `slider`, `scrollView`, `activityIndicatorView` and `progressView` get their
+  class, frame and colors but none of their own attributes. Anything else (stack
+  views, collection views, tab bar controllers, images, gesture recognizers,
+  user-defined runtime attributes, trait variations, localization) is skipped
+  silently or with a warning.
+- **Safe-area layout guides** are treated as the view that owns them, so a
+  constraint to the safe area pins to the view's edge instead.
+- Constraints that refer to unsupported objects are dropped with a warning.
+- Named colors (`systemColor` / `name`) resolve through the document's own
+  `<resources>` section, so they become fixed colors and do not follow dark
+  mode. Text styles become fixed-size system fonts.
+- Only iOS documents (`targetRuntime="iOS.CocoaTouch"`). Each document produces
+  one nib per view controller and view; there are no per-device-idiom
+  variants.
+
+## Asset catalogs (`.xcassets`, AssetKit)
+
+Asset catalogs are compiled by `idl-actool`, a small Swift wrapper around
+[xtool-org/AssetKit](https://github.com/xtool-org/AssetKit). It is a separate
+binary because AssetKit is a Swift library.
+
+- Build it with `zig build actool`. This needs `swift` on PATH, and the binary
+  is about 60 MB because the Swift runtime and Foundation are linked in.
+- Only image sets, color sets and one app icon are supported, as far as AssetKit
+  supports them. Data sets, symbol sets, sprite atlases, on-demand resource tags
+  and named app icon alternates are not.
+- App icons need an explicit `scale` for every image, e.g. iPhone `60x60` @2x
+  and @3x. Xcode's single 1024 pt "universal" icon has no scale and AssetKit
+  rejects it. The `app_icon` setting is not passed on: AssetKit uses whichever
+  `.appiconset` the catalog has.
+- One `.xcassets` per target. Merge catalogs if you have several.
+- SVG images need `rsvg-convert` (librsvg) on PATH.
+- The catalog is recompiled on every build.
 
 ## Project model
 
@@ -67,6 +114,7 @@ String Catalogs (`.xcstrings`) are supported: `idl` converts them itself.
   volume.
 - `idl` does not install or download tools. Install the Swift toolchain,
   Darwin SDK, ldid and xtool yourself. `idl check` lists what is missing.
+  `idl-actool` is built from this repository with `zig build actool`.
 
 ## Configuration parsing (zig-yaml 0.1.x)
 

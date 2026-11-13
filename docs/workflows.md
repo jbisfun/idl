@@ -77,6 +77,35 @@ For a value that differs between machines or CI runs, reference an
 environment variable directly: an unknown `$(VAR)` falls back to the process
 environment.
 
+## Storyboards, XIBs and asset catalogs
+
+List them as resources like any other file. `idl build` compiles them into the
+bundle:
+
+| Resource | Bundle output | Compiled by |
+| --- | --- | --- |
+| `Main.storyboard` | `Main.storyboardc/` | `idl` (ibtool port) |
+| `Banner.xib` | `Banner.nib` | `idl` (ibtool port) |
+| `Assets.xcassets` | `Assets.car`, app icon PNGs, Info.plist icon keys | `idl-actool` (AssetKit) |
+
+Asset catalogs need `idl-actool`, which is built once:
+
+    zig build actool             # installs zig-out/bin/idl-actool next to idl
+    zig build actool -p zig-out/release   # if you use the release build
+
+`idl` looks for `toolchain.actool` on PATH, then next to its own executable.
+Point `UIMainStoryboardFile` / `UILaunchStoryboardName` in Info.plist at the
+storyboard names (without extension). `examples/ib-app` uses all three.
+
+To compile or inspect a single file:
+
+    idl ibtool Main.storyboard -o /tmp/Main.storyboardc
+    idl ibtool Banner.xib --dump          # compile and print the objects
+    idl ibtool Some.nib --dump --types    # dump any NIBArchive, even Xcode's
+
+See [limitations](limitations.md#storyboards-and-xibs-idl-ibtool) for what is
+supported.
+
 ## Install on a device (through Jimpactor)
 
 `idl`'s ad-hoc `ldid` signature is not a provisioning profile. With the

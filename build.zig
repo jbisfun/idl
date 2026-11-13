@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
 
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize });
+    const xml = b.dependency("xml", .{ .target = target, .optimize = optimize });
 
     const libplist = buildLibplist(b, target, optimize);
 
@@ -16,6 +17,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("clap", clap.module("clap"));
     mod.addImport("yaml", yaml.module("yaml"));
+    mod.addImport("xml", xml.module("xml"));
     mod.linkLibrary(libplist);
     // `idl init` scaffolds from the real examples so templates never drift.
     mod.addAnonymousImport("scaffold_main_m", .{ .root_source_file = b.path("examples/objc-app/Sources/main.m") });
@@ -29,6 +31,15 @@ pub fn build(b: *std.Build) void {
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run idl (pass arguments after --)").dependOn(&run.step);
+
+    // idl-actool: AssetKit (Swift) wrapper that compiles .xcassets. Needs a
+    // Swift toolchain, so it is opt-in: `zig build actool`.
+    const actool_build = b.addSystemCommand(&.{ "swift", "build", "-c", "release", "--static-swift-stdlib", "-Xlinker", "--strip-all", "--package-path" });
+    actool_build.addDirectoryArg(b.path("tools/idl-actool"));
+    actool_build.has_side_effects = true;
+    const actool_install = b.addInstallBinFile(b.path("tools/idl-actool/.build/release/idl-actool"), "idl-actool");
+    actool_install.step.dependOn(&actool_build.step);
+    b.step("actool", "Build and install idl-actool (AssetKit asset catalog compiler; needs swift)").dependOn(&actool_install.step);
 
     const tests = b.addTest(.{ .root_module = mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);

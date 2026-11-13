@@ -24,6 +24,7 @@ being ignored. Write version numbers as text and quote them when you like:
 | `xtool` | `xtool` | xtool executable (needed for `builder: xtool`) |
 | `ldid` | `ldid` | ldid path or command name (needed when a target signs) |
 | `jobs` | `0` | number of parallel compile jobs (`0` = number of CPUs) |
+| `actool` | `idl-actool` | asset catalog compiler (`zig build actool`); a path, or a name looked up on PATH and next to `idl` |
 | `jimpactor_dir` | `$XDG_CONFIG_HOME/Jimpactor` or `~/.config/Jimpactor` | Jimpactor data dir, used by `idl devices` and `idl install` |
 
 `~` is expanded in paths.

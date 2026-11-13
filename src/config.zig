@@ -24,6 +24,9 @@ pub const ToolchainConfig = struct {
     xtool: []const u8 = "xtool",
     /// ldid path or command name on PATH.
     ldid: []const u8 = "ldid",
+    /// Asset catalog compiler (tools/idl-actool, AssetKit). Path or command name;
+    /// also looked up next to the idl executable.
+    actool: []const u8 = "idl-actool",
     /// 0 = number of CPUs.
     jobs: usize = 0,
     /// Jimpactor data dir (relaunch.port, ipc.token). Default: $XDG_CONFIG_HOME/Jimpactor or ~/.config/Jimpactor.
@@ -155,7 +158,7 @@ const target_keys = [_][]const u8{
     "xcodeproj",   "compile_commands", "configuration", "package_swift",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
-const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "jobs", "jimpactor_dir" };
+const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
 const top_keys = [_][]const u8{ "toolchain", "defaults", "targets" };
 
 fn checkKeys(m: ynode.Map, allowed: []const []const u8, where: []const u8) !void {

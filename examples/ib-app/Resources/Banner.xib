@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.XIB" version="3.0" toolsVersion="23504" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES">
+    <objects>
+        <placeholder placeholderIdentifier="IBFilesOwner" id="-1" userLabel="File's Owner"/>
+        <placeholder placeholderIdentifier="IBFirstResponder" id="-2" customClass="UIResponder"/>
+        <view contentMode="scaleToFill" id="iN0-l3-epB">
+            <rect key="frame" x="0.0" y="0.0" width="353" height="44"/>
+            <autoresizingMask key="autoresizingMask" flexibleMaxX="YES" flexibleMaxY="YES"/>
+            <subviews>
+                <label opaque="NO" userInteractionEnabled="NO" contentMode="left" text="…and this banner came from a .xib" textAlignment="center" translatesAutoresizingMaskIntoConstraints="NO" id="bnr-01-Lbl">
+                    <rect key="frame" x="0.0" y="12" width="353" height="20"/>
+                    <fontDescription key="fontDescription" type="system" pointSize="15"/>
+                    <color key="textColor" white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
+                </label>
+            </subviews>
+            <color key="backgroundColor" red="0.969" green="0.580" blue="0.114" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+            <constraints>
+                <constraint firstItem="bnr-01-Lbl" firstAttribute="centerX" secondItem="iN0-l3-epB" secondAttribute="centerX" id="bc1-aa-001"/>
+                <constraint firstItem="bnr-01-Lbl" firstAttribute="centerY" secondItem="iN0-l3-epB" secondAttribute="centerY" id="bc2-aa-002"/>
+            </constraints>
+        </view>
+    </objects>
+</document>
