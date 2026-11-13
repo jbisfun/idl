@@ -47,7 +47,8 @@ targets:
     dir: apps/second
     bundle_id: com.example.second
     sources: [Sources]
-    entitlements: Entitlements.plist
+    entitlements:
+      get-task-allow: true
 ```
 
 To get starter files, run `idl init Second --dir apps/second` and then move
@@ -94,7 +95,7 @@ Asset catalogs need `idl-actool`, which is built once:
     zig build actool -p zig-out/release   # if you use the release build
 
 `idl` looks for `toolchain.actool` on PATH, then next to its own executable.
-Point `UIMainStoryboardFile` / `UILaunchStoryboardName` in Info.plist at the
+Set `info.UIMainStoryboardFile` / `info.UILaunchStoryboardName` in YAML to the
 storyboard names (without extension). `examples/ib-app` uses all three.
 
 To compile or inspect a single file:

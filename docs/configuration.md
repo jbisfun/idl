@@ -73,26 +73,30 @@ links. C++ sources add `-lc++`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `info_plist` | `Info.plist` | source Info.plist (XML, binary, JSON or OpenStep) |
+| `info_plist` | none | optional base Info.plist (XML, binary, JSON or OpenStep); otherwise generated entirely from YAML |
 | `info` | none | keys merged into Info.plist (see below) |
 | `plist_vars` | none | extra `$(VAR)` values for Info.plist and entitlements |
-| `entitlements` | none | entitlements plist passed to `ldid -S` |
+| `entitlements` | none | YAML mapping of entitlement keys, or an explicit legacy plist path; no capabilities are added implicitly |
 | `resources` | `[]` | files or directories copied into the bundle (see [limitations](limitations.md)) |
 | `sign` | `true` for `direct`, `false` for `xtool` | ad-hoc sign with ldid / pass `--sign` to xtool |
 | `app_icon` | `AppIcon` | asset-catalog icon name in the Xcode project |
-| `device_family` | `1,2` | `TARGETED_DEVICE_FAMILY` in the Xcode project |
+| `device_family` | `1,2` | generated `UIDeviceFamily` and Xcode `TARGETED_DEVICE_FAMILY` |
 
 Info.plist processing, in order:
 
-1. Add any missing standard keys: `CFBundleExecutable`, `CFBundleIdentifier`,
+1. Start with an empty dictionary (or the explicit `info_plist` base). Add any missing standard keys: `CFBundleExecutable`, `CFBundleIdentifier`,
    `CFBundleName`, `CFBundlePackageType`, `CFBundleInfoDictionaryVersion`,
-   `CFBundleShortVersionString`, `CFBundleVersion`.
+   `CFBundleShortVersionString`, `CFBundleVersion`. Also default display name
+   to the target name, development region to `en`, `LSRequiresIPhoneOS` to true,
+   device family to `device_family`, orientations to portrait, and `UILaunchScreen`
+   to an empty dictionary unless a launch storyboard is configured.
 2. Merge the `info:` mapping. Unquoted `true`/`false` become booleans,
    unquoted integers become `<integer>`, lists become arrays, mappings become
    dictionaries, and quoted values stay strings. Version keys such as
    `CFBundleVersion` always stay strings.
 3. Set `MinimumOSVersion` to `min_ios`.
-4. Expand `$(VAR)`, `${VAR}` and `$(VAR:modifier)` in every string. Values
+4. For direct builds, merge the asset compiler’s generated icon keys.
+5. Expand `$(VAR)`, `${VAR}` and `$(VAR:modifier)` in every string. Values
    come from `plist_vars`, then the built-in variables, then the environment.
    Unknown variables become empty strings. The modifier is ignored.
 
@@ -100,6 +104,40 @@ Built-in variables: `EXECUTABLE_NAME`, `PRODUCT_NAME`, `TARGET_NAME`,
 `PRODUCT_MODULE_NAME`, `PRODUCT_BUNDLE_IDENTIFIER`,
 `PRODUCT_BUNDLE_PACKAGE_TYPE`, `MARKETING_VERSION`, `CURRENT_PROJECT_VERSION`,
 `IPHONEOS_DEPLOYMENT_TARGET`, `DEVELOPMENT_LANGUAGE`.
+
+No hand-written XML is required:
+
+```yaml
+targets:
+  - name: MyApp
+    bundle_id: com.example.myapp
+    version: "1.0"
+    build_number: "1"
+    info:
+      CFBundleDisplayName: My App
+      NSCameraUsageDescription: Take a profile photo
+      UIMainStoryboardFile: Main
+      UILaunchStoryboardName: LaunchScreen
+      UIBackgroundModes: [audio]
+    entitlements:
+      get-task-allow: true
+      com.apple.security.application-groups: ["group.com.example.myapp"]
+```
+
+Omit storyboard keys for a programmatic UI. Omit `entitlements` when no
+capabilities are needed; `get-task-allow` is opt-in, not a release default.
+Entitlements support the same YAML types and variable expansion as `info`.
+They are requests, not provisioning: Apple capabilities still need an
+appropriate signing identity/profile. An explicit `info_plist` or string-valued
+`entitlements: Support/App.entitlements` remains supported. Missing explicit
+files are errors, never silently ignored.
+
+`idl gen` and `idl xcodeproj` write `.idl/Info.plist` and, when configured,
+`.idl/Entitlements.plist` inside each target directory. Xcode and xtool reference
+these generated files. Run `idl gen` after editing YAML before building in
+Xcode; values are expanded at generation time, not per Xcode configuration.
+Direct builds generate bundle metadata themselves; xtool metadata is regenerated
+before each xtool build. `.idl/` is disposable and should be gitignored.
 
 ### Code generation
 
@@ -145,7 +183,8 @@ targets:
     defines: [ENABLE_LOGGING, 'API_HOST="api.example.com"']
     frameworks: [UIKit, Foundation, AVFoundation]
     libraries: [z]
-    entitlements: Entitlements.plist
+    entitlements:
+      get-task-allow: true
     plist_vars:
       APP_GROUP: group.com.example.myapp
     info:
@@ -159,6 +198,7 @@ targets:
     dir: companion
     bundle_id: com.example.companion
     sources: [Sources/Companion]
-    info_plist: Support/Info.plist
+    info:
+      CFBundleDisplayName: My App
     frameworks: [UIKit]
 ```

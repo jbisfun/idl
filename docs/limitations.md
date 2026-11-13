@@ -58,8 +58,12 @@ Asset catalogs are compiled by `idl-actool`, a small Swift wrapper around
 [xtool-org/AssetKit](https://github.com/xtool-org/AssetKit). It is a separate
 binary because AssetKit is a Swift library.
 
-- Build it with `zig build actool`. This needs `swift` on PATH, and the binary
-  is about 60 MB because the Swift runtime and Foundation are linked in.
+- Build it with `zig build actool`. This needs `swift` on PATH. By default it
+  uses the toolchain’s shared Swift runtime (about 1.2 MB here). Swift embeds
+  a runtime search path pointing at that toolchain: if you remove it, rebuild
+  `idl-actool`. Use `zig build actool -Dactool-static=true` for a standalone
+  Swift runtime (about 59 MB here). xtool’s private embedded runtime cannot
+  be shared with another executable.
 - Only image sets, color sets and one app icon are supported, as far as AssetKit
   supports them. Data sets, symbol sets, sprite atlases, on-demand resource tags
   and named app icon alternates are not.

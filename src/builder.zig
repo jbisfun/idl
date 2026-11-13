@@ -10,7 +10,7 @@ const zip = @import("zip.zig");
 const verify = @import("verify.zig");
 const codegen = @import("codegen.zig");
 const ibtool = @import("ibtool.zig");
-const ynode = @import("ynode.zig");
+const metadata = @import("metadata.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
 const Allocator = std.mem.Allocator;
@@ -205,82 +205,8 @@ fn link(c: Ctx, sources: []const []const u8, objects: []const []const u8, object
 
 // ---------------------------------------------------------------- bundling
 
-fn ynodeToPlist(a: Allocator, key: []const u8, n: ynode.Node) !plist.c.plist_t {
-    return switch (n) {
-        .null => diag.fail("info.{s}: null is not a plist value", .{key}),
-        .scalar => |s| if (s.quoted) try plist.newString(a, s.text) else try plist.parseCliValue(a, key, s.text),
-        .list => |items| blk: {
-            const arr = plist.c.plist_new_array();
-            for (items) |item| _ = plist.c.plist_array_append_item(arr, try ynodeToPlist(a, key, item));
-            break :blk arr;
-        },
-        .map => |m| blk: {
-            const d = plist.Plist.newDict();
-            for (m.keys, m.values) |k, v| try d.set(a, k, try ynodeToPlist(a, k, v));
-            break :blk d.node;
-        },
-    };
-}
-
-pub fn buildVars(a: Allocator, t: Target) !plist.Vars {
-    var vars = plist.Vars.init(a);
-    const module = try a.dupe(u8, t.name);
-    for (module) |*ch| if (!std.ascii.isAlphanumeric(ch.*)) {
-        ch.* = '_';
-    };
-    try vars.put("EXECUTABLE_NAME", t.name);
-    try vars.put("PRODUCT_NAME", t.name);
-    try vars.put("TARGET_NAME", t.name);
-    try vars.put("PRODUCT_MODULE_NAME", module);
-    try vars.put("PRODUCT_BUNDLE_IDENTIFIER", t.bundle_id);
-    try vars.put("PRODUCT_BUNDLE_PACKAGE_TYPE", "APPL");
-    try vars.put("MARKETING_VERSION", t.version);
-    try vars.put("CURRENT_PROJECT_VERSION", t.build_number);
-    try vars.put("IPHONEOS_DEPLOYMENT_TARGET", t.min_ios);
-    try vars.put("DEVELOPMENT_LANGUAGE", "en");
-    if (t.plist_vars) |m| for (m.keys, m.values) |k, v| switch (v) {
-        .scalar => |s| try vars.put(k, s.text),
-        else => return diag.fail("plist_vars.{s} must be a string", .{k}),
-    };
-    return vars;
-}
-
-/// Info.plist with `info:` overrides applied, variables expanded and
-/// MinimumOSVersion forced to the target's deployment version. `generated`
-/// (keys produced by resource compilers, e.g. app icons) is merged last.
-pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap, generated: ?plist.Plist) ![]const u8 {
-    const root = try plist.readFile(a, try t.path(a, t.info_plist));
-    defer root.deinit();
-    if (!root.isDict()) return diag.fail("{s}: root must be a dictionary", .{t.info_plist});
-    const defaults = [_][2][]const u8{
-        .{ "CFBundleExecutable", "$(EXECUTABLE_NAME)" },
-        .{ "CFBundleIdentifier", "$(PRODUCT_BUNDLE_IDENTIFIER)" },
-        .{ "CFBundleName", "$(PRODUCT_NAME)" },
-        .{ "CFBundlePackageType", "APPL" },
-        .{ "CFBundleInfoDictionaryVersion", "6.0" },
-        .{ "CFBundleShortVersionString", "$(MARKETING_VERSION)" },
-        .{ "CFBundleVersion", "$(CURRENT_PROJECT_VERSION)" },
-    };
-    for (defaults) |kv| try root.setDefault(a, kv[0], try plist.newString(a, kv[1]));
-    if (t.info) |m| for (m.keys, m.values) |k, v| try root.set(a, k, try ynodeToPlist(a, k, v));
-    try root.set(a, "MinimumOSVersion", try plist.newString(a, t.min_ios));
-    if (generated) |g| {
-        var it: plist.c.plist_dict_iter = null;
-        plist.c.plist_dict_new_iter(g.node, &it);
-        defer plist.c.plist_dict_free_iter(it);
-        while (true) {
-            var key: [*c]u8 = null;
-            var val: plist.c.plist_t = null;
-            plist.c.plist_dict_next_item(g.node, it, &key, &val);
-            if (val == null) break;
-            defer plist.c.plist_mem_free(key);
-            try root.set(a, std.mem.span(key), plist.c.plist_copy(val));
-        }
-    }
-    var vars = try buildVars(a, t);
-    try plist.expand(a, root.node, &vars, env);
-    return root.toXml(a);
-}
+pub const buildVars = metadata.buildVars;
+pub const processInfoPlist = metadata.processInfoPlist;
 
 fn copyTree(a: Allocator, src: []const u8, dst: []const u8) !void {
     switch (fsutil.kind(src)) {
@@ -391,13 +317,9 @@ fn copyResources(c: Ctx, app: []const u8, build_dir: []const u8) !Bundled {
 }
 
 fn entitlementsFile(c: Ctx, build_dir: []const u8) !?[]const u8 {
-    const rel = c.t.entitlements orelse return null;
-    const value = try plist.readFile(c.a, try c.t.path(c.a, rel));
-    defer value.deinit();
-    var vars = try buildVars(c.a, c.t);
-    try plist.expand(c.a, value.node, &vars, &c.tc.env);
+    const xml = (try metadata.entitlements(c.a, c.t, &c.tc.env)) orelse return null;
     const out = try std.fmt.allocPrint(c.a, "{s}/{s}.xcent", .{ build_dir, c.t.name });
-    try std.fs.cwd().writeFile(.{ .sub_path = out, .data = try value.toXml(c.a) });
+    try std.fs.cwd().writeFile(.{ .sub_path = out, .data = xml });
     return out;
 }
 
@@ -498,4 +420,17 @@ test "depfile parsing" {
     const deps = try depfileInputs(arena.allocator(), "build/obj/main.m.o: Sources/main.m \\\n  /sdk/UIKit.h My\\ Header.h\n\nSources/main.m:\n");
     try std.testing.expectEqual(@as(usize, 3), deps.len);
     try std.testing.expectEqualStrings("My Header.h", deps[2]);
+}
+
+test "generate Info.plist without a template" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try config.parse(a, "targets:\n  - name: Bare\n    bundle_id: com.example.bare\n    info:\n      CFBundleDisplayName: My App\n      NSCameraUsageDescription: Take photos\n", "/project/idlproj.yml");
+    const bytes = try processInfoPlist(a, cfg.targets[0], null, null);
+    const value = try plist.parse(bytes);
+    defer value.deinit();
+    try std.testing.expectEqualStrings("My App", (try value.getString(a, "CFBundleDisplayName")).?);
+    try std.testing.expectEqualStrings("Bare", (try value.getString(a, "CFBundleExecutable")).?);
+    try std.testing.expect(try value.get(a, "UIDeviceFamily") != null);
 }

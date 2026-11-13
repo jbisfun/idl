@@ -51,12 +51,13 @@ pub const Target = struct {
     app_icon: []const u8 = "AppIcon",
     sources: []const []const u8 = &.{"Sources"},
     resources: []const []const u8 = &.{},
-    info_plist: []const u8 = "Info.plist",
+    info_plist: ?[]const u8 = null,
     /// Keys merged into the processed Info.plist (`$(VAR)` expanded).
     info: ?ynode.Map = null,
     /// Extra `$(VAR)` values for Info.plist expansion.
     plist_vars: ?ynode.Map = null,
     entitlements: ?[]const u8 = null,
+    entitlement_values: ?ynode.Map = null,
     frameworks: []const []const u8 = &.{ "UIKit", "Foundation" },
     weak_frameworks: []const []const u8 = &.{},
     libraries: []const []const u8 = &.{},
@@ -84,8 +85,8 @@ pub const Target = struct {
             .swift_version = t.swift_version,
             .device_family = t.device_family,
             .app_icon = t.app_icon,
-            .info_plist = t.info_plist,
-            .entitlements = t.entitlements,
+            .info_plist = ".idl/Info.plist",
+            .entitlements = if (t.entitlements != null or t.entitlement_values != null) ".idl/Entitlements.plist" else null,
             .frameworks = t.frameworks,
             .sources = t.sources,
             .resources = t.resources,
@@ -150,12 +151,12 @@ pub fn find(a: Allocator, start: []const u8) ![]const u8 {
 // ---------------------------------------------------------------- loading
 
 const target_keys = [_][]const u8{
-    "name",        "dir",           "builder",         "bundle_id",     "min_ios",       "arch",
-    "opt",         "swift_opt",     "build_dir",       "version",       "build_number",  "swift_version",
-    "device_family", "app_icon",    "sources",         "resources",     "info_plist",    "info",
-    "plist_vars",  "entitlements",  "frameworks",      "weak_frameworks", "libraries",   "defines",
-    "include_dirs", "cflags",       "swiftflags",      "ldflags",       "bridging_header", "sign",
-    "xcodeproj",   "compile_commands", "configuration", "package_swift",
+    "name",          "dir",              "builder",       "bundle_id",       "min_ios",         "arch",
+    "opt",           "swift_opt",        "build_dir",     "version",         "build_number",    "swift_version",
+    "device_family", "app_icon",         "sources",       "resources",       "info_plist",      "info",
+    "plist_vars",    "entitlements",     "frameworks",    "weak_frameworks", "libraries",       "defines",
+    "include_dirs",  "cflags",           "swiftflags",    "ldflags",         "bridging_header", "sign",
+    "xcodeproj",     "compile_commands", "configuration", "package_swift",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
 const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
@@ -277,7 +278,9 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
         if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id"))) continue;
         const value = m.get(field.name) orelse if (defaults) |d| d.get(field.name) else null;
         if (value) |v| {
-            @field(t, field.name) = switch (field.type) {
+            if (comptime std.mem.eql(u8, field.name, "entitlements")) {
+                if (v == .map) t.entitlement_values = v.map else t.entitlements = if (v == .null) null else try c.str(v, field.name);
+            } else @field(t, field.name) = switch (field.type) {
                 []const u8 => try c.str(v, field.name),
                 ?[]const u8 => if (v == .null) null else try c.str(v, field.name),
                 []const []const u8 => try c.strList(v, field.name),
@@ -293,8 +296,8 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
 
     if (!isBundleId(t.bundle_id)) return diag.fail("{s}: invalid bundle_id '{s}'", .{ c.where, t.bundle_id });
     for ([_]struct { []const u8, []const u8 }{
-        .{ "min_ios", t.min_ios },             .{ "version", t.version },
-        .{ "build_number", t.build_number },   .{ "swift_version", t.swift_version },
+        .{ "min_ios", t.min_ios },           .{ "version", t.version },
+        .{ "build_number", t.build_number }, .{ "swift_version", t.swift_version },
     }) |kv| if (!isVersion(kv[1])) return diag.fail("{s}: '{s}' must be a numeric version string (got '{s}')", .{ c.where, kv[0], kv[1] });
     if (!isDeviceFamily(t.device_family)) return diag.fail("{s}: device_family must be a comma-separated list of integers", .{c.where});
     if (!isName(t.app_icon)) return diag.fail("{s}: app_icon must be a simple asset name", .{c.where});
@@ -303,7 +306,7 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     if (t.sources.len == 0) return diag.fail("{s}: 'sources' must not be empty", .{c.where});
     for (t.sources) |s| try fsutil.validateRelativePath(s, "source path");
     for (t.resources) |r| try fsutil.validateRelativePath(r, "resource path");
-    try fsutil.validateRelativePath(t.info_plist, "info_plist");
+    if (t.info_plist) |f| try fsutil.validateRelativePath(f, "info_plist");
     if (t.entitlements) |e| try fsutil.validateRelativePath(e, "entitlements");
     if (t.bridging_header) |h| try fsutil.validateRelativePath(h, "bridging_header");
     try fsutil.validateRelativePath(t.build_dir, "build_dir");

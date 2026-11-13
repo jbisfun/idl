@@ -28,6 +28,7 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/builder.zig` | parallel incremental compile, link, bundle assembly, signing, packaging, xtool runs, clean |
 | `src/codegen.zig` | `xtool.yml`, `Package.swift`, `compile_commands.json`, protection against overwriting non-generated files |
 | `src/pbxproj.zig` | deterministic Xcode project + scheme; atomic, symlink-safe publishing |
+| `src/metadata.zig` | YAML-driven Info.plist and entitlements, shared by direct, Xcode and xtool builds |
 | `src/plist.zig` | libplist wrapper, Xcode `$(VAR)` expansion, CLI value parsing |
 | `src/xcstrings.zig` | String Catalog to `.strings` / `.stringsdict` |
 | `src/zip.zig` | deterministic ZIP writer (std.compress.flate) and CRC-checking reader |

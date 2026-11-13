@@ -4,6 +4,7 @@ const std = @import("std");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const config = @import("config.zig");
+const metadata = @import("metadata.zig");
 const pbxproj = @import("pbxproj.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
@@ -23,6 +24,8 @@ pub fn writeGenerated(a: Allocator, path: []const u8, content: []const u8) !bool
 }
 
 fn report(path: []const u8, changed: bool) void {
+    // Zig's --listen test runner reserves stdout for its binary protocol.
+    if (@import("builtin").is_test) return;
     diag.info("  GEN  {s}{s}", .{ path, if (changed) "" else " (unchanged)" });
 }
 
@@ -31,8 +34,8 @@ fn report(path: []const u8, changed: bool) void {
 pub fn xtoolYml(a: Allocator, t: Target) ![]const u8 {
     var b = std.ArrayList(u8).init(a);
     const w = b.writer();
-    try w.print("# " ++ marker ++ "; edit idlproj.yml instead.\nversion: 1\nbundleID: {s}\nproduct: {s}\ninfoPath: {s}\n", .{ t.bundle_id, t.name, t.info_plist });
-    if (t.entitlements) |e| try w.print("entitlementsPath: {s}\n", .{e});
+    try w.print("# " ++ marker ++ "; edit idlproj.yml instead.\nversion: 1\nbundleID: {s}\nproduct: {s}\ninfoPath: {s}\n", .{ t.bundle_id, t.name, ".idl/Info.plist" });
+    if (t.entitlements != null or t.entitlement_values != null) try w.writeAll("entitlementsPath: .idl/Entitlements.plist\n");
     return b.items;
 }
 
@@ -166,6 +169,7 @@ pub fn packageSwift(a: Allocator, t: Target) ![]const u8 {
 }
 
 pub fn genXtool(a: Allocator, t: Target) !void {
+    try genMetadata(a, t);
     const yml = try t.path(a, "xtool.yml");
     report(yml, try writeGenerated(a, yml, try xtoolYml(a, t)));
     if (t.package_swift) {
@@ -223,9 +227,26 @@ pub const Options = struct {
     compile_commands: bool = true,
 };
 
+/// Both project formats consume the same expanded metadata as direct builds.
+pub fn genMetadata(a: Allocator, t: Target) !void {
+    var env = try std.process.getEnvMap(a);
+    const path = try t.path(a, ".idl/Info.plist");
+    const xml = try metadata.processInfoPlist(a, t, &env, null);
+    const tagged = try std.mem.replaceOwned(u8, a, xml, "<plist", "<!-- " ++ marker ++ "; edit YAML instead. -->\n<plist");
+    try fsutil.rejectSymlinkComponents(a, t.dir, ".idl/Info.plist");
+    report(path, try writeGenerated(a, path, tagged));
+    if (try metadata.entitlements(a, t, &env)) |ent| {
+        const ep = try t.path(a, ".idl/Entitlements.plist");
+        try fsutil.rejectSymlinkComponents(a, t.dir, ".idl/Entitlements.plist");
+        const et = try std.mem.replaceOwned(u8, a, ent, "<plist", "<!-- " ++ marker ++ "; edit YAML instead. -->\n<plist");
+        report(ep, try writeGenerated(a, ep, et));
+    }
+}
+
 pub fn generate(a: Allocator, tc: *const Toolchain, t: Target, opts: Options) !void {
     if (t.builder == .xtool) try genXtool(a, t);
     if (opts.xcodeproj and t.xcodeproj) {
+        try genMetadata(a, t);
         const out = try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
         report(try pbxproj.generateProject(a, t.manifest(), t.dir, out), true);
     }
@@ -280,11 +301,32 @@ test "Package.swift for an Objective-C xtool target" {
         \\version: 1
         \\bundleID: com.example.app
         \\product: App
-        \\infoPath: xtool-support/Info.plist
+        \\infoPath: .idl/Info.plist
         \\
     , try xtoolYml(a, t));
     // Hand-written files are never overwritten.
     const path = try std.fs.path.join(a, &.{ t.dir, "Package.swift" });
     try tmp.dir.writeFile(.{ .sub_path = "Package.swift", .data = "// mine\n" });
     try std.testing.expectError(error.Invalid, writeGenerated(a, path, "x"));
+}
+
+test "project metadata is emitted from YAML without input plists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    const cfg = try config.parse(a, "targets:\n  - name: Plain\n    bundle_id: com.example.plain\n    info:\n      UIMainStoryboardFile: Main\n      UILaunchStoryboardName: Launch\n    entitlements:\n      get-task-allow: false\n", try std.fs.path.join(a, &.{ root, "idlproj.yml" }));
+    const t = cfg.targets[0];
+    try genMetadata(a, t);
+    try genMetadata(a, t); // deterministic and accepts its own marker
+    const p = try @import("plist.zig").readFile(a, try t.path(a, ".idl/Info.plist"));
+    defer p.deinit();
+    try std.testing.expectEqualStrings("Main", (try p.getString(a, "UIMainStoryboardFile")).?);
+    try std.testing.expect(try p.get(a, "UILaunchScreen") == null);
+    try std.testing.expectEqualStrings(".idl/Info.plist", t.manifest().info_plist);
+    try std.testing.expectEqualStrings(".idl/Entitlements.plist", t.manifest().entitlements.?);
+    const yml = try xtoolYml(a, t);
+    try std.testing.expect(std.mem.indexOf(u8, yml, "entitlementsPath: .idl/Entitlements.plist") != null);
 }

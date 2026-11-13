@@ -30,6 +30,14 @@ Mach-O files and handles plists (with libplist) itself.
 To use `idl` anywhere, copy `zig-out/bin/idl` into a directory on your `PATH`,
 or use `zig build -p ~/.local`.
 
+`idl init` creates only app source, `.gitignore` and `idlproj.yml`. Info.plist
+and entitlements are generated from YAML; configure arbitrary keys under
+`info:` and `entitlements:`. No source XML is required.
+
+For asset catalogs, also run `zig build actool` with the Swift toolchain on
+PATH. This helper uses shared Swift runtime libraries by default; use
+`-Dactool-static=true` when distributing it independently of that toolchain.
+
 ## Check the toolchain
 
     idl check

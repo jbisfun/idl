@@ -8,26 +8,6 @@ const Allocator = std.mem.Allocator;
 
 pub const Lang = enum { objc, swift };
 
-const info_plist =
-    \\<?xml version="1.0" encoding="UTF-8"?>
-    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    \\<plist version="1.0"><dict>
-    \\<key>CFBundleDevelopmentRegion</key><string>$(DEVELOPMENT_LANGUAGE)</string>
-    \\<key>CFBundleDisplayName</key><string>$(PRODUCT_NAME)</string>
-    \\<key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
-    \\<key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-    \\<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    \\<key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
-    \\<key>CFBundlePackageType</key><string>APPL</string>
-    \\<key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
-    \\<key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
-    \\<key>LSRequiresIPhoneOS</key><true/>
-    \\<key>UILaunchScreen</key><dict/>
-    \\<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
-    \\</dict></plist>
-    \\
-;
-
 const project_yml =
     \\# idl project configuration. Reference: docs/configuration.md
     \\toolchain:
@@ -40,8 +20,6 @@ const project_yml =
     \\    version: "1.0"
     \\    build_number: "1"
     \\    sources: [Sources]
-    \\    info_plist: Info.plist
-    \\    entitlements: Entitlements.plist
     \\    frameworks: [UIKit, Foundation]
     \\    xcodeproj: true
     \\    compile_commands: true
@@ -74,8 +52,6 @@ pub fn init(a: Allocator, name: []const u8, lang: Lang, bundle_id_opt: ?[]const 
     if (fsutil.kind(cfg_path) != .missing) return diag.fail("{s} already exists", .{cfg_path});
     const files = [_]struct { []const u8, []const u8 }{
         .{ config.file_name, yml },
-        .{ "Info.plist", info_plist },
-        .{ "Entitlements.plist", @embedFile("scaffold_entitlements") },
         .{ ".gitignore", gitignore },
         switch (lang) {
             .objc => .{ "Sources/main.m", @embedFile("scaffold_main_m") },

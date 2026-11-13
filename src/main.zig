@@ -361,6 +361,7 @@ fn cmdXcodeproj(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const name = res.positionals[0] orelse return diag.fail("xcodeproj: expected a target name", .{});
     const t = (try p.cfg.select(a, &.{name}))[0];
     const out = res.args.output orelse try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
+    try codegen.genMetadata(a, t);
     diag.info("{s}", .{try pbxproj.generateProject(a, t.manifest(), t.dir, out)});
 }
 

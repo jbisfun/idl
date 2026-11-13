@@ -22,7 +22,6 @@ pub fn build(b: *std.Build) void {
     // `idl init` scaffolds from the real examples so templates never drift.
     mod.addAnonymousImport("scaffold_main_m", .{ .root_source_file = b.path("examples/objc-app/Sources/main.m") });
     mod.addAnonymousImport("scaffold_main_swift", .{ .root_source_file = b.path("examples/swift-app/Sources/main.swift") });
-    mod.addAnonymousImport("scaffold_entitlements", .{ .root_source_file = b.path("examples/objc-app/Entitlements.plist") });
 
     const exe = b.addExecutable(.{ .name = "idl", .root_module = mod });
     b.installArtifact(exe);
@@ -34,7 +33,10 @@ pub fn build(b: *std.Build) void {
 
     // idl-actool: AssetKit (Swift) wrapper that compiles .xcassets. Needs a
     // Swift toolchain, so it is opt-in: `zig build actool`.
-    const actool_build = b.addSystemCommand(&.{ "swift", "build", "-c", "release", "--static-swift-stdlib", "-Xlinker", "--strip-all", "--package-path" });
+    const static_runtime = b.option(bool, "actool-static", "Embed the Swift runtime in idl-actool") orelse false;
+    const actool_build = b.addSystemCommand(&.{ "swift", "build", "-c", "release" });
+    if (static_runtime) actool_build.addArg("--static-swift-stdlib");
+    actool_build.addArgs(&.{ "-Xlinker", "--strip-all", "--package-path" });
     actool_build.addDirectoryArg(b.path("tools/idl-actool"));
     actool_build.has_side_effects = true;
     const actool_install = b.addInstallBinFile(b.path("tools/idl-actool/.build/release/idl-actool"), "idl-actool");
@@ -75,10 +77,10 @@ fn buildLibplist(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     lib.addCSourceFiles(.{
         .root = dep.path(""),
         .files = &.{
-            "src/base64.c",       "src/bytearray.c",    "src/hashtable.c",  "src/ptrarray.c",
-            "src/time64.c",       "src/common.c",       "src/xplist.c",     "src/bplist.c",
-            "src/jsmn.c",         "src/jplist.c",       "src/oplist.c",     "src/out-default.c",
-            "src/out-plutil.c",   "src/out-limd.c",     "src/plist.c",      "libcnary/node.c",
+            "src/base64.c",         "src/bytearray.c", "src/hashtable.c", "src/ptrarray.c",
+            "src/time64.c",         "src/common.c",    "src/xplist.c",    "src/bplist.c",
+            "src/jsmn.c",           "src/jplist.c",    "src/oplist.c",    "src/out-default.c",
+            "src/out-plutil.c",     "src/out-limd.c",  "src/plist.c",     "libcnary/node.c",
             "libcnary/node_list.c",
         },
         .flags = &.{ "-std=gnu11", "-fno-sanitize=undefined" },

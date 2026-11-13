@@ -29,8 +29,11 @@ targets:
     dir: examples/objc-app
     bundle_id: com.example.objcexample
     sources: [Sources]
-    info_plist: Info.plist
-    entitlements: Entitlements.plist
+    info:
+      CFBundleDisplayName: "Objective-C Example"
+      UISupportedInterfaceOrientations: ["UIInterfaceOrientationPortrait"]
+    entitlements:
+      get-task-allow: true
     xcodeproj: true
 
   # Storyboards, xibs and an asset catalog, compiled on Linux.
@@ -39,16 +42,24 @@ targets:
     bundle_id: com.example.ibexample
     sources: [Sources]
     resources: [Resources]
-    info_plist: Info.plist
-    entitlements: Entitlements.plist
+    info:
+      CFBundleDisplayName: "IB Example"
+      UISupportedInterfaceOrientations: ["UIInterfaceOrientationPortrait"]
+      UIMainStoryboardFile: "Main"
+      UILaunchStoryboardName: "LaunchScreen"
+    entitlements:
+      get-task-allow: true
     xcodeproj: true
 
   - name: SwiftExample
     dir: examples/swift-app
     bundle_id: com.example.swiftexample
     sources: [Sources]
-    info_plist: Info.plist
-    entitlements: Entitlements.plist
+    info:
+      CFBundleDisplayName: "Swift Example"
+      UISupportedInterfaceOrientations: ["UIInterfaceOrientationPortrait"]
+    entitlements:
+      get-task-allow: true
     swift_version: "5.0"
     xcodeproj: true
 
@@ -57,6 +68,8 @@ targets:
     dir: examples/xtool-swiftpm
     bundle_id: com.example.xtoolapp
     sources: [Sources/XtoolExample]
-    info_plist: xtool-support/Info.plist
+    info:
+      CFBundleDisplayName: "Xtool Example"
+      UISupportedInterfaceOrientations: ["UIInterfaceOrientationPortrait"]
     frameworks: [UIKit]
     configuration: release
