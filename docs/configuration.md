@@ -84,6 +84,7 @@ without requiring `dsymutil`. Otherwise clang links. C++ sources add `-lc++`.
 | `resources` | `[]` | files or directories copied into the bundle (see [limitations](limitations.md)) |
 | `sign` | `true` for `direct`, `false` for `xtool` | ad-hoc sign with ldid / pass `--sign` to xtool |
 | `app_icon` | `AppIcon` | asset-catalog icon name in the Xcode project |
+| `icon` | none | xtool targets only: a PNG copied to the app root and set as `CFBundleIconFile` (xtool `iconPath`) |
 | `device_family` | `1,2` | generated `UIDeviceFamily` and Xcode `TARGETED_DEVICE_FAMILY` |
 
 Info.plist processing, in order:

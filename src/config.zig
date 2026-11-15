@@ -55,6 +55,8 @@ pub const Target = struct {
     swift_version: []const u8 = "5.0",
     device_family: []const u8 = "1,2",
     app_icon: []const u8 = "AppIcon",
+    /// xtool builder only: PNG copied to the app root as CFBundleIconFile.
+    icon: ?[]const u8 = null,
     sources: []const []const u8 = &.{"Sources"},
     resources: []const []const u8 = &.{},
     info_plist: ?[]const u8 = null,
@@ -185,7 +187,7 @@ const target_keys = [_][]const u8{
     "include_dirs",    "cflags",           "swiftflags",
     "ldflags",         "bridging_header",  "sign",
     "xcodeproj",       "compile_commands", "configuration",
-    "package_swift",
+    "package_swift",   "icon",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
 const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
@@ -338,6 +340,11 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     if (t.info_plist) |f| try fsutil.validateRelativePath(f, "info_plist");
     if (t.entitlements) |e| try fsutil.validateRelativePath(e, "entitlements");
     if (t.bridging_header) |h| try fsutil.validateRelativePath(h, "bridging_header");
+    if (t.icon) |i| {
+        try fsutil.validateRelativePath(i, "icon");
+        if (t.builder != .xtool) return diag.fail("{s}: 'icon' is for xtool targets; direct targets take the app icon from an asset catalog", .{c.where});
+        if (!std.ascii.endsWithIgnoreCase(i, ".png")) return diag.fail("{s}: icon must be a .png file", .{c.where});
+    }
     try fsutil.validateRelativePath(t.build_dir, "build_dir");
     if (!std.mem.eql(u8, t.configuration, "debug") and !std.mem.eql(u8, t.configuration, "release"))
         return diag.fail("{s}: configuration must be 'debug' or 'release'", .{c.where});

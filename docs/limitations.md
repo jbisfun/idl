@@ -107,9 +107,11 @@ binary because AssetKit is a Swift library.
 
 ## xtool builder
 
-- `resources:` orchestration currently requires `builder: direct`. The generated
-  SwiftPM package does not declare arbitrary resource paths; idl errors rather
-  than silently omitting them. xtool manages its own build and packaging cache.
+- xtool targets pass `resources:` to xtool.yml, which copies them verbatim into
+  the app root (`.lproj` folders, plain files). Resources that need a compiler
+  (`.xcassets`, storyboards, XIBs, `.xcstrings`, Core Data, Metal, Core ML) are
+  rejected; use `builder: direct` for those. xtool manages its own build and
+  packaging cache.
 
 - SwiftPM cannot mix Swift and C-family files in one target, so an xtool
   target is either all Swift or all C/Objective-C. Use `builder: direct` for

@@ -358,8 +358,17 @@ pub fn checkTarget(a: Allocator, tc: *Toolchain, t: Target, strict: bool) !void 
     } else {
         const xtool = (try fsutil.which(a, tc.cfg.xtool, tc.pathEnv())) orelse return diag.fail("missing tool: {s}", .{tc.cfg.xtool});
         _ = try tc.identity(xtool, true);
-        if (t.resources.len > 0) return diag.fail("{s}: resource orchestration requires builder: direct; xtool's generated package does not declare these resources", .{t.name});
-        _ = try codegen.packageSwift(a, t);
+        // xtool copies `resources:` verbatim into the app root; anything that
+        // needs an idl resource compiler still requires builder: direct.
+        for (try fsutil.discover(a, t.dir, t.resources, "resource")) |rel| {
+            if (codegen.xtoolCompiledResource(rel))
+                return diag.fail("{s}: {s} needs a resource compiler; xtool targets only copy resources verbatim (use builder: direct)", .{ t.name, rel });
+        }
+        if (t.icon) |i| {
+            try fsutil.rejectSymlinkComponents(a, t.dir, i);
+            if (fsutil.kind(try t.path(a, i)) != .file) return diag.fail("{s}: icon not found: {s}", .{ t.name, i });
+        }
+        if (t.package_swift) _ = try codegen.packageSwift(a, t);
     }
     _ = try metadata.processInfoPlist(a, t, &tc.env, null);
     _ = try metadata.entitlements(a, t, &tc.env);

@@ -36,7 +36,25 @@ pub fn xtoolYml(a: Allocator, t: Target) ![]const u8 {
     const w = b.writer();
     try w.print("# " ++ marker ++ "; edit idlproj.yml instead.\nversion: 1\nbundleID: {s}\nproduct: {s}\ninfoPath: {s}\n", .{ t.bundle_id, t.name, t.infoPath() });
     if (t.entitlementsPath()) |e| try w.print("entitlementsPath: {s}\n", .{e});
+    if (t.icon) |i| {
+        try w.writeAll("iconPath: ");
+        try std.json.stringify(i, .{}, w);
+        try w.writeByte('\n');
+    }
+    if (t.resources.len > 0) {
+        try w.writeAll("resources:\n");
+        for (t.resources) |r| {
+            try w.writeAll("  - ");
+            try std.json.stringify(r, .{}, w);
+            try w.writeByte('\n');
+        }
+    }
     return b.items;
+}
+
+/// Resources idl compiles itself; xtool would copy them uncompiled.
+pub fn xtoolCompiledResource(rel: []const u8) bool {
+    return fsutil.oneOf(fsutil.suffix(rel), &.{ ".xcassets", ".storyboard", ".xib", ".xcstrings", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".metal", ".mlmodel", ".mlpackage" });
 }
 
 fn swiftString(w: anytype, s: []const u8) !void {
@@ -341,4 +359,17 @@ test "project metadata is emitted from YAML without input plists" {
     try std.testing.expectEqualStrings(".idl/Entitlements.plist", t.manifest().entitlements.?);
     const yml = try xtoolYml(a, t);
     try std.testing.expect(std.mem.indexOf(u8, yml, "entitlementsPath: .idl/Entitlements.plist") != null);
+}
+
+test "xtool.yml passes plain resources through verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try config.parse(a, "targets:\n  - name: App\n    builder: xtool\n    bundle_id: com.example.app\n    sources: [Sources/App]\n    icon: Icon.png\n    resources: [Assets/en.lproj, \"Assets/odd name.lproj\"]\n", "/tmp/idlproj.yml");
+    const yml = try xtoolYml(a, cfg.targets[0]);
+    try std.testing.expect(std.mem.indexOf(u8, yml, "iconPath: \"Icon.png\"\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, yml, "resources:\n  - \"Assets/en.lproj\"\n  - \"Assets/odd name.lproj\"\n"));
+    try std.testing.expect(xtoolCompiledResource("Assets/Assets.xcassets"));
+    try std.testing.expect(xtoolCompiledResource("Base.lproj/Main.storyboard"));
+    try std.testing.expect(!xtoolCompiledResource("Assets/en.lproj"));
 }
