@@ -23,6 +23,8 @@ pub const Options = struct {
     /// The CLI holds all selected targets' locks for the whole operation.
     locked: bool = false,
     prepared: ?resources.Prepared = null,
+    /// Products of already-built targets, for `link`/`embed`.
+    products: ?*Products = null,
 };
 
 const Ctx = struct {
@@ -136,19 +138,20 @@ fn writeStamp(a: Allocator, output: []const u8, cmd: []const u8) !void {
 const Job = struct { argv: []const []const u8, obj: []const u8, label: []const u8, cmd: []const u8 };
 
 /// Compile C-family sources in parallel; returns object paths and whether any were rebuilt.
-fn compileObjects(c: Ctx, sources: []const []const u8, build_dir: []const u8, module_cache: []const u8) !struct { []const []const u8, bool } {
+fn compileObjects(c: Ctx, sources: []const []const u8, obj_dir: []const u8, module_cache: []const u8, extra: []const []const u8) !struct { []const []const u8, bool } {
     const a = c.a;
     var objects = std.ArrayList([]const u8).init(a);
     var jobs = std.ArrayList(Job).init(a);
     for (sources) |rel| {
         const lang = Toolchain.langOf(rel) orelse continue;
         if (lang == .swift) continue;
-        const obj = try std.fmt.allocPrint(a, "{s}/obj/{s}.o", .{ build_dir, rel });
+        const obj = try std.fmt.allocPrint(a, "{s}/{s}.o", .{ obj_dir, rel });
         try objects.append(obj);
         const compiler = if (lang == .cxx or lang == .objcxx) c.tc.cxx orelse return diag.fail("missing tool: {s}", .{c.tc.cfg.cxx}) else c.tc.cc.?;
         var argv = std.ArrayList([]const u8).init(a);
         try argv.append(compiler);
         try argv.appendSlice(try c.tc.cflags(c.t, lang, module_cache));
+        try argv.appendSlice(extra);
         try argv.appendSlice(&.{ "-c", try c.t.path(a, rel), "-o", obj });
         const cmd = try commandKey(c, argv.items);
         const depfile = try std.fmt.allocPrint(a, "{s}.d", .{obj[0 .. obj.len - 2]});
@@ -175,7 +178,7 @@ fn compileObjects(c: Ctx, sources: []const []const u8, build_dir: []const u8, mo
         if (failed == null and next < jobs.items.len and running.items.len < max) {
             const job = jobs.items[next];
             next += 1;
-            if (!c.opts.verbose) diag.info("  CC   {s}", .{job.label});
+            if (!c.opts.verbose) diag.info("  CC   [{s}] {s}", .{ c.t.name, job.label });
             try running.append(.{ .child = try spawn(c, job.argv, c.t.dir), .job = job });
             continue;
         }
@@ -190,58 +193,149 @@ fn compileObjects(c: Ctx, sources: []const []const u8, build_dir: []const u8, mo
     return .{ objects.items, true };
 }
 
-fn link(c: Ctx, sources: []const []const u8, objects: []const []const u8, objects_changed: bool, build_dir: []const u8, module_cache: []const u8) ![]const u8 {
+/// What a built target hands to the targets that link or embed it.
+pub const Product = struct {
+    name: []const u8,
+    kind: config.Kind,
+    /// Unsigned link-time binary (`<build>/link/...`); dependents link against it.
+    link_binary: ?[]const u8 = null,
+    /// Signed bundle dir / dylib that embedding apps copy.
+    bundle: ?[]const u8 = null,
+    /// Objects a `static` target contributes to its dependents' link.
+    objects: []const []const u8 = &.{},
+    /// Directory holding `<Module>.swiftmodule` (static/framework targets with Swift).
+    module_dir: ?[]const u8 = null,
+    /// Directory holding the generated `<Module>-Swift.h`.
+    header_dir: ?[]const u8 = null,
+    /// App IPA.
+    ipa: ?[]const u8 = null,
+};
+pub const Products = std.StringHashMap(Product);
+
+const Deps = struct {
+    swift_flags: []const []const u8,
+    c_flags: []const []const u8,
+    link_args: []const []const u8,
+    objects: []const []const u8,
+    inputs: []const []const u8,
+};
+
+fn product(c: Ctx, name: []const u8) !Product {
+    const products = c.opts.products orelse return diag.fail("target '{s}' depends on '{s}'; build it through `idl build`", .{ c.t.name, name });
+    return products.get(name) orelse diag.fail("target '{s}' depends on '{s}', which has not been built", .{ c.t.name, name });
+}
+
+fn resolveDeps(c: Ctx) !Deps {
     const a = c.a;
-    var swift = std.ArrayList([]const u8).init(a);
-    var need_cxx = false;
-    for (sources) |rel| switch (Toolchain.langOf(rel) orelse continue) {
-        .swift => try swift.append(try c.t.path(a, rel)),
-        .cxx, .objcxx => need_cxx = true,
-        else => {},
-    };
-    if (swift.items.len == 0 and objects.len == 0) return diag.fail("target '{s}': no compilable sources found", .{c.t.name});
-    const exe = try std.fmt.allocPrint(a, "{s}/{s}", .{ build_dir, c.t.name });
-    var link_objects = std.ArrayList([]const u8).init(a);
-    try link_objects.appendSlice(objects);
-    var swift_for_link = swift.items;
-    var link_target = c.t;
-    // Darwin swiftc -g performs a dsymutil pass when sources and link share
-    // an invocation. Keep DWARF in a persistent object and link separately;
-    // this preserves debug data without requiring macOS tools on Linux.
-    if (swift.items.len > 0 and c.t.debug_symbols) {
-        const swift_obj = try std.fmt.allocPrint(a, "{s}/{s}.swift.o", .{ build_dir, c.t.name });
-        var compile = std.ArrayList([]const u8).init(a);
-        try compile.append(c.tc.swiftc.?);
-        try compile.appendSlice(try c.tc.swiftflags(c.t, module_cache));
-        try compile.appendSlice(swift.items);
-        try compile.appendSlice(&.{ "-c", "-o", swift_obj });
-        var deps = std.ArrayList([]const u8).init(a);
-        try deps.appendSlice(swift.items);
-        if (c.t.bridging_header) |h| try deps.append(try c.t.path(a, h));
-        const compile_key = try commandKey(c, compile.items);
-        if (!try upToDate(a, swift_obj, compile_key, deps.items, c.t.dir)) {
-            if (!c.opts.verbose) diag.info("  SWIFT {s}", .{c.t.name});
-            try run(c, compile.items, c.t.dir);
-            try writeStamp(a, swift_obj, compile_key);
-        }
-        try link_objects.append(swift_obj);
-        swift_for_link = &.{};
-        link_target.debug_symbols = false;
-    }
-    const argv = if (swift.items.len > 0)
-        try c.tc.swiftLink(link_target, module_cache, swift_for_link, link_objects.items, exe, need_cxx)
-    else
-        try c.tc.clangLink(c.t, link_objects.items, exe, need_cxx);
-    const cmd = try commandKey(c, argv);
+    var swift_flags = std.ArrayList([]const u8).init(a);
+    var c_flags = std.ArrayList([]const u8).init(a);
+    var link_args = std.ArrayList([]const u8).init(a);
+    var objects = std.ArrayList([]const u8).init(a);
     var inputs = std.ArrayList([]const u8).init(a);
-    try inputs.appendSlice(swift.items);
-    try inputs.appendSlice(link_objects.items);
-    if (c.t.bridging_header) |h| try inputs.append(try c.t.path(a, h));
-    if (!objects_changed and try upToDate(a, exe, cmd, inputs.items, c.t.dir)) return exe;
-    if (!c.opts.verbose) diag.info("  {s} {s}", .{ if (swift.items.len > 0) "SWIFT" else "LD  ", c.t.name });
-    try run(c, argv, c.t.dir);
-    try writeStamp(a, exe, cmd);
-    return exe;
+    for (c.t.link) |name| {
+        const p = try product(c, name);
+        switch (p.kind) {
+            .framework => {
+                const bin = p.link_binary.?;
+                try link_args.appendSlice(&.{ "-F", std.fs.path.dirname(std.fs.path.dirname(bin).?).?, "-framework", p.name });
+                try swift_flags.appendSlice(&.{ "-F", std.fs.path.dirname(std.fs.path.dirname(bin).?).? });
+                try inputs.append(bin);
+            },
+            .dylib => {
+                try objects.append(p.link_binary.?);
+                try inputs.append(p.link_binary.?);
+            },
+            .static => {
+                try objects.appendSlice(p.objects);
+                try inputs.appendSlice(p.objects);
+            },
+            .app, .appex => unreachable, // rejected by config validation
+        }
+        if (p.module_dir) |d| {
+            try swift_flags.appendSlice(&.{ "-I", d });
+            try inputs.append(try std.fmt.allocPrint(a, "{s}/{s}.swiftmodule", .{ d, p.name }));
+        }
+        if (p.header_dir) |d| try c_flags.appendSlice(&.{ "-I", d });
+    }
+    return .{ .swift_flags = swift_flags.items, .c_flags = c_flags.items, .link_args = link_args.items, .objects = objects.items, .inputs = inputs.items };
+}
+
+const SwiftOut = struct { obj: []const u8, module_dir: ?[]const u8, header_dir: ?[]const u8, changed: bool };
+
+/// Whole-module Swift compile to one object. Runs before the C-family compile
+/// so Objective-C in the same target can import the generated `<Module>-Swift.h`.
+fn compileSwift(c: Ctx, swift: []const []const u8, obj_dir: []const u8, module_cache: []const u8, deps: Deps, has_c: bool) !SwiftOut {
+    const a = c.a;
+    const t = c.t;
+    const obj = try std.fmt.allocPrint(a, "{s}/{s}.swift.o", .{ obj_dir, t.name });
+    var argv = std.ArrayList([]const u8).init(a);
+    try argv.append(c.tc.swiftc.?);
+    try argv.appendSlice(try c.tc.swiftflags(t, module_cache));
+    if (t.type != .app) try argv.append("-parse-as-library");
+    try argv.appendSlice(deps.swift_flags);
+    try argv.appendSlice(swift);
+    try argv.appendSlice(&.{ "-c", "-o", obj });
+    var module_dir: ?[]const u8 = null;
+    var header_dir: ?[]const u8 = null;
+    // Emitting the ObjC header implies emitting a module; without an explicit
+    // path swiftc drops `<Name>-1.swiftmodule` etc. into the working directory.
+    if (has_c or t.type == .static or t.type == .framework) {
+        module_dir = try std.fs.path.join(a, &.{ obj_dir, "modules" });
+        try std.fs.cwd().makePath(module_dir.?);
+        try argv.appendSlice(&.{ "-emit-module-path", try std.fmt.allocPrint(a, "{s}/{s}.swiftmodule", .{ module_dir.?, t.name }) });
+    }
+    if (has_c or t.type == .static or t.type == .framework) {
+        header_dir = try std.fs.path.join(a, &.{ obj_dir, "include" });
+        try std.fs.cwd().makePath(header_dir.?);
+        try argv.appendSlice(&.{ "-emit-objc-header-path", try std.fmt.allocPrint(a, "{s}/{s}-Swift.h", .{ header_dir.?, t.name }) });
+    }
+    var inputs = std.ArrayList([]const u8).init(a);
+    try inputs.appendSlice(swift);
+    if (t.bridging_header) |h| try inputs.append(try t.path(a, h));
+    try inputs.appendSlice(deps.inputs);
+    const key = try commandKey(c, argv.items);
+    if (try upToDate(a, obj, key, inputs.items, t.dir)) return .{ .obj = obj, .module_dir = module_dir, .header_dir = header_dir, .changed = false };
+    try std.fs.cwd().makePath(obj_dir);
+    if (!c.opts.verbose) diag.info("  SWIFT [{s}] {d} file(s)", .{ t.name, swift.len });
+    try run(c, argv.items, t.dir);
+    try writeStamp(a, obj, key);
+    return .{ .obj = obj, .module_dir = module_dir, .header_dir = header_dir, .changed = true };
+}
+
+/// Link-time output path: frameworks get a real `<name>.framework/<name>`
+/// layout so dependents can use `-F <build>/link -framework <name>`.
+fn linkOutput(a: Allocator, t: Target, build_dir: []const u8) ![]const u8 {
+    return switch (t.type) {
+        .framework => std.fmt.allocPrint(a, "{s}/link/{s}.framework/{s}", .{ build_dir, t.name, t.name }),
+        .dylib => std.fmt.allocPrint(a, "{s}/link/{s}.dylib", .{ build_dir, t.name }),
+        else => std.fmt.allocPrint(a, "{s}/link/{s}", .{ build_dir, t.name }),
+    };
+}
+
+fn link(c: Ctx, objects: []const []const u8, changed: bool, has_swift: bool, need_cxx: bool, out: []const u8, module_cache: []const u8, deps: Deps) !void {
+    const a = c.a;
+    var all = std.ArrayList([]const u8).init(a);
+    try all.appendSlice(objects);
+    try all.appendSlice(deps.objects);
+    if (all.items.len == 0) return diag.fail("target '{s}': no compilable sources found", .{c.t.name});
+    // Swift was compiled separately: never let the driver run dsymutil.
+    var link_target = c.t;
+    link_target.debug_symbols = false;
+    var argv = std.ArrayList([]const u8).init(a);
+    try argv.appendSlice(if (has_swift)
+        try c.tc.swiftLink(link_target, module_cache, &.{}, all.items, out, need_cxx)
+    else
+        try c.tc.clangLink(c.t, all.items, out, need_cxx));
+    try argv.appendSlice(deps.link_args);
+    const cmd = try commandKey(c, argv.items);
+    var inputs = std.ArrayList([]const u8).init(a);
+    try inputs.appendSlice(all.items);
+    try inputs.appendSlice(deps.inputs);
+    if (!changed and try upToDate(a, out, cmd, inputs.items, c.t.dir)) return;
+    if (!c.opts.verbose) diag.info("  LD   [{s}] {s}", .{ c.t.name, std.fs.path.basename(out) });
+    try std.fs.cwd().makePath(std.fs.path.dirname(out).?);
+    try run(c, argv.items, c.t.dir);
+    try writeStamp(a, out, cmd);
 }
 
 // ---------------------------------------------------------------- bundling
@@ -266,11 +360,23 @@ fn copyTree(a: Allocator, src: []const u8, dst: []const u8) !void {
     }
 }
 
+/// Embedded framework content Xcode removes on copy (RemoveHeadersOnCopy) or
+/// that a re-sign invalidates.
+fn strippedFrameworkPart(dest: []const u8) bool {
+    if (!std.mem.startsWith(u8, dest, "Frameworks/")) return false;
+    var parts = std.mem.splitScalar(u8, dest["Frameworks/".len..], '/');
+    const fw = parts.next() orelse return false;
+    if (!std.mem.endsWith(u8, fw, ".framework")) return false;
+    const sub = parts.next() orelse return false;
+    return fsutil.oneOf(sub, &.{ "Headers", "PrivateHeaders", "Modules", "_CodeSignature" });
+}
+
 /// Copy only the collision-checked plan. Resource compiler cache directories
 /// never enter the app, and framework discovery is based on planned outputs.
 fn copyResources(c: Ctx, app: []const u8, prepared: resources.Prepared) ![]const []const u8 {
     var frameworks = std.StringHashMap(void).init(c.a);
     for (prepared.outputs) |o| {
+        if (strippedFrameworkPart(o.dest)) continue;
         const dest = try std.fs.path.join(c.a, &.{ app, o.dest });
         try copyTree(c.a, o.source, dest);
         if (std.mem.startsWith(u8, o.dest, "Frameworks/")) {
@@ -370,8 +476,10 @@ pub fn checkTarget(a: Allocator, tc: *Toolchain, t: Target, strict: bool) !void 
         }
         if (t.package_swift) _ = try codegen.packageSwift(a, t);
     }
-    _ = try metadata.processInfoPlist(a, t, &tc.env, null);
-    _ = try metadata.entitlements(a, t, &tc.env);
+    if (t.type.bundled()) {
+        _ = try metadata.processInfoPlist(a, t, &tc.env, null);
+        _ = try metadata.entitlements(a, t, &tc.env);
+    }
     for (try fsutil.discover(a, t.dir, t.resources, "resource")) |rel| {
         const suffix = fsutil.suffix(rel);
         if (fsutil.oneOf(suffix, &.{ ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".metal", ".mlmodel", ".mlpackage" }) and (strict or t.strict))
@@ -396,80 +504,178 @@ pub fn prepareAll(a: Allocator, tc: *Toolchain, targets: []const Target, strict:
     return .{ .locks = locks, .prepared = prepared.items };
 }
 
-fn buildDirect(c: Ctx) ![]const u8 {
+fn buildDirect(c: Ctx) !Product {
     const a = c.a;
     const t = c.t;
     const sources = try fsutil.discover(a, t.dir, t.sources, "source");
-    var has_swift = false;
-    for (sources) |s| if (Toolchain.langOf(s) == .swift) {
-        has_swift = true;
+    var swift = std.ArrayList([]const u8).init(a);
+    var has_c = false;
+    var need_cxx = false;
+    for (sources) |s| switch (Toolchain.langOf(s) orelse continue) {
+        .swift => try swift.append(try t.path(a, s)),
+        .cxx, .objcxx => {
+            has_c = true;
+            need_cxx = true;
+        },
+        else => has_c = true,
     };
-    try c.tc.require(has_swift);
-    const ldid_opt: ?[]const u8 = if (t.signs()) try c.tc.ldid() else null;
+    try c.tc.require(swift.items.len > 0);
 
     const build_dir = try t.buildPath(a);
+    const obj_dir = try std.fs.path.join(a, &.{ build_dir, "obj", t.name });
     const module_cache = try std.fs.path.join(a, &.{ build_dir, "ModuleCache" });
     try std.fs.cwd().makePath(module_cache);
+    const deps = try resolveDeps(c);
 
-    const objects, const changed = try compileObjects(c, sources, build_dir, module_cache);
-    const exe = try link(c, sources, objects, changed, build_dir, module_cache);
+    var objects = std.ArrayList([]const u8).init(a);
+    var changed = false;
+    var swift_out: ?SwiftOut = null;
+    if (swift.items.len > 0) {
+        swift_out = try compileSwift(c, swift.items, obj_dir, module_cache, deps, has_c);
+        changed = swift_out.?.changed;
+    }
+    var extra = std.ArrayList([]const u8).init(a);
+    try extra.appendSlice(deps.c_flags);
+    if (swift_out) |so| if (so.header_dir) |h| try extra.appendSlice(&.{ "-I", h });
+    const c_objects, const c_changed = try compileObjects(c, sources, obj_dir, module_cache, extra.items);
+    try objects.appendSlice(c_objects);
+    if (swift_out) |so| try objects.append(so.obj);
+    changed = changed or c_changed;
 
+    if (t.type == .static) {
+        if (objects.items.len == 0) return diag.fail("target '{s}': no compilable sources found", .{t.name});
+        return .{ .name = t.name, .kind = t.type, .objects = objects.items, .module_dir = if (swift_out) |so| so.module_dir else null, .header_dir = if (swift_out) |so| so.header_dir else null };
+    }
+    const linked = try linkOutput(a, t, build_dir);
+    try link(c, objects.items, changed, swift.items.len > 0, need_cxx, linked, module_cache, deps);
+    var p: Product = .{ .name = t.name, .kind = t.type, .link_binary = linked, .module_dir = if (swift_out) |so| so.module_dir else null, .header_dir = if (swift_out) |so| so.header_dir else null };
+    switch (t.type) {
+        .dylib => p.bundle = try assembleDylib(c, linked, build_dir),
+        .framework, .appex => p.bundle = try assembleBundle(c, linked, build_dir),
+        .app => p.ipa = try assembleBundle(c, linked, build_dir),
+        .static => unreachable,
+    }
+    return p;
+}
+
+fn signerKey(c: Ctx, f: *state.Fingerprint, ldid: ?[]const u8) !void {
+    f.add(if (ldid != null) "signed" else "unsigned");
+    if (ldid) |l| f.add(try c.tc.identity(l, false));
+}
+
+fn assembleDylib(c: Ctx, linked: []const u8, build_dir: []const u8) ![]const u8 {
+    const a = c.a;
+    const ldid_opt: ?[]const u8 = if (c.t.signs()) try c.tc.ldid() else null;
+    const out = try std.fs.path.join(a, &.{ build_dir, "products", try c.t.productName(a) });
+    var f: state.Fingerprint = .{};
+    f.add("dylib-v1");
+    f.add(try c.tc.selfIdentity());
+    f.add(try state.treeDigest(a, linked));
+    try signerKey(c, &f, ldid_opt);
+    const key = try f.finish(a);
+    const stamp = try std.fmt.allocPrint(a, "{s}.state", .{out});
+    if (try state.hit(a, stamp, key, out)) return out;
+    try std.fs.cwd().makePath(std.fs.path.dirname(out).?);
+    const tmp = try std.fmt.allocPrint(a, "{s}.partial", .{out});
+    try std.fs.cwd().copyFile(linked, std.fs.cwd(), tmp, .{ .override_mode = 0o755 });
+    if (ldid_opt) |ldid| {
+        if (!c.opts.verbose) diag.info("  SIGN [{s}]", .{c.t.name});
+        try run(c, &.{ ldid, "-S", tmp }, c.t.dir);
+    }
+    try std.fs.cwd().rename(tmp, out);
+    try state.record(a, stamp, key, out);
+    return out;
+}
+
+/// Bundle, sign and (for apps) package an app, framework or extension.
+/// Returns the IPA for apps, otherwise the signed bundle directory.
+fn assembleBundle(c: Ctx, linked: []const u8, build_dir: []const u8) ![]const u8 {
+    const a = c.a;
+    const t = c.t;
+    const is_app = t.type == .app;
+    const ldid_opt: ?[]const u8 = if (t.signs()) try c.tc.ldid() else null;
     const prepared = c.opts.prepared.?;
     const info_xml = try processInfoPlist(a, t, &c.tc.env, prepared.info);
     const ent_xml = (try metadata.entitlements(a, t, &c.tc.env)) orelse "";
+
+    // Embedded products, checked against resource outputs.
+    const Embed = struct { src: []const u8, dest: []const u8 };
+    var embeds = std.ArrayList(Embed).init(a);
+    for (t.embed) |name| {
+        const p = try product(c, name);
+        const dest = try std.fmt.allocPrint(a, "{s}/{s}", .{ if (p.kind == .appex) "PlugIns" else "Frameworks", std.fs.path.basename(p.bundle.?) });
+        for (prepared.outputs) |o| if (std.mem.eql(u8, o.dest, dest) or std.mem.startsWith(u8, o.dest, try std.fmt.allocPrint(a, "{s}/", .{dest})))
+            return diag.fail("{s}: resource {s} collides with embedded target {s}", .{ t.name, o.owner, name });
+        try embeds.append(.{ .src = p.bundle.?, .dest = dest });
+    }
+
     var fingerprint: state.Fingerprint = .{};
-    fingerprint.add("bundle-v1");
+    fingerprint.add("bundle-v2");
     fingerprint.add(try c.tc.selfIdentity());
-    fingerprint.add(try state.treeDigest(a, exe));
+    fingerprint.add(try state.treeDigest(a, linked));
     fingerprint.add(prepared.digest);
     fingerprint.add(info_xml);
     fingerprint.add(ent_xml);
-    fingerprint.add(if (ldid_opt != null) "signed" else "unsigned");
-    if (ldid_opt) |ldid| fingerprint.add(try c.tc.identity(ldid, false));
-    const key = try fingerprint.finish(a);
-    const ipa = try t.ipaPath(a);
-    const stamp = try std.fs.path.join(a, &.{ build_dir, "bundle.state" });
-    const payload = try std.fs.path.join(a, &.{ build_dir, "Payload" });
-    const payload_stamp = try std.fs.path.join(a, &.{ build_dir, "payload.state" });
-    if (try state.hit(a, stamp, key, ipa) and try state.hit(a, payload_stamp, key, payload)) {
-        if (c.opts.verbose) diag.info("  CACHED bundle + signature + IPA", .{});
-        return ipa;
+    for (embeds.items) |e| {
+        fingerprint.add(e.dest);
+        fingerprint.add(try state.treeDigest(a, e.src));
     }
-    // Staging prevents failures from destroying the previous successful app.
-    const pending_payload = try std.fs.path.join(a, &.{ build_dir, "Payload.partial" });
-    try std.fs.cwd().deleteTree(pending_payload);
-    const app = try std.fmt.allocPrint(a, "{s}/{s}.app", .{ pending_payload, t.name });
-    try std.fs.cwd().makePath(app);
-    const app_exe = try std.fs.path.join(a, &.{ app, t.name });
-    try std.fs.cwd().copyFile(exe, std.fs.cwd(), app_exe, .{ .override_mode = 0o755 });
-    const frameworks = try copyResources(c, app, prepared);
-    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ app, "Info.plist" }), .data = info_xml });
-    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ app, "PkgInfo" }), .data = "APPL????" });
+    try signerKey(c, &fingerprint, ldid_opt);
+    const key = try fingerprint.finish(a);
+
+    // Apps: <build>/Payload/<name>.app + <build>/<name>.ipa.
+    // Frameworks/extensions: <build>/products/<name>.{framework,appex}.
+    const out = if (is_app) try std.fs.path.join(a, &.{ build_dir, "Payload" }) else try std.fs.path.join(a, &.{ build_dir, "products", try t.productName(a) });
+    const result = if (is_app) try t.ipaPath(a) else out;
+    const stamp = if (is_app) try std.fs.path.join(a, &.{ build_dir, "bundle.state" }) else try std.fmt.allocPrint(a, "{s}.state", .{out});
+    const out_stamp = if (is_app) try std.fs.path.join(a, &.{ build_dir, "payload.state" }) else stamp;
+    if (try state.hit(a, stamp, key, result) and try state.hit(a, out_stamp, key, out)) {
+        if (c.opts.verbose) diag.info("  CACHED {s}", .{try t.productName(a)});
+        return result;
+    }
+    // Staging prevents failures from destroying the previous successful output.
+    const pending = try std.fmt.allocPrint(a, "{s}.partial", .{out});
+    try std.fs.cwd().deleteTree(pending);
+    const bundle = if (is_app) try std.fmt.allocPrint(a, "{s}/{s}.app", .{ pending, t.name }) else pending;
+    try std.fs.cwd().makePath(bundle);
+    const bundle_exe = try std.fs.path.join(a, &.{ bundle, t.name });
+    try std.fs.cwd().copyFile(linked, std.fs.cwd(), bundle_exe, .{ .override_mode = 0o755 });
+    const frameworks = try copyResources(c, bundle, prepared);
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ bundle, "Info.plist" }), .data = info_xml });
+    if (is_app) try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ bundle, "PkgInfo" }), .data = "APPL????" });
+    // Embedded products were signed when they were built.
+    for (embeds.items) |e| try copyTree(a, e.src, try std.fs.path.join(a, &.{ bundle, e.dest }));
 
     if (ldid_opt) |ldid| {
         // Nested code first, then the containing executable.
         for (frameworks) |fw| {
             const bin = try std.fs.path.join(a, &.{ fw, std.fs.path.stem(fw) });
-            if (fsutil.kind(bin) == .file) try run(c, &.{ ldid, "-S", bin }, t.dir);
+            if (fsutil.kind(bin) == .file) try run(c, &.{ ldid, "-S", fw }, t.dir);
         }
-        const ent = try entitlementsFile(c, build_dir);
-        const s_flag = if (ent) |e| try std.fmt.allocPrint(a, "-S{s}", .{e}) else "-S";
-        if (!c.opts.verbose) diag.info("  SIGN {s}", .{t.name});
-        try run(c, &.{ ldid, s_flag, try std.fmt.allocPrint(a, "-I{s}", .{t.bundle_id}), app_exe }, t.dir);
+        if (!c.opts.verbose) diag.info("  SIGN [{s}]", .{t.name});
+        if (t.type == .framework) {
+            try run(c, &.{ ldid, "-S", bundle }, t.dir);
+        } else {
+            const ent = try entitlementsFile(c, build_dir);
+            const s_flag = if (ent) |e| try std.fmt.allocPrint(a, "-S{s}", .{e}) else "-S";
+            try run(c, &.{ ldid, s_flag, try std.fmt.allocPrint(a, "-I{s}", .{t.bundle_id}), bundle_exe }, t.dir);
+        }
     }
 
-    var w = zip.Writer.init(a);
-    var payload_dir = try std.fs.cwd().openDir(pending_payload, .{ .iterate = true });
-    defer payload_dir.close();
-    try w.addTree(payload_dir, "Payload");
-    const tmp = try std.fmt.allocPrint(a, "{s}.partial", .{ipa});
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = try w.finish() });
-    try std.fs.cwd().rename(tmp, ipa);
-    try std.fs.cwd().deleteTree(payload);
-    try std.fs.cwd().rename(pending_payload, payload);
-    try state.record(a, payload_stamp, key, payload);
-    try state.record(a, stamp, key, ipa);
-    return ipa;
+    if (is_app) {
+        var w = zip.Writer.init(a);
+        var payload_dir = try std.fs.cwd().openDir(pending, .{ .iterate = true });
+        defer payload_dir.close();
+        try w.addTree(payload_dir, "Payload");
+        const tmp = try std.fmt.allocPrint(a, "{s}.partial", .{result});
+        try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = try w.finish() });
+        try std.fs.cwd().rename(tmp, result);
+    }
+    try std.fs.cwd().deleteTree(out);
+    try std.fs.cwd().rename(pending, out);
+    try state.record(a, out_stamp, key, out);
+    if (is_app) try state.record(a, stamp, key, result);
+    return result;
 }
 
 /// xtool 1.24's entitlement-rewrite path can drop executable ZIP mode bits.
@@ -513,19 +719,43 @@ fn buildXtool(c: Ctx) ![]const u8 {
     return ipa;
 }
 
-pub fn build(a: Allocator, tc: *Toolchain, t: Target, opts: Options) ![]const u8 {
+pub fn build(a: Allocator, tc: *Toolchain, t: Target, opts: Options) !Product {
     var session: ?Session = if (!opts.locked) try prepareAll(a, tc, &.{t}, opts.strict, opts.verbose) else null;
     defer if (session) |*s| s.release();
     var options = opts;
     if (session) |s| options.prepared = s.prepared[0];
     const c: Ctx = .{ .a = a, .tc = tc, .t = t, .opts = options };
-    diag.info("==> {s} ({s})", .{ t.name, @tagName(t.builder) });
-    const ipa = switch (t.builder) {
+    diag.info("==> {s} ({s}{s})", .{ t.name, @tagName(t.builder), if (t.type == .app) "" else try std.fmt.allocPrint(a, ", {s}", .{@tagName(t.type)}) });
+    const p: Product = switch (t.builder) {
         .direct => try buildDirect(c),
-        .xtool => try buildXtool(c),
+        .xtool => .{ .name = t.name, .kind = .app, .ipa = try buildXtool(c) },
     };
-    _ = try verify.verifyFile(a, ipa, .{ .bundle_id = t.bundle_id, .allow_unsigned = !t.signs() });
-    return ipa;
+    if (opts.products) |products| try products.put(t.name, p);
+    if (p.ipa) |ipa| {
+        _ = try verify.verifyFile(a, ipa, .{ .bundle_id = t.bundle_id, .allow_unsigned = !t.signs() });
+        if (t.post_build.len > 0) try postBuild(c, ipa);
+    }
+    return p;
+}
+
+/// Run the target's post_build command after its IPA is verified.
+fn postBuild(c: Ctx, ipa: []const u8) !void {
+    const a = c.a;
+    var env = std.process.EnvMap.init(a);
+    var it = c.tc.env.iterator();
+    while (it.next()) |kv| try env.put(kv.key_ptr.*, kv.value_ptr.*);
+    const build_dir = try c.t.buildPath(a);
+    try env.put("IDL_IPA", ipa);
+    try env.put("IDL_APP", try std.fmt.allocPrint(a, "{s}/Payload/{s}.app", .{ build_dir, c.t.name }));
+    try env.put("IDL_BUILD_DIR", build_dir);
+    try env.put("IDL_TARGET", c.t.name);
+    if (c.t.profile) |prof| try env.put("IDL_CONFIGURATION", prof);
+    if (!c.opts.verbose) diag.info("  POST [{s}] {s}", .{ c.t.name, try std.mem.join(a, " ", c.t.post_build) }) else printCommand(c.t.post_build);
+    var child = std.process.Child.init(c.t.post_build, a);
+    child.cwd = c.t.dir;
+    child.env_map = &env;
+    child.spawn() catch |err| return diag.fail("cannot run post_build {s}: {s}", .{ c.t.post_build[0], @errorName(err) });
+    if (!succeeded(try child.wait())) return diag.fail("{s}: post_build failed", .{c.t.name});
 }
 
 pub fn clean(a: Allocator, t: Target) !void {

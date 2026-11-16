@@ -13,6 +13,33 @@ pub const file_name = "idlproj.yml";
 
 pub const Builder = enum { direct, xtool };
 
+/// What a target produces. Only `app` targets are packaged as IPAs; the other
+/// kinds are built for, linked into and/or embedded in an app via `link` and
+/// `embed`.
+pub const Kind = enum {
+    app,
+    /// Dynamic framework: `<name>.framework` (install name `@rpath/<name>.framework/<name>`).
+    framework,
+    /// Loose dynamic library: `<name>.dylib` (install name `@rpath/<name>.dylib`).
+    dylib,
+    /// App extension: `<name>.appex`, embedded under `PlugIns/`.
+    appex,
+    /// Objects + Swift module only; linked directly into dependents.
+    static,
+
+    pub fn bundled(k: Kind) bool {
+        return k == .app or k == .framework or k == .appex;
+    }
+
+    pub fn packageType(k: Kind) []const u8 {
+        return switch (k) {
+            .framework => "FMWK",
+            .appex => "XPC!",
+            else => "APPL",
+        };
+    }
+};
+
 pub const ToolchainConfig = struct {
     sdk_bundle: []const u8 = "~/.swiftpm/swift-sdks/darwin.artifactbundle",
     /// Optional explicit iPhoneOS.sdk; otherwise the newest one in the bundle.
@@ -38,6 +65,7 @@ pub const Target = struct {
     /// Absolute target directory; all target paths are relative to it.
     dir: []const u8,
     builder: Builder = .direct,
+    type: Kind = .app,
     bundle_id: []const u8,
     min_ios: []const u8 = "16.0",
     arch: []const u8 = "arm64",
@@ -71,10 +99,23 @@ pub const Target = struct {
     libraries: []const []const u8 = &.{},
     defines: []const []const u8 = &.{},
     include_dirs: []const []const u8 = &.{},
+    /// `-iquote` directories: only `#include "..."` searches them (Xcode header-map style).
+    quote_include_dirs: []const []const u8 = &.{},
     cflags: []const []const u8 = &.{},
     swiftflags: []const []const u8 = &.{},
     ldflags: []const []const u8 = &.{},
     bridging_header: ?[]const u8 = null,
+    /// `-F` directories for clang, swiftc and the linker.
+    framework_dirs: []const []const u8 = &.{},
+    /// Project targets (framework/dylib/static) this target links against.
+    link: []const []const u8 = &.{},
+    /// Project targets (framework/dylib/appex) copied into this app bundle.
+    embed: []const []const u8 = &.{},
+    /// Pass `-dead_strip` to the linker.
+    dead_strip: bool = true,
+    /// Command (argv) run after an app's IPA is written. Runs in the target
+    /// directory with IDL_IPA, IDL_APP, IDL_BUILD_DIR and IDL_TARGET set.
+    post_build: []const []const u8 = &.{},
     /// Ad-hoc sign with ldid (direct) / `xtool --sign` (xtool). Default: direct only.
     sign: ?bool = null,
     xcodeproj: bool = false,
@@ -118,7 +159,19 @@ pub const Target = struct {
     }
 
     pub fn signs(t: Target) bool {
+        if (t.type == .static) return false;
         return t.sign orelse (t.builder == .direct);
+    }
+
+    /// File name of the product inside its container (bundle dir or dylib).
+    pub fn productName(t: Target, a: Allocator) ![]const u8 {
+        return switch (t.type) {
+            .app => std.fmt.allocPrint(a, "{s}.app", .{t.name}),
+            .framework => std.fmt.allocPrint(a, "{s}.framework", .{t.name}),
+            .appex => std.fmt.allocPrint(a, "{s}.appex", .{t.name}),
+            .dylib => std.fmt.allocPrint(a, "{s}.dylib", .{t.name}),
+            .static => t.name,
+        };
     }
 
     pub fn path(t: Target, a: Allocator, rel: []const u8) ![]const u8 {
@@ -187,7 +240,9 @@ const target_keys = [_][]const u8{
     "include_dirs",    "cflags",           "swiftflags",
     "ldflags",         "bridging_header",  "sign",
     "xcodeproj",       "compile_commands", "configuration",
-    "package_swift",   "icon",
+    "package_swift",   "icon",             "type",
+    "framework_dirs",  "link",             "embed",
+    "dead_strip",      "post_build",       "quote_include_dirs",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
 const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
@@ -302,11 +357,17 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     var t: Target = .{
         .name = name,
         .dir = try std.fs.path.resolve(a, &.{ root, dir_rel }),
-        .bundle_id = try c.str(m.get("bundle_id") orelse return diag.fail("{s}: 'bundle_id' is required", .{c.where}), "bundle_id"),
+        .bundle_id = "",
     };
+    const kind_node = m.get("type") orelse if (defaults) |d| d.get("type") else null;
+    if (kind_node) |k| t.type = std.meta.stringToEnum(Kind, try c.str(k, "type")) orelse
+        return diag.fail("{s}: type must be app, framework, dylib, appex or static", .{c.where});
+    if (m.get("bundle_id")) |b| {
+        t.bundle_id = try c.str(b, "bundle_id");
+    } else if (t.type.bundled()) return diag.fail("{s}: 'bundle_id' is required", .{c.where});
 
     inline for (std.meta.fields(Target)) |field| {
-        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants"))) continue;
+        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants") or std.mem.eql(u8, field.name, "type"))) continue;
         const value = m.get(field.name) orelse if (defaults) |d| d.get(field.name) else null;
         if (value) |v| {
             if (comptime std.mem.eql(u8, field.name, "entitlements")) {
@@ -325,7 +386,18 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
         }
     }
 
-    if (!isBundleId(t.bundle_id)) return diag.fail("{s}: invalid bundle_id '{s}'", .{ c.where, t.bundle_id });
+    if ((t.bundle_id.len > 0 or t.type.bundled()) and !isBundleId(t.bundle_id)) return diag.fail("{s}: invalid bundle_id '{s}'", .{ c.where, t.bundle_id });
+    if (t.type != .app) {
+        if (t.builder != .direct) return diag.fail("{s}: only app targets can use builder: xtool", .{c.where});
+        if (t.xcodeproj) return diag.fail("{s}: xcodeproj generation is only supported for app targets", .{c.where});
+        if (t.embed.len > 0) return diag.fail("{s}: only app targets can embed other targets", .{c.where});
+        if (t.post_build.len > 0) return diag.fail("{s}: post_build is only supported for app targets", .{c.where});
+        if (!t.type.bundled() and (t.resources.len > 0 or t.info_plist != null or t.info != null or t.entitlements != null or t.entitlement_values != null))
+            return diag.fail("{s}: {s} targets have no bundle (resources, info and entitlements are not allowed)", .{ c.where, @tagName(t.type) });
+    }
+    for (t.framework_dirs) |d| try fsutil.validateRelativePath(d, "framework_dirs");
+    for (t.include_dirs) |d| try fsutil.validateRelativePath(d, "include_dirs");
+    for (t.quote_include_dirs) |d| try fsutil.validateRelativePath(d, "quote_include_dirs");
     for ([_]struct { []const u8, []const u8 }{
         .{ "min_ios", t.min_ios },           .{ "version", t.version },
         .{ "build_number", t.build_number }, .{ "swift_version", t.swift_version },
@@ -470,7 +542,54 @@ pub fn parseConfiguration(a: Allocator, source: []const u8, path: []const u8, pr
         for (targets[0..i]) |prev| if (std.mem.eql(u8, prev.name, t.name)) return diag.fail("duplicate target name '{s}'", .{t.name});
     }
     cfg.targets = targets;
+    try validateGraph(a, cfg.targets);
     return cfg;
+}
+
+fn findTarget(targets: []const Target, name: []const u8) ?Target {
+    for (targets) |t| if (std.mem.eql(u8, t.name, name)) return t;
+    return null;
+}
+
+/// `link`/`embed` reference existing targets of a compatible kind, and the
+/// graph has no cycles.
+fn validateGraph(a: Allocator, targets: []const Target) !void {
+    for (targets) |t| {
+        for (t.link) |n| {
+            const dep = findTarget(targets, n) orelse return diag.fail("target '{s}': link: unknown target '{s}'", .{ t.name, n });
+            if (!fsutil.oneOf(@tagName(dep.type), &.{ "framework", "dylib", "static" }))
+                return diag.fail("target '{s}': cannot link {s} target '{s}'", .{ t.name, @tagName(dep.type), n });
+        }
+        for (t.embed) |n| {
+            const dep = findTarget(targets, n) orelse return diag.fail("target '{s}': embed: unknown target '{s}'", .{ t.name, n });
+            if (!fsutil.oneOf(@tagName(dep.type), &.{ "framework", "dylib", "appex" }))
+                return diag.fail("target '{s}': cannot embed {s} target '{s}'", .{ t.name, @tagName(dep.type), n });
+        }
+    }
+    // Ordering doubles as cycle detection.
+    _ = try buildOrder(a, targets, targets);
+}
+
+/// `selected` plus everything it links or embeds (transitively), ordered so
+/// every target comes after its dependencies.
+pub fn buildOrder(a: Allocator, all: []const Target, selected: []const Target) ![]const Target {
+    var out = std.ArrayList(Target).init(a);
+    var state = std.StringHashMap(u8).init(a); // 1 = visiting, 2 = done
+    const Visit = struct {
+        fn visit(al: []const Target, o: *std.ArrayList(Target), st: *std.StringHashMap(u8), t: Target) !void {
+            if (st.get(t.name)) |s| {
+                if (s == 1) return diag.fail("dependency cycle through target '{s}'", .{t.name});
+                return;
+            }
+            try st.put(t.name, 1);
+            for ([_][]const []const u8{ t.link, t.embed }) |names| for (names) |n|
+                try visit(al, o, st, findTarget(al, n) orelse return diag.fail("unknown target '{s}'", .{n}));
+            try st.put(t.name, 2);
+            try o.append(t);
+        }
+    };
+    for (selected) |t| try Visit.visit(all, &out, &state, t);
+    return out.items;
 }
 
 pub fn load(a: Allocator, path: []const u8) !Config {
@@ -583,4 +702,51 @@ test "debug and release profiles isolate outputs and deep merge metadata" {
     try testing.expectEqualStrings("build/release", rel.build_dir);
     try testing.expectEqualStrings("false", rel.entitlement_values.?.get("get-task-allow").?.scalar.text);
     try testing.expectError(error.Invalid, parseConfiguration(a, source, "/project/idlproj.yml", "typo"));
+}
+
+test "product kinds, link/embed validation and dependency order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try parse(a,
+        \\targets:
+        \\  - name: App
+        \\    bundle_id: com.example.app
+        \\    embed: [Kit, Ext]
+        \\  - name: Ext
+        \\    type: appex
+        \\    bundle_id: com.example.app.ext
+        \\    link: [Kit]
+        \\  - name: Kit
+        \\    type: framework
+        \\    bundle_id: com.example.kit
+        \\    link: [Core]
+        \\  - name: Core
+        \\    type: static
+        \\
+    , "/proj/idlproj.yml");
+    try testing.expectEqual(Kind.static, cfg.targets[3].type);
+    try testing.expectEqualStrings("", cfg.targets[3].bundle_id);
+    try testing.expect(!cfg.targets[3].signs());
+    const order = try buildOrder(a, cfg.targets, cfg.targets[0..1]);
+    try testing.expectEqual(@as(usize, 4), order.len);
+    try testing.expectEqualStrings("Core", order[0].name);
+    try testing.expectEqualStrings("Kit", order[1].name);
+    try testing.expectEqualStrings("Ext", order[2].name);
+    try testing.expectEqualStrings("App", order[3].name);
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "targets:\n  - name: A\n    bundle_id: com.example.a\n    link: [Missing]\n", "unknown target 'Missing'" },
+        .{ "targets:\n  - name: A\n    bundle_id: com.example.a\n  - name: B\n    bundle_id: com.example.b\n    embed: [A]\n", "cannot embed app" },
+        .{ "targets:\n  - name: A\n    type: static\n    link: [B]\n  - name: B\n    type: static\n    link: [A]\n", "dependency cycle" },
+        .{ "targets:\n  - name: S\n    type: static\n    resources: [R]\n", "have no bundle" },
+        .{ "targets:\n  - name: F\n    type: framework\n", "'bundle_id' is required" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.Invalid, parse(a, case[0], "/p/idlproj.yml"));
+        testing.expect(std.mem.indexOf(u8, diag.msg, case[1]) != null) catch |err| {
+            std.debug.print("expected '{s}' in '{s}'\n", .{ case[1], diag.msg });
+            return err;
+        };
+    }
 }

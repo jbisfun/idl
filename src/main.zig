@@ -237,11 +237,14 @@ fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         try ipas.append(try std.fs.cwd().realpathAlloc(a, ipa));
     } else {
         var p = try loadProjectConfiguration(a, g, res.args.configuration);
-        const targets = try p.cfg.select(a, res.positionals[1]);
+        const selected = try p.cfg.select(a, res.positionals[1]);
+        const targets = if (res.args.@"no-build" == 0) try config.buildOrder(a, p.cfg.targets, selected) else selected;
         var session: ?builder.Session = if (res.args.@"no-build" == 0) try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0) else null;
         defer if (session) |*s| s.release();
+        var products = builder.Products.init(a);
         for (targets, 0..) |t, i| {
-            const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.?.prepared[i], .strict = res.args.strict != 0 });
+            const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else (try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.?.prepared[i], .strict = res.args.strict != 0, .products = &products })).ipa orelse continue;
+            if (t.type != .app) continue;
             if (fsutil.kind(ipa) != .file) return diag.fail("{s} does not exist; run `idl build {s}` first", .{ ipa, t.name });
             try ipas.append(ipa);
         }
@@ -266,13 +269,16 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     );
     const res = try parseSub(a, "build", &params, parsers, iter);
     var p = try loadProjectConfiguration(a, g, res.args.configuration);
-    const targets = try p.cfg.select(a, res.positionals[0]);
+    // Selected targets plus everything they link or embed, dependencies first.
+    const targets = try config.buildOrder(a, p.cfg.targets, try p.cfg.select(a, res.positionals[0]));
     var session = try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0);
     defer session.release();
     var ipas = std.ArrayList([]const u8).init(a);
+    var products = builder.Products.init(a);
     for (targets, 0..) |t, i| {
         if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
-        try ipas.append(try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0 }));
+        const built = try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0, .products = &products });
+        if (built.ipa) |ipa| try ipas.append(ipa);
     }
     diag.info("\nbuilt {d} IPA(s):", .{ipas.items.len});
     for (ipas.items) |ipa| diag.info("  {s}", .{ipa});
@@ -311,7 +317,7 @@ fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         const cfg = try config.loadConfiguration(a, file, res.args.configuration);
         var tc = try Toolchain.init(a, cfg.toolchain, cfg.root);
         _ = try tc.check(); // informational inventory; requirements are target-specific
-        var session = try builder.prepareAll(a, &tc, try cfg.select(a, res.positionals[0]), res.args.strict != 0, g.verbose);
+        var session = try builder.prepareAll(a, &tc, try config.buildOrder(a, cfg.targets, try cfg.select(a, res.positionals[0])), res.args.strict != 0, g.verbose);
         defer session.release();
         diag.info("preflight passed (no application sources compiled)", .{});
     } else {
@@ -331,7 +337,7 @@ fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const p = try loadProjectConfiguration(a, g, res.args.configuration);
     for (p.cfg.targets) |t| {
         const rel = try std.fs.path.relative(a, p.cfg.root, t.dir);
-        diag.info("{s:<20} {s:<7} {s:<32} iOS {s:<6} {s}", .{ t.name, @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
+        diag.info("{s:<24} {s:<9} {s:<7} {s:<36} iOS {s:<6} {s}", .{ t.name, @tagName(t.type), @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
     }
 }
 

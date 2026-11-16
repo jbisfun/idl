@@ -79,12 +79,14 @@ binary because AssetKit is a Swift library.
 
 ## Project model
 
-- Each target is one iOS application. There are no app extensions, frameworks,
-  static-library targets, watch apps or test bundles, either as build targets
-  or in the generated Xcode project. Prebuilt `.framework` resources are
-  copied to `Frameworks/` and ad-hoc signed, and `@executable_path/Frameworks`
-  is always an rpath. Building frameworks or extensions from source is not
-  supported.
+- `direct` targets can be apps, dynamic frameworks, dylibs, app extensions or
+  static (objects + Swift module) targets; see "Products" in the configuration
+  reference. Only apps are packaged; the other kinds are built for an app's
+  `link`/`embed` lists. Watch apps, test bundles, XCFrameworks and real `.a`
+  archives are not supported, and the generated Xcode project and xtool
+  builder only handle app targets. Prebuilt `.framework` resources are copied
+  to `Frameworks/` (without Headers, Modules or _CodeSignature) and ad-hoc
+  signed, and `@executable_path/Frameworks` is always an rpath.
 - Debug/release profiles are supported. Arbitrary additional configurations and
   profile-dependent source/dependency graphs are not. Omitting `-c` preserves
   the legacy unprofiled flags/output paths.
@@ -99,8 +101,10 @@ binary because AssetKit is a Swift library.
   produce the same language file will conflict.
 - Swift uses whole-module compilation, so changing a Swift source recompiles
   all Swift in the target. Debug compilation and linking are separate steps.
-- Objective-C cannot call Swift: no `<Module>-Swift.h` header is generated.
-  Swift can call Objective-C through `bridging_header`.
+- Swift compiles before the target's C-family sources. If a target mixes them,
+  idl generates `<Module>-Swift.h` and puts it on the include path, so
+  Objective-C can `#import "<Name>-Swift.h"`. Swift calls Objective-C through
+  `bridging_header`.
 - Swift `defines` must be plain flags. `NAME=VALUE` only applies to C-family
   code.
 - Only `arm64` device builds are tested. There is no simulator SDK.

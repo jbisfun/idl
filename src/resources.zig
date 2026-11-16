@@ -175,6 +175,7 @@ fn validateReferences(a: Allocator, node: plist.c.plist_t, outputs: []const Outp
 /// Tool checks for every selected target run before this function. Compiled
 /// resources are prepared/validated before any application object compilation.
 pub fn prepare(a: Allocator, tc: *Toolchain, t: Target, strict: bool, verbose: bool) !Prepared {
+    if (!t.type.bundled()) return .{ .outputs = &.{}, .info = null, .digest = "" };
     const xml = try metadata.processInfoPlist(a, t, &tc.env, null);
     const info = try plist.parse(xml);
     defer info.deinit();

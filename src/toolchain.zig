@@ -31,6 +31,16 @@ pub const Toolchain = struct {
         const old_path = env.get("PATH") orelse "/usr/bin:/bin";
         try env.put("PATH", try std.fmt.allocPrint(a, "{s}:{s}", .{ old_path, swiftly_bin }));
         const path_env = env.get("PATH").?;
+        // $(GIT_BRANCH) / $(GIT_COMMIT) for Info.plist and entitlements (environment wins).
+        for ([_]struct { []const u8, []const []const u8 }{
+            .{ "GIT_BRANCH", &.{ "git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD" } },
+            .{ "GIT_COMMIT", &.{ "git", "-C", root, "log", "-1", "--format=%h" } },
+        }) |entry| if (env.get(entry[0]) == null) {
+            const value = if (std.process.Child.run(.{ .allocator = a, .argv = entry[1] })) |r|
+                (if (r.term == .Exited and r.term.Exited == 0) std.mem.trim(u8, r.stdout, " \n\r") else "unknown")
+            else |_| "unknown";
+            try env.put(entry[0], value);
+        };
 
         const bundle = try fsutil.expandHome(a, cfg.sdk_bundle, &env);
         const sdks_dir = try std.fs.path.join(a, &.{ bundle, "Developer/Platforms/iPhoneOS.platform/Developer/SDKs" });
@@ -105,6 +115,9 @@ pub const Toolchain = struct {
             .c, .asm_, .swift => {},
         }
         for (target.include_dirs) |inc| try f.appendSlice(&.{ "-I", try target.path(t.a, inc) });
+        for (target.quote_include_dirs) |d| try f.appendSlice(&.{ "-iquote", try target.path(t.a, d) });
+        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
+        if (target.type == .appex) try f.append("-fapplication-extension");
         for (target.defines) |d| try f.append(try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
         try f.appendSlice(target.cflags);
         return f.items;
@@ -122,6 +135,9 @@ pub const Toolchain = struct {
         if (target.debug_symbols) try f.append("-g");
         if (target.bridging_header) |h| try f.appendSlice(&.{ "-import-objc-header", try target.path(t.a, h) });
         for (target.include_dirs) |inc| try f.appendSlice(&.{ "-I", try target.path(t.a, inc) });
+        for (target.quote_include_dirs) |d| try f.appendSlice(&.{ "-Xcc", "-iquote", "-Xcc", try target.path(t.a, d) });
+        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
+        if (target.type == .appex) try f.append("-application-extension");
         // Swift conditions are flags only; NAME=VALUE defines apply to C-family code.
         for (target.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try f.append(try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
         try f.appendSlice(target.swiftflags);
@@ -130,21 +146,37 @@ pub const Toolchain = struct {
 
     /// Linker inputs shared by clang and swiftc drivers: frameworks, libraries, extra flags.
     fn linkInputs(t: *const Toolchain, f: *std.ArrayList([]const u8), target: config.Target, need_cxx: bool) !void {
+        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
         for (target.frameworks) |fw| try f.appendSlice(&.{ "-framework", stripFramework(fw) });
         for (target.weak_frameworks) |fw| try f.appendSlice(&.{ "-weak_framework", stripFramework(fw) });
         for (target.libraries) |l| try f.append(try std.fmt.allocPrint(t.a, "-l{s}", .{l}));
         if (need_cxx) try f.append("-lc++");
         // Xcode's default LD_RUNPATH_SEARCH_PATHS, so embedded frameworks resolve.
         try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/Frameworks" });
+        switch (target.type) {
+            .framework, .dylib => {
+                if (target.type == .framework) try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks" });
+                const install = if (target.type == .framework)
+                    try std.fmt.allocPrint(t.a, "@rpath/{s}.framework/{s}", .{ target.name, target.name })
+                else
+                    try std.fmt.allocPrint(t.a, "@rpath/{s}.dylib", .{target.name});
+                try f.appendSlice(&.{ "-Xlinker", "-install_name", "-Xlinker", install });
+            },
+            // Extensions live in <app>/PlugIns/<name>.appex and load the app's frameworks.
+            .appex => try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../Frameworks", "-Xlinker", "-application_extension" }),
+            .app, .static => {},
+        }
+        if (target.dead_strip) try f.appendSlice(&.{ "-Xlinker", "-dead_strip" });
         for (target.ldflags) |l| try f.appendSlice(&.{ "-Xlinker", l });
     }
 
     pub fn clangLink(t: *const Toolchain, target: config.Target, objects: []const []const u8, out: []const u8, need_cxx: bool) ![]const []const u8 {
         var f = std.ArrayList([]const u8).init(t.a);
         try f.appendSlice(&.{
-            t.cc.?,         "-target",                                               try t.triple(target), "-isysroot",                        t.sdk.?,
-            "-fuse-ld=lld", try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}), "-Wl,-dead_strip",    "-Wl,-headerpad_max_install_names", t.clang_rt.?,
+            if (need_cxx) t.cxx orelse t.cc.? else t.cc.?, "-target",                                               try t.triple(target), "-isysroot", t.sdk.?,
+            "-fuse-ld=lld",                                try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}), "-Wl,-headerpad_max_install_names", t.clang_rt.?,
         });
+        if (target.type == .framework or target.type == .dylib) try f.append("-dynamiclib");
         try f.appendSlice(objects);
         try f.appendSlice(&.{ "-o", out });
         try t.linkInputs(&f, target, need_cxx);
@@ -157,10 +189,10 @@ pub const Toolchain = struct {
         try f.appendSlice(try t.swiftflags(target, module_cache));
         try f.appendSlice(&.{
             "-use-ld=lld", try std.fmt.allocPrint(t.a, "-ld-path={s}", .{t.ld64}),
-            "-Xlinker",    "-dead_strip",
             "-Xlinker",    "-headerpad_max_install_names",
             "-Xlinker",    t.clang_rt.?,
         });
+        if (target.type == .framework or target.type == .dylib) try f.append("-emit-library");
         try f.appendSlice(swift_sources);
         try f.appendSlice(objects);
         try f.appendSlice(&.{ "-o", out });

@@ -61,6 +61,9 @@ they must stay inside it (no absolute paths, no `..`).
 | `defines` | `[]` | `NAME` or `NAME=VALUE`. Both forms go to C-family code; only `NAME` goes to Swift |
 | `include_dirs` | `[]` | `-I` for clang and swiftc |
 | `bridging_header` | none | Objective-C header that Swift imports (`-import-objc-header`) |
+| `quote_include_dirs` | `[]` | `-iquote` dirs (clang, and swiftc via `-Xcc`): only `#include "..."` sees them, like Xcode's header map |
+| `framework_dirs` | `[]` | `-F` dirs for clang, swiftc and the linker |
+| `dead_strip` | `true` | pass `-dead_strip` to the linker |
 | `cflags` / `swiftflags` | `[]` | extra compiler flags |
 | `ldflags` | `[]` | extra linker arguments, each passed as `-Xlinker <arg>` |
 | `frameworks` | `[UIKit, Foundation]` | SDK frameworks (`X` or `X.framework`) |
@@ -145,6 +148,43 @@ Xcode configurations reference their matching set. Variables are expanded at
 generation time using each profile, not re-evaluated from YAML by Xcode.
 Direct builds generate bundle metadata themselves; xtool metadata is regenerated
 before each xtool build. `.idl/` is disposable and should be gitignored.
+
+### Products
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `type` | `app` | `app`, `framework`, `dylib`, `appex` or `static` |
+| `link` | `[]` | project `framework`/`dylib`/`static` targets to link against |
+| `embed` | `[]` | apps only: project `framework`/`dylib`/`appex` targets to copy into the bundle |
+| `post_build` | `[]` | apps only: command (argv) run after the IPA is built and verified |
+
+`idl build X` builds X plus every target it links or embeds, with dependencies
+first. Cycles are an error. Each kind produces:
+
+- `framework`: `<build>/products/<name>.framework` (binary, generated Info.plist
+  with `FMWK`, resources), install name `@rpath/<name>.framework/<name>`, bundle
+  signed with ldid. Dependents link with `-F <build>/link -framework <name>`.
+  Apps embed it under `Frameworks/`.
+- `dylib`: `<build>/products/<name>.dylib`, install name `@rpath/<name>.dylib`,
+  embedded under `Frameworks/`. No `bundle_id`, Info.plist or resources.
+- `appex`: `<build>/products/<name>.appex` (Info.plist with `XPC!`, entitlements,
+  signed with `-I<bundle_id>`), built with `-fapplication-extension` /
+  `-application-extension`. Rpaths include `@executable_path/../../Frameworks`.
+  Apps embed it under `PlugIns/`. The entry point comes from `ldflags` (e.g.
+  `[-e, _NSExtensionMain]`) or a Swift `@main`.
+- `static`: compiled objects plus `<name>.swiftmodule` and `<name>-Swift.h`. A
+  linking target receives the objects in its link, `-I` for the module, and the
+  header dir. Not signed. No `bundle_id`.
+
+Swift in non-app targets is compiled with `-parse-as-library` and module name
+`<name>`. `post_build` runs in the target directory with `IDL_IPA`, `IDL_APP`,
+`IDL_BUILD_DIR`, `IDL_TARGET` (and `IDL_CONFIGURATION` with `-c`) set.
+
+In `info:`, `Key: ~` removes a key inherited from `info_plist`. Info.plist and
+entitlement expansion can also use `$(GIT_BRANCH)` and `$(GIT_COMMIT)` from the
+project root's git checkout (environment variables override them). Source and
+resource entries may use `*` in their last path component, e.g.
+`Resources/*.lproj`.
 
 ### Code generation
 

@@ -59,6 +59,21 @@ fn validateLanguage(language: []const u8) !void {
         return diag.fail("invalid String Catalog language '{s}'; expected a language identifier, not a path", .{language});
 }
 
+/// NSStringPluralRuleType dictionary for one plural variation map.
+fn pluralRule(a: Allocator, plural: std.json.ObjectMap, spec: []const u8) !plist.c.plist_t {
+    const rule = plist.Plist.newDict();
+    try rule.set(a, "NSStringFormatSpecTypeKey", try plist.newString(a, "NSStringPluralRuleType"));
+    try rule.set(a, "NSStringFormatValueTypeKey", try plist.newString(a, spec));
+    var cat_it = plural.iterator();
+    while (cat_it.next()) |cat| {
+        const unit = obj((obj(cat.value_ptr.*) orelse continue).get("stringUnit")) orelse continue;
+        const text = str(unit.get("value")) orelse continue;
+        const replaced = try std.mem.replaceOwned(u8, a, text, "%arg", try std.fmt.allocPrint(a, "%{s}", .{spec}));
+        try rule.set(a, cat.key_ptr.*, try plist.newString(a, replaced));
+    }
+    return rule.node;
+}
+
 pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
     const root = std.json.parseFromSliceLeaky(Json, a, source, .{}) catch |err|
         return diag.fail("invalid xcstrings JSON: {s}", .{@errorName(err)});
@@ -88,26 +103,36 @@ pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
             try validateLanguage(language);
             const localization = obj(loc.value_ptr.*) orelse continue;
             const plural_map: ?std.json.ObjectMap = if (obj(localization.get("variations"))) |v| obj(v.get("plural")) else null;
-            if (plural_map) |plural| {
+            if (obj(localization.get("substitutions"))) |subs| {
+                // Multi-argument plurals: "Moved %#@arg1@ and %#@arg2@."
+                var format: []const u8 = if (obj(localization.get("stringUnit"))) |unit| str(unit.get("value")) orelse key else key;
+                const wrapper = plist.Plist.newDict();
+                var sub_it = subs.iterator();
+                while (sub_it.next()) |sub| {
+                    const name = sub.key_ptr.*;
+                    const s = obj(sub.value_ptr.*) orelse continue;
+                    const spec = str(s.get("formatSpecifier")) orelse "lld";
+                    const plural = (if (obj(s.get("variations"))) |v| obj(v.get("plural")) else null) orelse continue;
+                    try wrapper.set(a, name, try pluralRule(a, plural, spec));
+                    if (s.get("argNum")) |n| if (n == .integer) {
+                        format = try std.mem.replaceOwned(u8, a, format, try std.fmt.allocPrint(a, "%#@{s}@", .{name}), try std.fmt.allocPrint(a, "%{d}$#@{s}@", .{ n.integer, name }));
+                    };
+                }
+                try wrapper.set(a, "NSStringLocalizedFormatKey", try plist.newString(a, format));
+                const gop = try plurals.getOrPut(a, language);
+                if (!gop.found_existing) gop.value_ptr.* = plist.Plist.newDict();
+                try gop.value_ptr.set(a, key, wrapper.node);
+                const t = try tableFor(a, &strings, language);
+                try t.put(a, key, format);
+            } else if (plural_map) |plural| {
                 const other_value = blk: {
                     const o = obj(plural.get("other")) orelse break :blk key;
                     const unit = obj(o.get("stringUnit")) orelse break :blk key;
                     break :blk str(unit.get("value")) orelse key;
                 };
-                const spec = formatSpecifier(other_value);
-                const rule = plist.Plist.newDict();
-                try rule.set(a, "NSStringFormatSpecTypeKey", try plist.newString(a, "NSStringPluralRuleType"));
-                try rule.set(a, "NSStringFormatValueTypeKey", try plist.newString(a, spec));
-                var cat_it = plural.iterator();
-                while (cat_it.next()) |cat| {
-                    const unit = obj((obj(cat.value_ptr.*) orelse continue).get("stringUnit")) orelse continue;
-                    const text = str(unit.get("value")) orelse continue;
-                    const replaced = try std.mem.replaceOwned(u8, a, text, "%arg", try std.fmt.allocPrint(a, "%{s}", .{spec}));
-                    try rule.set(a, cat.key_ptr.*, try plist.newString(a, replaced));
-                }
                 const wrapper = plist.Plist.newDict();
                 try wrapper.set(a, "NSStringLocalizedFormatKey", try plist.newString(a, "%#@value@"));
-                try wrapper.set(a, "value", rule.node);
+                try wrapper.set(a, "value", try pluralRule(a, plural, formatSpecifier(other_value)));
                 const gop = try plurals.getOrPut(a, language);
                 if (!gop.found_existing) gop.value_ptr.* = plist.Plist.newDict();
                 try gop.value_ptr.set(a, key, wrapper.node);
@@ -169,4 +194,25 @@ test "string catalog language must be a single safe directory name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(error.Invalid, convert(arena.allocator(), "{\"sourceLanguage\":\"bad/lang\",\"strings\":{\"Hello\":{}}}", tmp.dir));
+}
+
+test "multi-argument plural substitutions become positional stringsdict rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try convert(a,
+        \\{"sourceLanguage":"en","strings":{"moved %lld %lld":{"localizations":{"en":{
+        \\ "stringUnit":{"value":"Moved %#@a@ and %#@b@."},
+        \\ "substitutions":{
+        \\  "a":{"argNum":1,"formatSpecifier":"lld","variations":{"plural":{"one":{"stringUnit":{"value":"%arg file"}},"other":{"stringUnit":{"value":"%arg files"}}}}},
+        \\  "b":{"argNum":2,"formatSpecifier":"lld","variations":{"plural":{"other":{"stringUnit":{"value":"%arg dirs"}}}}}}}}}}}
+    , tmp.dir);
+    const dict = try plist.parse(try tmp.dir.readFileAlloc(a, "en.lproj/Localizable.stringsdict", 4096));
+    defer dict.deinit();
+    const entry = try dict.get(a, "moved %lld %lld");
+    try std.testing.expectEqualStrings("Moved %1$#@a@ and %2$#@b@.", plist.stringOf(plist.c.plist_dict_get_item(entry, "NSStringLocalizedFormatKey")).?);
+    const rule = plist.c.plist_dict_get_item(entry, "a");
+    try std.testing.expectEqualStrings("%lld file", plist.stringOf(plist.c.plist_dict_get_item(rule, "one")).?);
 }

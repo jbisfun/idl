@@ -144,10 +144,51 @@ fn walk(a: Allocator, root: []const u8, rel: []const u8, out: *std.ArrayList([]c
 
 /// Recursively expand `entries` (relative to `root`) into a sorted, de-duplicated
 /// list of relative file paths. Package directories are returned whole.
+/// `*` matches any run of characters within one path component.
+fn globMatch(pattern: []const u8, name: []const u8) bool {
+    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return std.mem.eql(u8, pattern, name);
+    const head = pattern[0..star];
+    if (!std.mem.startsWith(u8, name, head)) return false;
+    const rest = pattern[star + 1 ..];
+    var i: usize = head.len;
+    while (i <= name.len) : (i += 1) if (globMatch(rest, name[i..])) return true;
+    return false;
+}
+
+/// Expand a pattern whose last component contains `*` (e.g. `Resources/*.lproj`).
+fn expandGlob(a: Allocator, root: []const u8, entry: []const u8, comptime label: []const u8) ![]const []const u8 {
+    const parent = std.fs.path.dirnamePosix(entry) orelse "";
+    const pattern = std.fs.path.basenamePosix(entry);
+    if (std.mem.indexOfScalar(u8, parent, '*') != null) return diag.fail(label ++ " pattern {s}: only the last path component may contain '*'", .{entry});
+    if (parent.len > 0) try rejectSymlinkComponents(a, root, parent);
+    var dir = std.fs.cwd().openDir(try join(a, root, parent), .{ .iterate = true, .no_follow = true }) catch
+        return diag.fail(label ++ " path does not exist: {s}", .{parent});
+    defer dir.close();
+    var out = std.ArrayList([]const u8).init(a);
+    var it = dir.iterate();
+    while (try it.next()) |e| {
+        if (e.name[0] == '.' or !globMatch(pattern, e.name)) continue;
+        try out.append(if (parent.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, e.name }));
+    }
+    if (out.items.len == 0) return diag.fail(label ++ " pattern matched nothing: {s}", .{entry});
+    std.mem.sort([]const u8, out.items, {}, lessThan);
+    return out.items;
+}
+
+test "glob matching" {
+    try std.testing.expect(globMatch("*.lproj", "en.lproj"));
+    try std.testing.expect(globMatch("a*b*c", "aXbYc"));
+    try std.testing.expect(!globMatch("*.lproj", "en.lprojx"));
+}
+
 pub fn discover(a: Allocator, root: []const u8, entries: []const []const u8, comptime label: []const u8) ![]const []const u8 {
     var found = std.ArrayList([]const u8).init(a);
     for (entries) |entry| {
         try validateRelativePath(entry, label ++ " path");
+        if (std.mem.indexOfScalar(u8, entry, '*') != null) {
+            for (try expandGlob(a, root, entry, label)) |rel| try walk(a, root, rel, &found);
+            continue;
+        }
         try rejectSymlinkComponents(a, root, entry);
         const rel = try normalizeRelative(a, entry);
         if (kind(try join(a, root, rel)) == .missing)
