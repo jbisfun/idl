@@ -156,7 +156,7 @@ before each xtool build. `.idl/` is disposable and should be gitignored.
 | `type` | `app` | `app`, `framework`, `dylib`, `appex` or `static` |
 | `link` | `[]` | project `framework`/`dylib`/`static` targets to link against |
 | `embed` | `[]` | apps only: project `framework`/`dylib`/`appex` targets to copy into the bundle |
-| `post_build` | `[]` | apps only: command (argv) run after the IPA is built and verified |
+| `post_build` | `[]` | apps only: command (argv list) or list of commands run in order after the IPA is built and verified; skip with `idl build --no-post-build` |
 
 `idl build X` builds X plus every target it links or embeds, with dependencies
 first. Cycles are an error. Each kind produces:
@@ -178,13 +178,84 @@ first. Cycles are an error. Each kind produces:
 
 Swift in non-app targets is compiled with `-parse-as-library` and module name
 `<name>`. `post_build` runs in the target directory with `IDL_IPA`, `IDL_APP`,
-`IDL_BUILD_DIR`, `IDL_TARGET` (and `IDL_CONFIGURATION` with `-c`) set.
+`IDL_BUILD_DIR`, `IDL_TARGET`, `IDL` (path of the running idl) and, with `-c`,
+`IDL_CONFIGURATION` set. A command that exits non-zero fails the build.
 
 In `info:`, `Key: ~` removes a key inherited from `info_plist`. Info.plist and
 entitlement expansion can also use `$(GIT_BRANCH)` and `$(GIT_COMMIT)` from the
 project root's git checkout (environment variables override them). Source and
 resource entries may use `*` in their last path component, e.g.
 `Resources/*.lproj`.
+
+### Formatting, linting and tests (`idl fmt`, `idl lint`, `idl test`)
+
+idl only orchestrates the tools. It generates their configurations from YAML
+into `.idl/quality/<target>/`, so no hand-written `.clang-format` or
+`.swift-format` files are needed. It passes the configs explicitly, runs the
+tools in parallel, and merges their output into one de-duplicated report:
+`file:line:col: severity: message [flag] (tool)`, followed by a per-tool
+summary and the most frequent flags/checks.
+
+`format:` (maps merge with `defaults:`):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `indent` | `4` | indent width (clang-format `IndentWidth`/`ObjCBlockIndentWidth`, swift-format `indentation.spaces`) |
+| `line_length` | `0` | 0 = never re-wrap (clang-format `ColumnLimit: 0`) |
+| `clang_format` | none | extra clang-format keys; they override the generated ones (nested maps allowed) |
+| `swift_format` | none | extra swift-format JSON keys, deep-merged (e.g. `rules:`) |
+| `exclude` | `[]` | source paths or directories never formatted (`*` per path component) |
+| `editor_configs` | `false` | `idl gen` also writes `.clang-format`, `.clang-tidy` and `.swift-format` for clangd/sourcekit-lsp |
+
+`idl fmt [--check] [target...]` formats C, Objective-C, C++, Objective-C++ and
+headers with clang-format, and Swift with swift-format. `--check` changes
+nothing and exits 1 if any file would change.
+
+`lint:`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `warnings` | `[-Wall]` | clang warning flags added to the compiler pass |
+| `swift_flags` | `[]` | extra swiftc flags for the Swift type-check |
+| `exclude` | `[]` | paths not linted; diagnostics located there are dropped too |
+| `clang_tidy` | auto | run clang-tidy (auto = when installed) |
+| `clang_tidy_checks` | idl's set | clang-tidy `Checks`; default is clang-analyzer, bugprone and performance checks minus noisy ones |
+| `analyze` | `false` | also run the clang static analyzer (`clang --analyze`) |
+| `swift_format` | `false` | also run `swift-format lint` with the generated style |
+
+`idl lint [target...]` first builds the targets and their dependencies
+incrementally, so that Swift modules and generated `<Module>-Swift.h` headers
+exist. It then re-runs each compiler with the target's exact build flags. Every
+C-family file gets `clang -fsyntax-only`, with the target's `-w`, `-Werror`
+and depfile flags removed and `lint.warnings` added. Each Swift module gets
+`swiftc -typecheck` with warnings enabled. clang-tidy, the static analyzer and
+`swift-format lint` reuse the same flags. Diagnostics from the SDK, from
+excluded paths, and duplicates of the same header warning across translation
+units are dropped. Options: `--werror`, `--analyze`, `--tidy`/`--no-tidy`,
+`-q` (summary only) and `--max N`. Errors exit 1, and so do warnings with
+`--werror`.
+
+`tests:` (apps only) is a list of commands (argv lists). `idl test [target...]`
+builds the targets without running `post_build` (unless `--no-build`). It then
+checks each app's built bundle:
+- Every Mach-O must be arm64, built for iOS, and signed. Embedded code must
+  not require a newer iOS than the app's MinimumOSVersion; extensions are
+  exempt.
+- Every `@rpath`/`@loader_path`/`@executable_path` dependency must resolve
+  inside the bundle, using the image's own rpaths. System libraries must exist
+  in the SDK. Private frameworks and weak links only produce warnings.
+- Every framework and extension needs an Info.plist and an executable, with
+  string version keys.
+- Every extension's bundle ID must be prefixed by the app's, and it must have
+  `NSExtension`/`EXAppExtensionAttributes`.
+
+After the checks, the `tests:` commands run in the target directory with
+`IDL_IPA`, `IDL_APP`, `IDL_BUILD_DIR`, `IDL_TARGET` and `IDL` set. Output is
+one PASS/FAIL line per check or command, then a summary.
+
+Tool paths can be set under `toolchain:` as `clang_format`, `clang_tidy` and
+`swift_format` (swift-format ships with the swiftly toolchain). A missing
+optional tool is skipped with a note.
 
 ### Code generation
 

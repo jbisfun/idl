@@ -40,6 +40,44 @@ pub const Kind = enum {
     }
 };
 
+/// `idl lint` settings (per target; `defaults:` maps merge).
+pub const LintConfig = struct {
+    /// Extra clang warning flags for the compiler pass (the target's own `-w`,
+    /// `-Werror` and depfile flags are dropped).
+    warnings: []const []const u8 = &.{"-Wall"},
+    /// Extra swiftc flags for the Swift type-check pass (warnings are not suppressed).
+    swift_flags: []const []const u8 = &.{},
+    /// Source paths (relative to the target dir; `*` globs per component) whose
+    /// diagnostics are dropped, e.g. vendored code.
+    exclude: []const []const u8 = &.{},
+    /// clang-tidy pass. null = run when clang-tidy is installed.
+    clang_tidy: ?bool = null,
+    /// clang static analyzer pass (`clang --analyze`).
+    analyze: bool = false,
+    /// `swift-format lint` (style rules from the generated config). Off by default.
+    swift_format: bool = false,
+    /// clang-tidy `Checks` (joined with commas). Empty = idl's default set.
+    clang_tidy_checks: []const []const u8 = &.{},
+};
+
+/// `idl fmt` settings. idl generates the clang-format / swift-format
+/// configurations from these; there are no hand-written style files.
+pub const FormatConfig = struct {
+    /// Paths (relative to the target dir; `*` globs per component) never formatted.
+    exclude: []const []const u8 = &.{},
+    /// Indent width for every language.
+    indent: []const u8 = "4",
+    /// Maximum line length; 0 = never re-wrap lines.
+    line_length: []const u8 = "0",
+    /// Extra clang-format options (clang-format YAML keys), override the above.
+    clang_format: ?ynode.Map = null,
+    /// Extra swift-format options (its JSON keys), deep-merged over the above.
+    swift_format: ?ynode.Map = null,
+    /// `idl gen` also writes .clang-format, .clang-tidy and .swift-format into
+    /// the target directory for editors (clangd, sourcekit-lsp).
+    editor_configs: bool = false,
+};
+
 pub const ToolchainConfig = struct {
     sdk_bundle: []const u8 = "~/.swiftpm/swift-sdks/darwin.artifactbundle",
     /// Optional explicit iPhoneOS.sdk; otherwise the newest one in the bundle.
@@ -58,6 +96,10 @@ pub const ToolchainConfig = struct {
     jobs: usize = 0,
     /// Jimpactor data dir (relaunch.port, ipc.token). Default: $XDG_CONFIG_HOME/Jimpactor or ~/.config/Jimpactor.
     jimpactor_dir: ?[]const u8 = null,
+    /// Optional quality tools (`idl fmt` / `idl lint`), path or command name.
+    clang_format: []const u8 = "clang-format",
+    clang_tidy: []const u8 = "clang-tidy",
+    swift_format: []const u8 = "swift-format",
 };
 
 pub const Target = struct {
@@ -113,9 +155,14 @@ pub const Target = struct {
     embed: []const []const u8 = &.{},
     /// Pass `-dead_strip` to the linker.
     dead_strip: bool = true,
-    /// Command (argv) run after an app's IPA is written. Runs in the target
-    /// directory with IDL_IPA, IDL_APP, IDL_BUILD_DIR and IDL_TARGET set.
-    post_build: []const []const u8 = &.{},
+    /// Commands (argv lists) run in order after an app's IPA is written. They
+    /// run in the target directory with IDL_IPA, IDL_APP, IDL_BUILD_DIR and
+    /// IDL_TARGET set. YAML: one argv list, or a list of argv lists.
+    post_build: []const []const []const u8 = &.{},
+    /// Commands (argv lists) `idl test` runs after the bundle checks.
+    tests: []const []const []const u8 = &.{},
+    lint: LintConfig = .{},
+    format: FormatConfig = .{},
     /// Ad-hoc sign with ldid (direct) / `xtool --sign` (xtool). Default: direct only.
     sign: ?bool = null,
     xcodeproj: bool = false,
@@ -243,9 +290,10 @@ const target_keys = [_][]const u8{
     "package_swift",   "icon",             "type",
     "framework_dirs",  "link",             "embed",
     "dead_strip",      "post_build",       "quote_include_dirs",
+    "tests",           "lint",             "format",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
-const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir" };
+const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir", "clang_format", "clang_tidy", "swift_format" };
 const top_keys = [_][]const u8{ "toolchain", "defaults", "targets", "configurations" };
 
 fn checkKeys(m: ynode.Map, allowed: []const []const u8, where: []const u8) !void {
@@ -278,6 +326,51 @@ const Ctx = struct {
                 return out;
             },
             else => return diag.fail("{s}: '{s}' must be a list of strings", .{ c.where, key }),
+        }
+    }
+
+    /// A settings mapping onto a struct of strings, string lists and (optional) bools.
+    fn section(c: Ctx, comptime T: type, n: Node, key: []const u8) !T {
+        var out: T = .{};
+        const m = (try c.map(n, key)) orelse return out;
+        const names = comptime blk: {
+            var ns: [std.meta.fields(T).len][]const u8 = undefined;
+            for (std.meta.fields(T), 0..) |f, i| ns[i] = f.name;
+            break :blk ns;
+        };
+        try checkKeys(m, &names, try std.fmt.allocPrint(c.a, "{s}.{s}", .{ c.where, key }));
+        inline for (std.meta.fields(T)) |f| if (m.get(f.name)) |v| {
+            @field(out, f.name) = switch (f.type) {
+                []const u8 => try c.str(v, f.name),
+                ?ynode.Map => try c.map(v, f.name),
+                []const []const u8 => try c.strList(v, f.name),
+                bool => try c.boolean(v, f.name),
+                ?bool => if (v == .null) null else try c.boolean(v, f.name),
+                else => @compileError("unhandled section field type"),
+            };
+        };
+        return out;
+    }
+
+    /// One argv list (`[cmd, arg]`) or a list of them (`[[cmd, arg], [cmd2]]`).
+    fn commands(c: Ctx, n: Node, key: []const u8) ![]const []const []const u8 {
+        switch (n) {
+            .null => return &.{},
+            .list => |items| {
+                if (items.len == 0) return &.{};
+                if (items[0] != .list) {
+                    const one = try c.a.alloc([]const []const u8, 1);
+                    one[0] = try c.strList(n, key);
+                    return one;
+                }
+                const out = try c.a.alloc([]const []const u8, items.len);
+                for (items, out) |item, *o| {
+                    o.* = try c.strList(item, key);
+                    if (o.len == 0) return diag.fail("{s}: '{s}' commands must not be empty", .{ c.where, key });
+                }
+                return out;
+            },
+            else => return diag.fail("{s}: '{s}' must be a command list ([cmd, args...]) or a list of them", .{ c.where, key }),
         }
     }
 
@@ -362,12 +455,18 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     const kind_node = m.get("type") orelse if (defaults) |d| d.get("type") else null;
     if (kind_node) |k| t.type = std.meta.stringToEnum(Kind, try c.str(k, "type")) orelse
         return diag.fail("{s}: type must be app, framework, dylib, appex or static", .{c.where});
+    if (m.get("post_build") orelse if (defaults) |d| d.get("post_build") else null) |pb| t.post_build = try c.commands(pb, "post_build");
+    if (m.get("tests") orelse if (defaults) |d| d.get("tests") else null) |v| t.tests = try c.commands(v, "tests");
+    if (m.get("lint") orelse if (defaults) |d| d.get("lint") else null) |v| t.lint = try c.section(LintConfig, v, "lint");
+    if (m.get("format") orelse if (defaults) |d| d.get("format") else null) |v| t.format = try c.section(FormatConfig, v, "format");
+    for ([_][]const u8{ t.format.indent, t.format.line_length }) |n| _ = std.fmt.parseInt(u16, n, 10) catch
+        return diag.fail("{s}: format.indent and format.line_length must be non-negative integers", .{c.where});
     if (m.get("bundle_id")) |b| {
         t.bundle_id = try c.str(b, "bundle_id");
     } else if (t.type.bundled()) return diag.fail("{s}: 'bundle_id' is required", .{c.where});
 
     inline for (std.meta.fields(Target)) |field| {
-        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants") or std.mem.eql(u8, field.name, "type"))) continue;
+        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants") or std.mem.eql(u8, field.name, "type") or std.mem.eql(u8, field.name, "post_build") or std.mem.eql(u8, field.name, "tests") or std.mem.eql(u8, field.name, "lint") or std.mem.eql(u8, field.name, "format"))) continue;
         const value = m.get(field.name) orelse if (defaults) |d| d.get(field.name) else null;
         if (value) |v| {
             if (comptime std.mem.eql(u8, field.name, "entitlements")) {
@@ -392,6 +491,7 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
         if (t.xcodeproj) return diag.fail("{s}: xcodeproj generation is only supported for app targets", .{c.where});
         if (t.embed.len > 0) return diag.fail("{s}: only app targets can embed other targets", .{c.where});
         if (t.post_build.len > 0) return diag.fail("{s}: post_build is only supported for app targets", .{c.where});
+        if (t.tests.len > 0) return diag.fail("{s}: tests are only supported for app targets", .{c.where});
         if (!t.type.bundled() and (t.resources.len > 0 or t.info_plist != null or t.info != null or t.entitlements != null or t.entitlement_values != null))
             return diag.fail("{s}: {s} targets have no bundle (resources, info and entitlements are not allowed)", .{ c.where, @tagName(t.type) });
     }
@@ -726,6 +826,12 @@ test "product kinds, link/embed validation and dependency order" {
         \\
     , "/proj/idlproj.yml");
     try testing.expectEqual(Kind.static, cfg.targets[3].type);
+    const one = try parse(a, "targets:\n  - name: A\n    bundle_id: com.example.a\n    post_build: [sh, x.sh]\n", "/p/idlproj.yml");
+    try testing.expectEqual(@as(usize, 1), one.targets[0].post_build.len);
+    try testing.expectEqualStrings("x.sh", one.targets[0].post_build[0][1]);
+    const two = try parse(a, "targets:\n  - name: A\n    bundle_id: com.example.a\n    post_build:\n      - [sh, x.sh]\n      - [sh, y.sh, --flag]\n", "/p/idlproj.yml");
+    try testing.expectEqual(@as(usize, 2), two.targets[0].post_build.len);
+    try testing.expectEqualStrings("--flag", two.targets[0].post_build[1][2]);
     try testing.expectEqualStrings("", cfg.targets[3].bundle_id);
     try testing.expect(!cfg.targets[3].signs());
     const order = try buildOrder(a, cfg.targets, cfg.targets[0..1]);

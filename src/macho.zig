@@ -17,6 +17,8 @@ const lc_code_signature: u32 = 0x1d;
 const lc_version_min_iphoneos: u32 = 0x25;
 const lc_main: u32 = 0x28 | lc_req_dyld;
 const lc_build_version: u32 = 0x32;
+const lc_rpath: u32 = 0x1c | lc_req_dyld;
+const lc_id_dylib: u32 = 0x0d;
 
 pub const Info = struct {
     cputype: u32,
@@ -28,7 +30,19 @@ pub const Info = struct {
     min_os: ?u32 = null,
     sdk: ?u32 = null,
     dylibs: []const []const u8 = &.{},
+    /// Subset of `dylibs` loaded with LC_LOAD_WEAK_DYLIB.
+    weak_dylibs: []const []const u8 = &.{},
+    rpaths: []const []const u8 = &.{},
+    id_dylib: ?[]const u8 = null,
 };
+
+fn lcString(lc: []const u8, off_at: usize) ?[]const u8 {
+    if (lc.len < off_at + 4) return null;
+    const off = std.mem.readInt(u32, lc[off_at..][0..4], .little);
+    if (off >= lc.len) return null;
+    const raw = lc[off..];
+    return raw[0 .. std.mem.indexOfScalar(u8, raw, 0) orelse raw.len];
+}
 
 pub fn formatVersion(buf: []u8, v: u32) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}", .{ v >> 16, (v >> 8) & 0xff, v & 0xff }) catch "?";
@@ -63,6 +77,8 @@ pub fn parse(a: Allocator, b: []const u8) !Info {
     };
     const ncmds = std.mem.readInt(u32, b[16..20], .little);
     var dylibs = std.ArrayList([]const u8).init(a);
+    var weak = std.ArrayList([]const u8).init(a);
+    var rpaths = std.ArrayList([]const u8).init(a);
     var off: usize = 32;
     for (0..ncmds) |_| {
         if (off + 8 > b.len) return diag.fail("Mach-O load commands truncated", .{});
@@ -84,17 +100,20 @@ pub fn parse(a: Allocator, b: []const u8) !Info {
                 info.sdk = std.mem.readInt(u32, lc[12..16], .little);
             },
             lc_load_dylib, lc_load_weak_dylib, lc_reexport_dylib => if (size >= 24) {
-                const name_off = std.mem.readInt(u32, lc[8..12], .little);
-                if (name_off < size) {
-                    const raw = lc[name_off..];
-                    try dylibs.append(raw[0 .. std.mem.indexOfScalar(u8, raw, 0) orelse raw.len]);
+                if (lcString(lc, 8)) |name| {
+                    try dylibs.append(name);
+                    if (cmd == lc_load_weak_dylib) try weak.append(name);
                 }
             },
+            lc_rpath => if (lcString(lc, 8)) |p| try rpaths.append(p),
+            lc_id_dylib => info.id_dylib = lcString(lc, 8),
             else => {},
         }
         off += size;
     }
     info.dylibs = dylibs.items;
+    info.weak_dylibs = weak.items;
+    info.rpaths = rpaths.items;
     return info;
 }
 

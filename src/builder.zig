@@ -25,6 +25,8 @@ pub const Options = struct {
     prepared: ?resources.Prepared = null,
     /// Products of already-built targets, for `link`/`embed`.
     products: ?*Products = null,
+    /// Run app targets' post_build commands.
+    post_build: bool = true,
 };
 
 const Ctx = struct {
@@ -260,6 +262,14 @@ fn resolveDeps(c: Ctx) !Deps {
     return .{ .swift_flags = swift_flags.items, .c_flags = c_flags.items, .link_args = link_args.items, .objects = objects.items, .inputs = inputs.items };
 }
 
+/// Like Xcode: only a file named main.swift may hold top-level code; every
+/// other module (libraries, @main apps, ObjC-main apps) parses as a library.
+fn parseAsLibrary(t: Target, swift: []const []const u8) bool {
+    if (t.type != .app) return true;
+    for (swift) |f| if (std.mem.eql(u8, std.fs.path.basename(f), "main.swift")) return false;
+    return true;
+}
+
 const SwiftOut = struct { obj: []const u8, module_dir: ?[]const u8, header_dir: ?[]const u8, changed: bool };
 
 /// Whole-module Swift compile to one object. Runs before the C-family compile
@@ -271,7 +281,7 @@ fn compileSwift(c: Ctx, swift: []const []const u8, obj_dir: []const u8, module_c
     var argv = std.ArrayList([]const u8).init(a);
     try argv.append(c.tc.swiftc.?);
     try argv.appendSlice(try c.tc.swiftflags(t, module_cache));
-    if (t.type != .app) try argv.append("-parse-as-library");
+    if (parseAsLibrary(t, swift)) try argv.append("-parse-as-library");
     try argv.appendSlice(deps.swift_flags);
     try argv.appendSlice(swift);
     try argv.appendSlice(&.{ "-c", "-o", obj });
@@ -558,6 +568,57 @@ fn buildDirect(c: Ctx) !Product {
     return p;
 }
 
+/// The exact compiler invocations `buildDirect` uses for a target, without
+/// outputs (`-c`/`-o`/emit flags), for tools that re-run the compilers (lint).
+/// Dependencies must already be in `products`.
+pub const Invocations = struct {
+    pub const Source = struct { rel: []const u8, path: []const u8, lang: Toolchain.Lang, argv: []const []const u8 };
+    c_family: []const Source,
+    /// swiftc + flags + all Swift sources of the module, or null.
+    swift: ?[]const []const u8,
+    swift_files: []const []const u8,
+};
+
+pub fn invocations(a: Allocator, tc: *Toolchain, t: Target, products: *Products) !Invocations {
+    const c: Ctx = .{ .a = a, .tc = tc, .t = t, .opts = .{ .products = products } };
+    const sources = try fsutil.discover(a, t.dir, t.sources, "source");
+    var swift = std.ArrayList([]const u8).init(a);
+    var has_c = false;
+    for (sources) |s| switch (Toolchain.langOf(s) orelse continue) {
+        .swift => try swift.append(try t.path(a, s)),
+        else => has_c = true,
+    };
+    try tc.require(swift.items.len > 0);
+    const build_dir = try t.buildPath(a);
+    const module_cache = try std.fs.path.join(a, &.{ build_dir, "ModuleCache" });
+    try std.fs.cwd().makePath(module_cache);
+    const deps = try resolveDeps(c);
+    var extra = std.ArrayList([]const u8).init(a);
+    try extra.appendSlice(deps.c_flags);
+    if (swift.items.len > 0 and has_c) try extra.appendSlice(&.{ "-I", try std.fs.path.join(a, &.{ build_dir, "obj", t.name, "include" }) });
+    var out = std.ArrayList(Invocations.Source).init(a);
+    for (sources) |rel| {
+        const lang = Toolchain.langOf(rel) orelse continue;
+        if (lang == .swift) continue;
+        var argv = std.ArrayList([]const u8).init(a);
+        try argv.append(if (lang == .cxx or lang == .objcxx) tc.cxx orelse return diag.fail("missing tool: {s}", .{tc.cfg.cxx}) else tc.cc.?);
+        try argv.appendSlice(try tc.cflags(t, lang, module_cache));
+        try argv.appendSlice(extra.items);
+        try out.append(.{ .rel = rel, .path = try t.path(a, rel), .lang = lang, .argv = argv.items });
+    }
+    var swift_argv: ?[]const []const u8 = null;
+    if (swift.items.len > 0) {
+        var argv = std.ArrayList([]const u8).init(a);
+        try argv.append(tc.swiftc.?);
+        try argv.appendSlice(try tc.swiftflags(t, module_cache));
+        if (parseAsLibrary(t, swift.items)) try argv.append("-parse-as-library");
+        try argv.appendSlice(deps.swift_flags);
+        try argv.appendSlice(swift.items);
+        swift_argv = argv.items;
+    }
+    return .{ .c_family = out.items, .swift = swift_argv, .swift_files = swift.items };
+}
+
 fn signerKey(c: Ctx, f: *state.Fingerprint, ldid: ?[]const u8) !void {
     f.add(if (ldid != null) "signed" else "unsigned");
     if (ldid) |l| f.add(try c.tc.identity(l, false));
@@ -733,12 +794,12 @@ pub fn build(a: Allocator, tc: *Toolchain, t: Target, opts: Options) !Product {
     if (opts.products) |products| try products.put(t.name, p);
     if (p.ipa) |ipa| {
         _ = try verify.verifyFile(a, ipa, .{ .bundle_id = t.bundle_id, .allow_unsigned = !t.signs() });
-        if (t.post_build.len > 0) try postBuild(c, ipa);
+        if (t.post_build.len > 0 and opts.post_build) try postBuild(c, ipa);
     }
     return p;
 }
 
-/// Run the target's post_build command after its IPA is verified.
+/// Run the target's post_build commands, in order, after its IPA is verified.
 fn postBuild(c: Ctx, ipa: []const u8) !void {
     const a = c.a;
     var env = std.process.EnvMap.init(a);
@@ -749,13 +810,16 @@ fn postBuild(c: Ctx, ipa: []const u8) !void {
     try env.put("IDL_APP", try std.fmt.allocPrint(a, "{s}/Payload/{s}.app", .{ build_dir, c.t.name }));
     try env.put("IDL_BUILD_DIR", build_dir);
     try env.put("IDL_TARGET", c.t.name);
+    try env.put("IDL", try std.fs.selfExePathAlloc(a));
     if (c.t.profile) |prof| try env.put("IDL_CONFIGURATION", prof);
-    if (!c.opts.verbose) diag.info("  POST [{s}] {s}", .{ c.t.name, try std.mem.join(a, " ", c.t.post_build) }) else printCommand(c.t.post_build);
-    var child = std.process.Child.init(c.t.post_build, a);
-    child.cwd = c.t.dir;
-    child.env_map = &env;
-    child.spawn() catch |err| return diag.fail("cannot run post_build {s}: {s}", .{ c.t.post_build[0], @errorName(err) });
-    if (!succeeded(try child.wait())) return diag.fail("{s}: post_build failed", .{c.t.name});
+    for (c.t.post_build) |argv| {
+        if (!c.opts.verbose) diag.info("  POST [{s}] {s}", .{ c.t.name, try std.mem.join(a, " ", argv) }) else printCommand(argv);
+        var child = std.process.Child.init(argv, a);
+        child.cwd = c.t.dir;
+        child.env_map = &env;
+        child.spawn() catch |err| return diag.fail("cannot run post_build {s}: {s}", .{ argv[0], @errorName(err) });
+        if (!succeeded(try child.wait())) return diag.fail("{s}: post_build command failed: {s}", .{ c.t.name, try std.mem.join(a, " ", argv) });
+    }
 }
 
 pub fn clean(a: Allocator, t: Target) !void {

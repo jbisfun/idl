@@ -42,6 +42,15 @@ Debug/release artifacts are isolated. Direct builds cache resource compilation,
 bundling, signing and packaging; concurrent build/gen/clean operations are locked.
 See [workflows](docs/workflows.md#strict-preflight-and-build-profiles).
 
+## Code quality
+
+    idl fmt [--check]      # clang-format (C/ObjC/C++/ObjC++) + swift-format, configs generated from YAML
+    idl lint [--analyze]   # clang -Wall, swiftc -typecheck, clang-tidy, analyzer, all with the real build flags
+    idl test               # bundle checks (arm64/iOS/signed, @rpath resolution, plists) + `tests:` commands
+
+idl only orchestrates installed tools and merges their diagnostics into one
+report. See [configuration](docs/configuration.md#formatting-linting-and-tests-idl-fmt-idl-lint-idl-test).
+
 ## Layout
 
     idlproj.yml        configuration for the examples in this repository

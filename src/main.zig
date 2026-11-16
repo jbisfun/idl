@@ -13,6 +13,7 @@ const xcstrings = @import("xcstrings.zig");
 const verify = @import("verify.zig");
 const scaffold = @import("scaffold.zig");
 const jimpactor = @import("jimpactor.zig");
+const quality = @import("quality.zig");
 const ibtool = @import("ibtool.zig");
 const nib = @import("nib.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
@@ -22,7 +23,7 @@ const Allocator = std.mem.Allocator;
 // zig-yaml logs every token at debug level; keep output clean in Debug builds.
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-const Command = enum { build, gen, check, list, clean, install, devices, verify, init, xcodeproj, plist, xcstrings, ibtool, help };
+const Command = enum { build, gen, check, list, clean, install, devices, verify, init, xcodeproj, plist, xcstrings, ibtool, fmt, lint, @"test", help };
 
 const main_params = clap.parseParamsComptime(
     \\-h, --help           Show help (also: idl <command> --help).
@@ -49,6 +50,9 @@ const usage_text =
     \\  xcodeproj <target>     generate one Xcode project (optionally to --output)
     \\  install <device> [target...]
     \\                         build, then sign + install through the running Jimpactor
+    \\  fmt [target...]        format sources (clang-format, swift-format; --check to verify)
+    \\  lint [target...]       compiler warnings, clang-tidy, analyzer, swift-format lint
+    \\  test [target...]       build, check app bundles, then run each app's `tests:`
     \\
     \\Build/check/install: --strict rejects unsupported inputs.
     \\Project commands: -c debug|release selects isolated profile outputs.
@@ -128,6 +132,9 @@ fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: G
         .plist => try cmdPlist(a, iter),
         .xcstrings => try cmdXcstrings(a, iter),
         .ibtool => try cmdIbtool(a, iter),
+        .fmt => try cmdFmt(a, iter, g),
+        .lint => try cmdLint(a, iter, g),
+        .@"test" => try cmdTest(a, iter, g),
         .help => unreachable,
     }
 }
@@ -264,6 +271,7 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         \\-j, --jobs <usize>  Parallel compile jobs (default: toolchain.jobs or CPU count).
         \\-v, --verbose       Print every command that is run.
         \\    --gen           Also regenerate .xcodeproj / compile_commands.json.
+        \\    --no-post-build Skip app targets' post_build commands.
         \\<target>...
         \\
     );
@@ -277,7 +285,7 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     var products = builder.Products.init(a);
     for (targets, 0..) |t, i| {
         if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
-        const built = try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0, .products = &products });
+        const built = try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0, .products = &products, .post_build = res.args.@"no-post-build" == 0 });
         if (built.ipa) |ipa| try ipas.append(ipa);
     }
     diag.info("\nbuilt {d} IPA(s):", .{ipas.items.len});
@@ -300,7 +308,95 @@ fn cmdGen(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     for (targets) |t| {
         diag.info("==> {s}", .{t.name});
         try codegen.generate(a, &p.tc, t, .{});
+        try quality.genEditorConfigs(a, t);
     }
+}
+
+/// Build `selected` plus dependencies (no post_build) and return the products.
+fn buildForQuality(a: Allocator, p: *Project, selected: []const config.Target, jobs: ?usize, verbose: bool, strict: bool) !builder.Products {
+    const targets = try config.buildOrder(a, p.cfg.targets, selected);
+    var session = try builder.prepareAll(a, &p.tc, targets, strict, verbose);
+    defer session.release();
+    var products = builder.Products.init(a);
+    for (targets, 0..) |t, i| _ = try builder.build(a, &p.tc, t, .{ .jobs = jobs orelse p.cfg.toolchain.jobs, .verbose = verbose, .locked = true, .prepared = session.prepared[i], .strict = strict, .products = &products, .post_build = false });
+    return products;
+}
+
+fn cmdFmt(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help          Show this help.
+        \\    --check         Report files that need formatting; change nothing (exit 1 if any).
+        \\-j, --jobs <usize>  Parallel tool runs.
+        \\-v, --verbose       Print every command that is run.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "fmt", &params, parsers, iter);
+    var p = try loadProject(a, g);
+    const targets = try p.cfg.select(a, res.positionals[0]);
+    const locks = try builder.lockTargets(a, targets);
+    defer for (locks) |*lock| lock.release();
+    const ok = try quality.fmt(a, &p.tc, p.cfg.root, targets, .{ .check = res.args.check != 0, .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0 });
+    if (!ok) return diag.fail("{s}", .{if (res.args.check != 0) "some files need formatting (run `idl fmt`)" else "formatting failed"});
+}
+
+fn cmdLint(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help          Show this help.
+        \\-c, --configuration <str>  Build profile: debug or release.
+        \\    --werror        Fail on warnings too.
+        \\    --analyze       Also run the clang static analyzer.
+        \\    --no-tidy       Skip clang-tidy.
+        \\    --tidy          Require clang-tidy.
+        \\-q, --quiet         Print only the summary.
+        \\    --max <usize>   Print at most this many diagnostics.
+        \\-j, --jobs <usize>  Parallel tool runs.
+        \\-v, --verbose       Print every command that is run.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "lint", &params, parsers, iter);
+    var p = try loadProjectConfiguration(a, g, res.args.configuration);
+    const targets = try p.cfg.select(a, res.positionals[0]);
+    const verbose = g.verbose or res.args.verbose != 0;
+    // Dependencies' modules and generated Swift headers come from a build.
+    var products = try buildForQuality(a, &p, targets, res.args.jobs, verbose, false);
+    const locks = try builder.lockTargets(a, targets);
+    defer for (locks) |*lock| lock.release();
+    const ok = try quality.lint(a, &p.tc, p.cfg.root, targets, &products, .{
+        .jobs = res.args.jobs orelse p.cfg.toolchain.jobs,
+        .verbose = verbose,
+        .werror = res.args.werror != 0,
+        .analyze = res.args.analyze != 0,
+        .tidy = if (res.args.@"no-tidy" != 0) false else if (res.args.tidy != 0) true else null,
+        .quiet = res.args.quiet != 0,
+        .max = res.args.max,
+    });
+    if (!ok) return diag.fail("lint failed", .{});
+}
+
+fn cmdTest(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help          Show this help.
+        \\-c, --configuration <str>  Build profile: debug or release.
+        \\    --no-build      Test the existing build outputs.
+        \\    --strict        Reject unsupported inputs while building.
+        \\-j, --jobs <usize>  Parallel compile jobs.
+        \\-v, --verbose       Print every command that is run.
+        \\<target>...
+        \\
+    );
+    const res = try parseSub(a, "test", &params, parsers, iter);
+    var p = try loadProjectConfiguration(a, g, res.args.configuration);
+    const selected = try p.cfg.select(a, res.positionals[0]);
+    const verbose = g.verbose or res.args.verbose != 0;
+    if (res.args.@"no-build" == 0) _ = try buildForQuality(a, &p, selected, res.args.jobs, verbose, res.args.strict != 0);
+    var apps = std.ArrayList(config.Target).init(a);
+    for (selected) |t| if (t.type == .app) try apps.append(t);
+    if (apps.items.len == 0) return diag.fail("test: no app targets selected", .{});
+    const locks = try builder.lockTargets(a, apps.items);
+    defer for (locks) |*lock| lock.release();
+    if (!try quality.runTests(a, &p.tc, apps.items, .{ .verbose = verbose })) return diag.fail("tests failed", .{});
 }
 
 fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
@@ -516,4 +612,5 @@ test {
     _ = @import("xmldom.zig");
     _ = @import("nib.zig");
     _ = @import("ibtool.zig");
+    _ = @import("quality.zig");
 }

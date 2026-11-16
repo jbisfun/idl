@@ -145,7 +145,7 @@ fn walk(a: Allocator, root: []const u8, rel: []const u8, out: *std.ArrayList([]c
 /// Recursively expand `entries` (relative to `root`) into a sorted, de-duplicated
 /// list of relative file paths. Package directories are returned whole.
 /// `*` matches any run of characters within one path component.
-fn globMatch(pattern: []const u8, name: []const u8) bool {
+pub fn globMatch(pattern: []const u8, name: []const u8) bool {
     const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return std.mem.eql(u8, pattern, name);
     const head = pattern[0..star];
     if (!std.mem.startsWith(u8, name, head)) return false;
@@ -173,6 +173,25 @@ fn expandGlob(a: Allocator, root: []const u8, entry: []const u8, comptime label:
     if (out.items.len == 0) return diag.fail(label ++ " pattern matched nothing: {s}", .{entry});
     std.mem.sort([]const u8, out.items, {}, lessThan);
     return out.items;
+}
+
+/// True if `rel` is `pattern` or lies below it, matching `*` per path component.
+pub fn pathMatches(pattern: []const u8, rel: []const u8) bool {
+    var pi = std.mem.tokenizeScalar(u8, pattern, '/');
+    var ri = std.mem.tokenizeScalar(u8, rel, '/');
+    while (pi.next()) |p| {
+        if (std.mem.eql(u8, p, ".")) continue;
+        const r = ri.next() orelse return false;
+        if (!globMatch(p, r)) return false;
+    }
+    return true;
+}
+
+test "path pattern matching" {
+    try std.testing.expect(pathMatches("ZSign", "ZSign/common/util.h"));
+    try std.testing.expect(pathMatches("Vendor/*/src", "Vendor/a/src/x.c"));
+    try std.testing.expect(!pathMatches("ZSign", "ZSignX/a.c"));
+    try std.testing.expect(!pathMatches("a/b", "a"));
 }
 
 test "glob matching" {

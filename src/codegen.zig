@@ -224,7 +224,7 @@ pub fn compileCommands(a: Allocator, tc: *const Toolchain, t: Target, sources: [
             try swift_files.append(file);
             continue;
         }
-        const obj = try std.fmt.allocPrint(a, "{s}/obj/{s}.o", .{ build_dir, rel });
+        const obj = try std.fmt.allocPrint(a, "{s}/obj/{s}/{s}.o", .{ build_dir, t.name, rel });
         var argv = std.ArrayList([]const u8).init(a);
         try argv.append(if (lang == .cxx or lang == .objcxx) tc.cxx orelse tc.cfg.cxx else tc.cc orelse tc.cfg.cc);
         try argv.appendSlice(try tc.cflags(t, lang, module_cache));
