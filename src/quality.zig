@@ -505,6 +505,31 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
     if (skipped_swift > 0) diag.warn("swift-format not found ({s}); {d} Swift file(s) not checked", .{ tc.cfg.swift_format, skipped_swift });
     diag.info("==> {s} {d} file(s) with {d} tool run(s)", .{ if (opts.check) "checking" else "formatting", seen.count(), tasks.items.len });
     try runAll(a, tc, tasks.items, opts.jobs, opts.verbose);
+    // clang-format is not always idempotent in one pass (alignment that depends
+    // on its own earlier changes); repeat until the files stop changing.
+    if (!opts.check) {
+        var previous = std.StringArrayHashMap([]const u8).init(a);
+        for (originals.keys()) |path| try previous.put(path, std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch "");
+        var pass: usize = 1;
+        while (pass < 4) : (pass += 1) {
+            for (tasks.items) |*t| {
+                t.stdout = "";
+                t.stderr = "";
+                t.ok = false;
+                t.spawn_error = null;
+            }
+            try runAll(a, tc, tasks.items, opts.jobs, false);
+            var moved = false;
+            for (previous.keys(), previous.values()) |path, *content| {
+                const now = std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch continue;
+                if (!std.mem.eql(u8, now, content.*)) {
+                    moved = true;
+                    content.* = now;
+                }
+            }
+            if (!moved) break;
+        }
+    }
 
     var diags = std.ArrayList(Diagnostic).init(a);
     for (tasks.items) |task| {
