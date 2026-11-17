@@ -21,10 +21,12 @@ The build steps come from the Linux build used by LiveContainer.
     zig build actool              # optional: .xcassets compiler (needs swift)
     ./zig-out/bin/idl build --strict -c release  # preflight, then build every example
 
-Install on a phone through the running Jimpactor tray app:
+Install on a phone through [Jimpactor](https://github.com/jpdagostin0/jimpactor),
+a sideloading tray app that signs the IPA with your Apple account (other
+options in [workflows](docs/workflows.md#install-on-a-device-through-jimpactor)):
 
     idl devices list
-    idl install "JPs iPhone" MyApp
+    idl install "My iPhone" MyApp
 
 Start a new app:
 

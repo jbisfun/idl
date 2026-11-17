@@ -30,7 +30,7 @@ cleaned. xtool still manages its own incremental build and packaging.
     idl check --strict -c release MyApp  # tools + inputs + resources, no app compile
     idl build --strict -c debug MyApp
     idl build --strict -c release --gen
-    idl install "JPs iPhone" -c debug MyApp
+    idl install "My iPhone" -c debug MyApp
     idl gen -c debug MyApp
 
 Before compiling any application source, idl checks tools for *all selected
@@ -154,11 +154,12 @@ supported.
 ## Install on a device (through Jimpactor)
 
 `idl`'s ad-hoc `ldid` signature is not a provisioning profile. With the
-Jimpactor tray app running, `idl` can hand IPAs to it, and Jimpactor signs
-them with your account and installs them:
+[Jimpactor](https://github.com/jpdagostin0/jimpactor) tray app running, `idl`
+can hand IPAs to it, and Jimpactor signs them with your account and installs
+them:
 
     idl devices list                   # devices Jimpactor can reach
-    idl install "JPs iPhone"           # build every target, then install each IPA
+    idl install "My iPhone"            # build every target, then install each IPA
     idl install 00008130 MyApp         # device by UDID prefix, one target
     idl install 00008130-... --no-build MyApp   # install the last build
     idl install 00008130-... --ipa ~/Downloads/Other.ipa
