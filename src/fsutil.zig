@@ -1,10 +1,10 @@
 //! Filesystem helpers shared by codegen and builds: source discovery with the
 //! same rules Xcode uses, symlink rejection, and lexical path utilities.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
 
 pub const source_extensions = [_][]const u8{ ".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".swift", ".s", ".S", ".metal" };
 /// Directories that Xcode treats as a single opaque file.
@@ -17,7 +17,7 @@ pub fn oneOf(value: []const u8, comptime set: []const []const u8) bool {
 
 /// Python-`pathlib`-compatible suffix: "" for ".hidden" or "name.".
 pub fn suffix(path: []const u8) []const u8 {
-    const name = std.fs.path.basenamePosix(path);
+    const name = std.Io.Dir.path.basenamePosix(path);
     const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
     if (dot == 0 or dot == name.len - 1) return "";
     return name[dot..];
@@ -25,18 +25,18 @@ pub fn suffix(path: []const u8) []const u8 {
 
 /// Collapse "", "." segments; leave ".." to validation. Returns "" for the root.
 pub fn normalizeRelative(a: Allocator, path: []const u8) ![]const u8 {
-    var parts = std.ArrayList([]const u8).init(a);
+    var parts: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeScalar(u8, path, '/');
     while (it.next()) |part| {
         if (std.mem.eql(u8, part, ".")) continue;
-        try parts.append(part);
+        try parts.append(a, part);
     }
     return std.mem.join(a, "/", parts.items);
 }
 
 pub fn join(a: Allocator, base: []const u8, rel: []const u8) ![]const u8 {
     if (rel.len == 0) return base;
-    return std.fs.path.join(a, &.{ base, rel });
+    return std.Io.Dir.path.join(a, &.{ base, rel });
 }
 
 pub fn hasControlCharacters(s: []const u8) bool {
@@ -47,7 +47,7 @@ pub fn hasControlCharacters(s: []const u8) bool {
 pub fn validateRelativePath(value: []const u8, label: []const u8) !void {
     if (value.len == 0) return diag.fail("{s} must be a non-empty relative path", .{label});
     if (hasControlCharacters(value)) return diag.fail("{s} contains control characters", .{label});
-    if (std.fs.path.isAbsolute(value)) return diag.fail("{s} must stay within the target directory: {s}", .{ label, value });
+    if (std.Io.Dir.path.isAbsolute(value)) return diag.fail("{s} must stay within the target directory: {s}", .{ label, value });
     var it = std.mem.tokenizeScalar(u8, value, '/');
     while (it.next()) |part| if (std.mem.eql(u8, part, ".."))
         return diag.fail("{s} must stay within the target directory: {s}", .{ label, value });
@@ -56,39 +56,38 @@ pub fn validateRelativePath(value: []const u8, label: []const u8) !void {
 pub const Kind = enum { missing, file, dir, symlink, other };
 
 /// lstat-style classification (never follows the final symlink).
-pub fn kindAt(dir: std.fs.Dir, path: []const u8) Kind {
-    const st = posix.fstatat(dir.fd, path, posix.AT.SYMLINK_NOFOLLOW) catch return .missing;
-    const fmt = st.mode & posix.S.IFMT;
-    return switch (fmt) {
-        posix.S.IFREG => .file,
-        posix.S.IFDIR => .dir,
-        posix.S.IFLNK => .symlink,
+pub fn kindAt(dir: std.Io.Dir, path: []const u8) Kind {
+    const st = dir.statFile(sys.io, path, .{ .follow_symlinks = false }) catch return .missing;
+    return switch (st.kind) {
+        .file => .file,
+        .directory => .dir,
+        .sym_link => .symlink,
         else => .other,
     };
 }
 
 pub fn kind(path: []const u8) Kind {
-    return kindAt(std.fs.cwd(), path);
+    return kindAt(sys.cwd(), path);
 }
 
 /// Like `kind`, but follows symlinks (for toolchain paths, which may be links).
 pub fn kindFollow(path: []const u8) Kind {
-    const st = posix.fstatat(std.fs.cwd().fd, path, 0) catch return .missing;
-    return switch (st.mode & posix.S.IFMT) {
-        posix.S.IFREG => .file,
-        posix.S.IFDIR => .dir,
+    const st = sys.cwd().statFile(sys.io, path, .{}) catch return .missing;
+    return switch (st.kind) {
+        .file => .file,
+        .directory => .dir,
         else => .other,
     };
 }
 
 /// Fail if any component of `rel` below `root` is a symlink.
 pub fn rejectSymlinkComponents(a: Allocator, root: []const u8, rel: []const u8) !void {
-    var prefix = std.ArrayList(u8).init(a);
+    var prefix: std.ArrayList(u8) = .empty;
     var it = std.mem.tokenizeScalar(u8, rel, '/');
     while (it.next()) |part| {
         if (std.mem.eql(u8, part, ".")) continue;
-        if (prefix.items.len > 0) try prefix.append('/');
-        try prefix.appendSlice(part);
+        if (prefix.items.len > 0) try prefix.append(a, '/');
+        try prefix.appendSlice(a, part);
         if (kind(try join(a, root, prefix.items)) == .symlink)
             return diag.fail("symlinks are not allowed: {s}", .{prefix.items});
     }
@@ -102,10 +101,10 @@ pub fn rejectSymlinksBelow(a: Allocator, root: []const u8, rel: []const u8, comp
         .dir => {},
         else => return,
     }
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = true });
-    defer dir.close();
+    var dir = try sys.cwd().openDir(sys.io, path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(sys.io);
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(sys.io)) |entry| {
         const child = if (rel.len == 0) try a.dupe(u8, entry.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ rel, entry.name });
         if (entry.kind == .sym_link) return diag.fail(label ++ ": {s}", .{child});
         if (entry.kind == .directory) try rejectSymlinksBelow(a, root, child, label);
@@ -124,17 +123,17 @@ fn walk(a: Allocator, root: []const u8, rel: []const u8, out: *std.ArrayList([]c
     if (std.mem.eql(u8, sfx, ".xcodeproj")) return;
     if (oneOf(sfx, &package_extensions)) {
         try rejectSymlinksBelow(a, root, rel, "symlinks are not allowed");
-        return out.append(rel);
+        return out.append(a, rel);
     }
-    if (k == .file) return out.append(rel);
+    if (k == .file) return out.append(a, rel);
     if (k != .dir) return;
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = true });
-    defer dir.close();
-    var names = std.ArrayList([]const u8).init(a);
+    var dir = try sys.cwd().openDir(sys.io, path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(sys.io);
+    var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(sys.io)) |entry| {
         if (entry.name[0] == '.') continue;
-        try names.append(try a.dupe(u8, entry.name));
+        try names.append(a, try a.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
     for (names.items) |name| {
@@ -157,18 +156,18 @@ pub fn globMatch(pattern: []const u8, name: []const u8) bool {
 
 /// Expand a pattern whose last component contains `*` (e.g. `Resources/*.lproj`).
 fn expandGlob(a: Allocator, root: []const u8, entry: []const u8, comptime label: []const u8) ![]const []const u8 {
-    const parent = std.fs.path.dirnamePosix(entry) orelse "";
-    const pattern = std.fs.path.basenamePosix(entry);
+    const parent = std.Io.Dir.path.dirnamePosix(entry) orelse "";
+    const pattern = std.Io.Dir.path.basenamePosix(entry);
     if (std.mem.indexOfScalar(u8, parent, '*') != null) return diag.fail(label ++ " pattern {s}: only the last path component may contain '*'", .{entry});
     if (parent.len > 0) try rejectSymlinkComponents(a, root, parent);
-    var dir = std.fs.cwd().openDir(try join(a, root, parent), .{ .iterate = true, .no_follow = true }) catch
+    var dir = sys.cwd().openDir(sys.io, try join(a, root, parent), .{ .iterate = true, .follow_symlinks = false }) catch
         return diag.fail(label ++ " path does not exist: {s}", .{parent});
-    defer dir.close();
-    var out = std.ArrayList([]const u8).init(a);
+    defer dir.close(sys.io);
+    var out: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
-    while (try it.next()) |e| {
+    while (try it.next(sys.io)) |e| {
         if (e.name[0] == '.' or !globMatch(pattern, e.name)) continue;
-        try out.append(if (parent.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, e.name }));
+        try out.append(a, if (parent.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, e.name }));
     }
     if (out.items.len == 0) return diag.fail(label ++ " pattern matched nothing: {s}", .{entry});
     std.mem.sort([]const u8, out.items, {}, lessThan);
@@ -201,7 +200,7 @@ test "glob matching" {
 }
 
 pub fn discover(a: Allocator, root: []const u8, entries: []const []const u8, comptime label: []const u8) ![]const []const u8 {
-    var found = std.ArrayList([]const u8).init(a);
+    var found: std.ArrayList([]const u8) = .empty;
     for (entries) |entry| {
         try validateRelativePath(entry, label ++ " path");
         if (std.mem.indexOfScalar(u8, entry, '*') != null) {
@@ -215,10 +214,10 @@ pub fn discover(a: Allocator, root: []const u8, entries: []const []const u8, com
         try walk(a, root, rel, &found);
     }
     std.mem.sort([]const u8, found.items, {}, lessThan);
-    var unique = std.ArrayList([]const u8).init(a);
+    var unique: std.ArrayList([]const u8) = .empty;
     for (found.items) |item| {
         if (unique.items.len > 0 and std.mem.eql(u8, unique.items[unique.items.len - 1], item)) continue;
-        try unique.append(item);
+        try unique.append(a, item);
     }
     return unique.items;
 }
@@ -226,21 +225,21 @@ pub fn discover(a: Allocator, root: []const u8, entries: []const []const u8, com
 /// Like Python's `Path.resolve(strict=False)`: realpath the longest existing
 /// prefix, then append the remaining components lexically.
 pub fn resolveLenient(a: Allocator, path: []const u8) ![]const u8 {
-    const abs = try std.fs.path.resolve(a, &.{path});
+    const abs = try sys.resolve(a, &.{path});
     var existing: []const u8 = abs;
     var rest: []const u8 = "";
     while (true) {
-        if (std.fs.cwd().realpathAlloc(a, existing)) |real| {
-            return if (rest.len == 0) real else std.fs.path.join(a, &.{ real, rest });
+        if (sys.realpath(a, existing)) |real| {
+            return if (rest.len == 0) real else std.Io.Dir.path.join(a, &.{ real, rest });
         } else |_| {}
-        const parent = std.fs.path.dirname(existing) orelse return abs;
-        const base = std.fs.path.basename(existing);
-        rest = if (rest.len == 0) base else try std.fs.path.join(a, &.{ base, rest });
+        const parent = std.Io.Dir.path.dirname(existing) orelse return abs;
+        const base = std.Io.Dir.path.basename(existing);
+        rest = if (rest.len == 0) base else try std.Io.Dir.path.join(a, &.{ base, rest });
         existing = parent;
     }
 }
 
-pub fn expandHome(a: Allocator, path: []const u8, env: *const std.process.EnvMap) ![]const u8 {
+pub fn expandHome(a: Allocator, path: []const u8, env: *const std.process.Environ.Map) ![]const u8 {
     if (std.mem.eql(u8, path, "~") or std.mem.startsWith(u8, path, "~/")) {
         const home = env.get("HOME") orelse return diag.fail("HOME is not set; cannot expand {s}", .{path});
         return std.fmt.allocPrint(a, "{s}{s}", .{ home, path[1..] });
@@ -251,13 +250,13 @@ pub fn expandHome(a: Allocator, path: []const u8, env: *const std.process.EnvMap
 /// Look up an executable by name on `path_env` (names containing '/' are checked directly).
 pub fn which(a: Allocator, name: []const u8, path_env: []const u8) !?[]const u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        posix.access(name, posix.X_OK) catch return null;
+        sys.cwd().access(sys.io, name, .{ .execute = true }) catch return null;
         return name;
     }
     var it = std.mem.tokenizeScalar(u8, path_env, ':');
     while (it.next()) |dir| {
-        const candidate = try std.fs.path.join(a, &.{ dir, name });
-        posix.access(candidate, posix.X_OK) catch continue;
+        const candidate = try std.Io.Dir.path.join(a, &.{ dir, name });
+        sys.cwd().access(sys.io, candidate, .{ .execute = true }) catch continue;
         if (kind(candidate) == .dir) continue;
         return candidate;
     }
@@ -266,11 +265,11 @@ pub fn which(a: Allocator, name: []const u8, path_env: []const u8) !?[]const u8 
 
 /// Write `data` to `path` only when it differs; returns true if written.
 pub fn writeIfChanged(a: Allocator, path: []const u8, data: []const u8) !bool {
-    if (std.fs.cwd().readFileAlloc(a, path, 64 << 20)) |old| {
+    if (sys.readFile(a, path, 64 << 20)) |old| {
         if (std.mem.eql(u8, old, data)) return false;
     } else |_| {}
-    if (std.fs.path.dirname(path)) |parent| try std.fs.cwd().makePath(parent);
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+    if (std.Io.Dir.path.dirname(path)) |parent| try sys.makePath(parent);
+    try sys.cwd().writeFile(sys.io, .{ .sub_path = path, .data = data });
     return true;
 }
 

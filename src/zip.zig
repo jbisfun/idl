@@ -2,6 +2,7 @@
 //! std.compress.flate, Unix modes preserved) and a reader that validates CRCs.
 //! ZIP64 is not supported (archives and entries must stay below 4 GiB).
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 
 const Allocator = std.mem.Allocator;
@@ -22,11 +23,27 @@ pub const Writer = struct {
     count: u16 = 0,
 
     pub fn init(a: Allocator) Writer {
-        return .{ .a = a, .out = std.ArrayList(u8).init(a), .central = std.ArrayList(u8).init(a) };
+        return .{ .a = a, .out = .empty, .central = .empty };
     }
 
+    /// Little-endian appender over an unmanaged byte list.
+    const Le = struct {
+        a: Allocator,
+        list: *std.ArrayList(u8),
+
+        fn writeInt(x: Le, comptime T: type, v: T, comptime _: std.builtin.Endian) !void {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &bytes, v, .little);
+            try x.list.appendSlice(x.a, &bytes);
+        }
+
+        fn writeAll(x: Le, bytes: []const u8) !void {
+            try x.list.appendSlice(x.a, bytes);
+        }
+    };
+
     fn header(w: *Writer, list: *std.ArrayList(u8), central: bool, name: []const u8, method: u16, crc: u32, csize: u32, usize_: u32, mode: u32, offset: u32) !void {
-        const x = list.writer();
+        const x: Le = .{ .a = w.a, .list = list };
         try x.writeInt(u32, if (central) central_sig else local_sig, .little);
         if (central) try x.writeInt(u16, (3 << 8) | 30, .little); // made by: Unix, spec 3.0
         try x.writeInt(u16, 20, .little); // version needed
@@ -48,27 +65,30 @@ pub const Writer = struct {
             try x.writeInt(u32, offset, .little);
         }
         try x.writeAll(name);
-        _ = w;
     }
 
     fn add(w: *Writer, name: []const u8, data: []const u8, mode: u32) !void {
         if (w.count == std.math.maxInt(u16) or data.len > std.math.maxInt(u32) or w.out.items.len > std.math.maxInt(u32))
             return diag.fail("archive too large (ZIP64 is not supported)", .{});
         const crc = std.hash.Crc32.hash(data);
-        var compressed = std.ArrayList(u8).init(w.a);
         var method: u16 = 0;
         var payload = data;
         if (data.len > 0) {
-            var in = std.io.fixedBufferStream(data);
-            try flate.compress(in.reader(), compressed.writer(), .{});
-            if (compressed.items.len < data.len) {
+            // Raw deflate (no zlib/gzip container), zlib's default level.
+            var compressed: std.Io.Writer.Allocating = try .initCapacity(w.a, data.len / 2 + 64);
+            const window = try w.a.alloc(u8, flate.max_window_len);
+            defer w.a.free(window);
+            var c = try flate.Compress.init(&compressed.writer, window, .raw, .default);
+            try c.writer.writeAll(data);
+            try c.finish();
+            if (compressed.written().len < data.len) {
                 method = 8;
-                payload = compressed.items;
+                payload = compressed.written();
             }
         }
         const offset: u32 = @intCast(w.out.items.len);
         try w.header(&w.out, false, name, method, crc, @intCast(payload.len), @intCast(data.len), mode, 0);
-        try w.out.appendSlice(payload);
+        try w.out.appendSlice(w.a, payload);
         try w.header(&w.central, true, name, method, crc, @intCast(payload.len), @intCast(data.len), mode, offset);
         w.count += 1;
     }
@@ -83,11 +103,11 @@ pub const Writer = struct {
     }
 
     /// Recursively add `fs_dir` under archive prefix `prefix` in sorted order.
-    pub fn addTree(w: *Writer, fs_dir: std.fs.Dir, prefix: []const u8) !void {
+    pub fn addTree(w: *Writer, fs_dir: std.Io.Dir, prefix: []const u8) !void {
         try w.addDir(prefix);
-        var names = std.ArrayList([]const u8).init(w.a);
+        var names: std.ArrayList([]const u8) = .empty;
         var it = fs_dir.iterate();
-        while (try it.next()) |e| try names.append(try w.a.dupe(u8, e.name));
+        while (try it.next(sys.io)) |e| try names.append(w.a, try w.a.dupe(u8, e.name));
         std.mem.sort([]const u8, names.items, {}, struct {
             fn lt(_: void, l: []const u8, r: []const u8) bool {
                 return std.mem.lessThan(u8, l, r);
@@ -95,14 +115,14 @@ pub const Writer = struct {
         }.lt);
         for (names.items) |name| {
             const path = try std.fmt.allocPrint(w.a, "{s}/{s}", .{ prefix, name });
-            const st = try std.posix.fstatat(fs_dir.fd, name, std.posix.AT.SYMLINK_NOFOLLOW);
-            switch (st.mode & std.posix.S.IFMT) {
-                std.posix.S.IFDIR => {
-                    var sub = try fs_dir.openDir(name, .{ .iterate = true, .no_follow = true });
-                    defer sub.close();
+            const st = try fs_dir.statFile(sys.io, name, .{ .follow_symlinks = false });
+            switch (st.kind) {
+                .directory => {
+                    var sub = try fs_dir.openDir(sys.io, name, .{ .iterate = true, .follow_symlinks = false });
+                    defer sub.close(sys.io);
                     try w.addTree(sub, path);
                 },
-                std.posix.S.IFREG => try w.addFile(path, try fs_dir.readFileAlloc(w.a, name, std.math.maxInt(u32)), st.mode),
+                .file => try w.addFile(path, try fs_dir.readFileAlloc(sys.io, name, w.a, .limited(std.math.maxInt(u32))), st.permissions.toMode()),
                 else => return diag.fail("cannot archive non-regular file (symlink?): {s}", .{path}),
             }
         }
@@ -110,8 +130,8 @@ pub const Writer = struct {
 
     pub fn finish(w: *Writer) ![]const u8 {
         const cd_offset: u32 = @intCast(w.out.items.len);
-        try w.out.appendSlice(w.central.items);
-        const x = w.out.writer();
+        try w.out.appendSlice(w.a, w.central.items);
+        const x: Le = .{ .a = w.a, .list = &w.out };
         try x.writeInt(u32, eocd_sig, .little);
         try x.writeInt(u16, 0, .little);
         try x.writeInt(u16, 0, .little);
@@ -157,10 +177,11 @@ pub const Archive = struct {
         const data = switch (e.method) {
             0 => try a.dupe(u8, raw),
             8 => blk: {
-                var out = std.ArrayList(u8).init(a);
-                var in = std.io.fixedBufferStream(raw);
-                flate.decompress(in.reader(), out.writer()) catch return diag.fail("ZIP: corrupt deflate stream in {s}", .{e.name});
-                break :blk out.items;
+                var in: std.Io.Reader = .fixed(raw);
+                var d = flate.Decompress.init(&in, .raw, &.{});
+                var out: std.Io.Writer.Allocating = .init(a);
+                _ = d.reader.streamRemaining(&out.writer) catch return diag.fail("ZIP: corrupt deflate stream in {s}", .{e.name});
+                break :blk out.written();
             },
             else => return diag.fail("ZIP: unsupported compression method {d} for {s}", .{ e.method, e.name }),
         };
@@ -213,7 +234,8 @@ test "write and read back" {
     const a = arena.allocator();
     var w = Writer.init(a);
     try w.addDir("Payload");
-    const big = "hello " ** 200;
+    const big = try a.alloc(u8, 6 * 200);
+    for (0..200) |i| @memcpy(big[i * 6 ..][0..6], "hello ");
     try w.addFile("Payload/a.txt", big, 0o644);
     try w.addFile("Payload/exe", "\xcf\xfa\xed\xfe", 0o755);
     const bytes = try w.finish();

@@ -3,6 +3,7 @@
 //! A Zig port of davidquesada/ibtool (xibparser.py). It understands a subset
 //! of UIKit; unknown elements are skipped. See docs/limitations.md.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const nib = @import("nib.zig");
 const plist = @import("plist.zig");
@@ -11,7 +12,7 @@ const xmldom = @import("xmldom.zig");
 const Allocator = std.mem.Allocator;
 const Element = xmldom.Element;
 const Obj = nib.Obj;
-const ObjMap = std.StringArrayHashMapUnmanaged(*Obj);
+const ObjMap = std.array_hash_map.String(*Obj);
 
 /// Per-document state shared by every scene.
 const Doc = struct {
@@ -41,23 +42,23 @@ const ViewRef = struct { id: []const u8, obj: *Obj, key: []const u8 };
 const Ctx = struct {
     doc: *Doc,
     a: Allocator,
-    connections: std.ArrayListUnmanaged(*Obj) = .empty,
+    connections: std.ArrayList(*Obj) = .empty,
     /// Scene-level objects. For storyboards this excludes the main view and its descendants.
     objects: ObjMap = .empty,
     view_objects: ObjMap = .empty,
-    extra: std.ArrayListUnmanaged(*Obj) = .empty,
+    extra: std.ArrayList(*Obj) = .empty,
     is_storyboard: bool = false,
     view_controller: ?*Obj = null,
     parsing_view: bool = false,
     view_connections: []const *Obj = &.{},
     scene_connections: []const *Obj = &.{},
-    segue_connections: std.ArrayListUnmanaged(*Obj) = .empty,
+    segue_connections: std.ArrayList(*Obj) = .empty,
     is_prototype_list: bool = false,
     parent: ?*Ctx = null,
     /// placeholder identifier -> IB object id
-    upstream: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
-    view_refs: std.ArrayListUnmanaged(ViewRef) = .empty,
-    layout_guides: std.ArrayListUnmanaged(*Obj) = .empty,
+    upstream: std.array_hash_map.String([]const u8) = .empty,
+    view_refs: std.ArrayList(ViewRef) = .empty,
+    layout_guides: std.ArrayList(*Obj) = .empty,
 
     fn init(doc: *Doc) Ctx {
         return .{ .doc = doc, .a = doc.a };
@@ -125,14 +126,14 @@ const Ctx = struct {
 
     fn resolveStoryboard(c: *Ctx) !void {
         const a = c.a;
-        var view_cons: std.ArrayListUnmanaged(*Obj) = .empty;
-        var scene_cons: std.ArrayListUnmanaged(*Obj) = .empty;
+        var view_cons: std.ArrayList(*Obj) = .empty;
+        var scene_cons: std.ArrayList(*Obj) = .empty;
         // Objects reached across the scene/view nib boundary, by placeholder id.
-        var extern_objects: std.StringArrayHashMapUnmanaged(*Obj) = .empty;
+        var extern_objects: std.array_hash_map.String(*Obj) = .empty;
         var proxies: std.AutoHashMapUnmanaged(*Obj, *Obj) = .empty;
 
         const proxyFor = struct {
-            fn f(cx: *Ctx, ext: *std.StringArrayHashMapUnmanaged(*Obj), px: *std.AutoHashMapUnmanaged(*Obj, *Obj), o: *Obj) !*Obj {
+            fn f(cx: *Ctx, ext: *std.array_hash_map.String(*Obj), px: *std.AutoHashMapUnmanaged(*Obj, *Obj), o: *Obj) !*Obj {
                 if (px.get(o)) |p| return p;
                 const phid = try cx.doc.placeholderId();
                 try ext.put(cx.a, phid, o);
@@ -305,7 +306,7 @@ fn parseObject(c: *Ctx, e: *const Element, parent: ?*Obj) anyerror!?*Obj {
 }
 
 fn parseChildren(c: *Ctx, e: *const Element, parent: ?*Obj) anyerror![]const *Obj {
-    var out: std.ArrayListUnmanaged(*Obj) = .empty;
+    var out: std.ArrayList(*Obj) = .empty;
     for (e.children) |child| if (try parseObject(c, child, parent)) |o| try out.append(c.a, o);
     return out.items;
 }
@@ -957,7 +958,7 @@ fn parseFontDescription(c: *Ctx, e: *const Element, parent: *Obj) anyerror!void 
 /// Parse top-level elements into a nib root object.
 fn parseObjects(c: *Ctx, elements: []const *const Element, resolve: bool) anyerror!*Obj {
     const a = c.a;
-    var toplevel: std.ArrayListUnmanaged(*Obj) = .empty;
+    var toplevel: std.ArrayList(*Obj) = .empty;
     for (elements) |el| if (try parseObject(c, el, null)) |o| try toplevel.append(a, o);
     if (resolve) try c.resolveConnections();
     const root = try nib.new(a, "NSObject");
@@ -970,10 +971,10 @@ fn parseObjects(c: *Ctx, elements: []const *const Element, resolve: bool) anyerr
 }
 
 fn loadDoc(a: Allocator, path: []const u8) !struct { *Doc, *const Element } {
-    const data = std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch |err|
+    const data = sys.readFile(a, path, 64 << 20) catch |err|
         return diag.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
     const doc = try a.create(Doc);
-    doc.* = .{ .a = a, .name = std.fs.path.basename(path) };
+    doc.* = .{ .a = a, .name = std.Io.Dir.path.basename(path) };
     const root = try xmldom.parse(a, data, doc.name);
     if (!std.mem.eql(u8, root.tag, "document")) return diag.fail("{s}: not an Interface Builder document", .{doc.name});
     if (root.get("targetRuntime")) |rt| if (std.mem.indexOf(u8, rt, "CocoaTouch") == null and !std.mem.eql(u8, rt, "iOS.CocoaTouch"))
@@ -1003,15 +1004,15 @@ const Scene = struct { vc: *Obj, root: *Obj, nib_name: []const u8 };
 pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !Result {
     const doc, const root = try loadDoc(a, path);
     const scenes_el = root.find("scenes") orelse return diag.fail("{s}: no <scenes>", .{doc.name});
-    try std.fs.cwd().deleteTree(out_dir);
-    try std.fs.cwd().makePath(out_dir);
-    var out = try std.fs.cwd().openDir(out_dir, .{});
-    defer out.close();
+    try sys.deleteTree(out_dir);
+    try sys.makePath(out_dir);
+    var out = try sys.cwd().openDir(sys.io, out_dir, .{});
+    defer out.close(sys.io);
 
-    var id_to_nib = std.StringArrayHashMapUnmanaged([]const u8).empty;
-    var id_to_vc = std.StringArrayHashMapUnmanaged(*Obj).empty;
-    var identifiers = std.StringArrayHashMapUnmanaged(void).empty;
-    var scenes: std.ArrayListUnmanaged(Scene) = .empty;
+    var id_to_nib = std.array_hash_map.String([]const u8).empty;
+    var id_to_vc = std.array_hash_map.String(*Obj).empty;
+    var identifiers = std.array_hash_map.String(void).empty;
+    var scenes: std.ArrayList(Scene) = .empty;
 
     const owner = try nib.proxy(a, "IBFilesOwner");
     const sb_placeholder = try nib.proxy(a, "UIStoryboardPlaceholder");
@@ -1021,7 +1022,7 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
         const objects = scene.child("objects") orelse continue;
         var c = Ctx.init(doc);
         c.is_storyboard = true;
-        var toplevel: std.ArrayListUnmanaged(*Obj) = .empty;
+        var toplevel: std.ArrayList(*Obj) = .empty;
         for (objects.children) |el| if (try parseObject(&c, el, null)) |o| try toplevel.append(a, o);
         const vc = c.view_controller orelse {
             doc.warn(scene, "scene {s} has no view controller; skipped", .{scene.get("sceneID") orelse "?"});
@@ -1054,7 +1055,7 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
             const cons = try nib.listOf(a, &.{view_con});
             for (c.view_connections) |vc_| try cons.items.append(a, .{ .obj = vc_ });
             try vroot.set(a, "UINibConnectionsKey", .{ .list = cons });
-            try out.writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}.nib", .{view_nib}), .data = try nib.encode(a, vroot) });
+            try out.writeFile(sys.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.nib", .{view_nib}), .data = try nib.encode(a, vroot) });
             try vc.setStr(a, "UINibName", view_nib);
         }
 
@@ -1068,7 +1069,7 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
         try sb_con.setStr(a, "UILabel", "storyboard");
         try sb_con.set(a, "UISource", .{ .obj = vc });
         try sb_con.set(a, "UIDestination", .{ .obj = sb_placeholder });
-        var scene_cons: std.ArrayListUnmanaged(*Obj) = .empty;
+        var scene_cons: std.ArrayList(*Obj) = .empty;
         try scene_cons.append(a, sb_con);
         try scene_cons.appendSlice(a, vc.ib.scene_connections);
         vc.ib.scene_connections = scene_cons.items;
@@ -1095,7 +1096,7 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
             const name = id_to_nib.get(dest) orelse return diag.fail("{s}: segue destination {s} is not a view controller in this storyboard", .{ doc.name, dest });
             try t.obj.setStr(a, "UIDestinationViewControllerIdentifier", name);
         };
-        var restore: ?struct { *Obj, std.ArrayListUnmanaged(nib.Prop) } = null;
+        var restore: ?struct { *Obj, std.ArrayList(nib.Prop) } = null;
         if (s.vc.ib.relationship_segue) |seg| {
             const rel = seg.get("relationship") orelse "";
             if (std.mem.eql(u8, rel, "rootViewController")) {
@@ -1109,20 +1110,20 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
                 try child.set(a, "UIParentViewController", .{ .obj = s.vc });
             } else doc.warn(seg, "relationship '{s}' is not supported", .{rel});
         }
-        try out.writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}.nib", .{s.nib_name}), .data = try nib.encode(a, s.root) });
+        try out.writeFile(sys.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.nib", .{s.nib_name}), .data = try nib.encode(a, s.root) });
         if (restore) |r| r[0].props = r[1];
     }
 
     const info = plist.Plist.newDict();
     defer info.deinit();
     const map = plist.c.plist_new_dict();
-    for (identifiers.keys()) |k| _ = plist.c.plist_dict_set_item(map, try a.dupeZ(u8, k), try plist.newString(a, k));
+    for (identifiers.keys()) |k| _ = plist.c.plist_dict_set_item(map, try a.dupeSentinel(u8, k, 0), try plist.newString(a, k));
     try info.set(a, "UIViewControllerIdentifiersToNibNames", map);
     try info.set(a, "UIStoryboardVersion", plist.c.plist_new_int(1));
     if (root.nonEmpty("initialViewController")) |init_id| {
         try info.set(a, "UIStoryboardDesignatedEntryPointIdentifier", try plist.newString(a, id_to_nib.get(init_id) orelse init_id));
     }
-    try out.writeFile(.{ .sub_path = "Info.plist", .data = try info.toBinary(a) });
+    try out.writeFile(sys.io, .{ .sub_path = "Info.plist", .data = try info.toBinary(a) });
     return .{ .warnings = doc.warnings };
 }
 
@@ -1130,14 +1131,14 @@ pub fn compileStoryboard(a: Allocator, path: []const u8, out_dir: []const u8) !R
 
 const testing = std.testing;
 
-fn writeTmp(dir: std.fs.Dir, name: []const u8, data: []const u8) !void {
-    try dir.writeFile(.{ .sub_path = name, .data = data });
+fn writeTmp(dir: std.Io.Dir, name: []const u8, data: []const u8) !void {
+    try dir.writeFile(sys.io, .{ .sub_path = name, .data = data });
 }
 
 fn dumpText(a: Allocator, bytes: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).init(a);
-    try nib.dump(a, bytes, out.writer(), false, "");
-    return out.items;
+    var out: std.Io.Writer.Allocating = .init(a);
+    try nib.dump(a, bytes, &out.writer, false, "");
+    return out.written();
 }
 
 test "compile a xib with outlets, actions, colors, fonts and constraints" {
@@ -1177,7 +1178,7 @@ test "compile a xib with outlets, actions, colors, fonts and constraints" {
         \\  <resources><systemColor name="labelColor"><color red="0.1" green="0.2" blue="0.3" alpha="1" colorSpace="custom" customColorSpace="sRGB"/></systemColor></resources>
         \\</document>
     );
-    const path = try tmp.dir.realpathAlloc(a, "V.xib");
+    const path = try tmp.dir.realPathFileAlloc(sys.io, "V.xib", a);
     const bytes, const res = try compileXib(a, path);
     try testing.expectEqual(@as(usize, 1), res.warnings); // the "ghost" constraint
     const text = try dumpText(a, bytes);
@@ -1246,27 +1247,27 @@ test "compile a storyboard with a navigation controller and a segue" {
         \\  <resources><systemColor name="systemBackgroundColor"><color white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/></systemColor></resources>
         \\</document>
     );
-    const path = try tmp.dir.realpathAlloc(a, "Main.storyboard");
+    const path = try tmp.dir.realPathFileAlloc(sys.io, "Main.storyboard", a);
     const out = try std.fmt.allocPrint(a, "{s}c", .{path});
     const res = try compileStoryboard(a, path, out);
     try testing.expectEqual(@as(usize, 0), res.warnings);
-    var dir = try std.fs.cwd().openDir(out, .{});
-    defer dir.close();
+    var dir = try sys.cwd().openDir(sys.io, out, .{});
+    defer dir.close(sys.io);
     for ([_][]const u8{ "Info.plist", "UIViewController-nav.nib", "Home.nib", "vc-view-root.nib", "UIViewController-vc2.nib", "vc2-view-v2.nib" }) |f|
-        try dir.access(f, .{});
+        try dir.access(sys.io, f, .{});
 
-    const info = try plist.readFile(a, try std.fs.path.join(a, &.{ out, "Info.plist" }));
+    const info = try plist.readFile(a, try std.Io.Dir.path.join(a, &.{ out, "Info.plist" }));
     defer info.deinit();
     try testing.expectEqualStrings("UIViewController-nav", (try info.getString(a, "UIStoryboardDesignatedEntryPointIdentifier")).?);
 
-    const home = try dumpText(a, try dir.readFileAlloc(a, "Home.nib", 1 << 20));
+    const home = try dumpText(a, try dir.readFileAlloc(sys.io, "Home.nib", a, .limited(1 << 20)));
     try testing.expect(std.mem.indexOf(u8, home, ": UIButton") == null); // only in the view nib
     for ([_][]const u8{ "UIStoryboardShowSegueTemplate", "\"UIViewController-vc2\"", "UIExternalObjectsTableForViewLoading", "\"vc-view-root\"", "\"HomeViewController\"" }) |needle|
         try testing.expect(std.mem.indexOf(u8, home, needle) != null);
-    const view = try dumpText(a, try dir.readFileAlloc(a, "vc-view-root.nib", 1 << 20));
+    const view = try dumpText(a, try dir.readFileAlloc(sys.io, "vc-view-root.nib", a, .limited(1 << 20)));
     for ([_][]const u8{ "\"perform:\"", "UpstreamPlaceholder-idl-", "UIButton" }) |needle|
         try testing.expect(std.mem.indexOf(u8, view, needle) != null);
-    const nav = try dumpText(a, try dir.readFileAlloc(a, "UIViewController-nav.nib", 1 << 20));
+    const nav = try dumpText(a, try dir.readFileAlloc(sys.io, "UIViewController-nav.nib", a, .limited(1 << 20)));
     for ([_][]const u8{ "UINavigationController", "UIChildViewControllers", "UIParentViewController", "UINavigationBar" }) |needle|
         try testing.expect(std.mem.indexOf(u8, nav, needle) != null);
 }
@@ -1277,7 +1278,7 @@ test "non-iOS documents are rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTmp(tmp.dir, "Mac.xib", "<document targetRuntime=\"MacOSX.Cocoa\"><objects/></document>");
-    const path = try tmp.dir.realpathAlloc(arena.allocator(), "Mac.xib");
+    const path = try tmp.dir.realPathFileAlloc(sys.io, "Mac.xib", arena.allocator());
     try testing.expectError(error.Invalid, compileXib(arena.allocator(), path));
 }
 
@@ -1287,14 +1288,14 @@ test "strict validation rejects unsupported elements and unresolved outlets" {
     const a = arena.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "Strict.xib" });
-    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><stackView id=\"s\"/></objects></document>" });
+    const path = try std.Io.Dir.path.join(a, &.{ try tmp.dir.realPathFileAlloc(sys.io, ".", a), "Strict.xib" });
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "Strict.xib", .data = "<document><objects><stackView id=\"s\"/></objects></document>" });
     try testing.expectError(error.Invalid, validate(a, path, true));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "stackView") != null);
-    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><connections><outlet property=\"missing\" destination=\"ghost\"/></connections></view></objects></document>" });
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><connections><outlet property=\"missing\" destination=\"ghost\"/></connections></view></objects></document>" });
     try testing.expectError(error.Invalid, validate(a, path, true));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "ghost") != null);
-    try tmp.dir.writeFile(.{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><rect key=\"frame\" x=\"0\" y=\"0\" width=\"10\" height=\"10\"/></view></objects></document>" });
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "Strict.xib", .data = "<document><objects><view id=\"v\"><rect key=\"frame\" x=\"0\" y=\"0\" width=\"10\" height=\"10\"/></view></objects></document>" });
     try validate(a, path, true);
 }
 
@@ -1386,6 +1387,6 @@ test "storyboard initial entry must be a controller not just an existing id" {
     const a = arena.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "Bad.storyboard", .data = "<document initialViewController=\"label\"><scenes><scene><objects><viewController id=\"vc\" sceneMemberID=\"viewController\"><view key=\"view\" id=\"view\"><subviews><label id=\"label\"/></subviews></view></viewController></objects></scene></scenes></document>" });
-    try testing.expectError(error.Invalid, validate(a, try tmp.dir.realpathAlloc(a, "Bad.storyboard"), true));
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "Bad.storyboard", .data = "<document initialViewController=\"label\"><scenes><scene><objects><viewController id=\"vc\" sceneMemberID=\"viewController\"><view key=\"view\" id=\"view\"><subviews><label id=\"label\"/></subviews></view></viewController></objects></scene></scenes></document>" });
+    try testing.expectError(error.Invalid, validate(a, try tmp.dir.realPathFileAlloc(sys.io, "Bad.storyboard", a), true));
 }

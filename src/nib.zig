@@ -10,8 +10,8 @@ const xmldom = @import("xmldom.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const List = struct { items: std.ArrayListUnmanaged(Value) = .empty };
-pub const Dict = struct { keys: std.ArrayListUnmanaged(Value) = .empty, values: std.ArrayListUnmanaged(Value) = .empty };
+pub const List = struct { items: std.ArrayList(Value) = .empty };
+pub const Dict = struct { keys: std.ArrayList(Value) = .empty, values: std.ArrayList(Value) = .empty };
 
 pub const Value = union(enum) {
     obj: *Obj,
@@ -51,7 +51,7 @@ pub const IbInfo = struct {
 
 pub const Obj = struct {
     class: []const u8,
-    props: std.ArrayListUnmanaged(Prop) = .empty,
+    props: std.ArrayList(Prop) = .empty,
     ib: IbInfo = .{},
 
     pub fn originalClass(o: *const Obj) []const u8 {
@@ -180,13 +180,13 @@ const EncValue = struct {
     data: []const u8 = "",
 };
 
-const EncObject = struct { class: u32, values: std.ArrayListUnmanaged(EncValue) = .empty };
+const EncObject = struct { class: u32, values: std.ArrayList(EncValue) = .empty };
 
 const Encoder = struct {
     a: Allocator,
-    objects: std.ArrayListUnmanaged(EncObject) = .empty,
-    keys: std.StringArrayHashMapUnmanaged(void) = .empty,
-    classes: std.StringArrayHashMapUnmanaged(void) = .empty,
+    objects: std.ArrayList(EncObject) = .empty,
+    keys: std.array_hash_map.String(void) = .empty,
+    classes: std.array_hash_map.String(void) = .empty,
     index: std.AutoHashMapUnmanaged(*const Obj, u32) = .empty,
 
     fn keyIndex(e: *Encoder, key: []const u8) !u32 {
@@ -289,13 +289,19 @@ const Encoder = struct {
     }
 };
 
-fn writeFlex(out: *std.ArrayList(u8), number: usize) !void {
+fn putInt(a: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, v, .little);
+    try out.appendSlice(a, &bytes);
+}
+
+fn writeFlex(a: Allocator, out: *std.ArrayList(u8), number: usize) !void {
     var n = number;
     while (true) {
         const byte: u8 = @intCast(n & 0x7f);
         n >>= 7;
-        if (n == 0) return out.append(byte | 0x80);
-        try out.append(byte);
+        if (n == 0) return out.append(a, byte | 0x80);
+        try out.append(a, byte);
     }
 }
 
@@ -304,51 +310,50 @@ pub fn encode(a: Allocator, root: *const Obj) ![]u8 {
     var e: Encoder = .{ .a = a };
     _ = try e.addObj(root);
 
-    var objs = std.ArrayList(u8).init(a);
-    var vals = std.ArrayList(u8).init(a);
+    var objs: std.ArrayList(u8) = .empty;
+    var vals: std.ArrayList(u8) = .empty;
     var value_count: usize = 0;
     for (e.objects.items) |o| {
-        try writeFlex(&objs, o.class);
-        try writeFlex(&objs, value_count);
-        try writeFlex(&objs, o.values.items.len);
+        try writeFlex(a, &objs, o.class);
+        try writeFlex(a, &objs, value_count);
+        try writeFlex(a, &objs, o.values.items.len);
         value_count += o.values.items.len;
         for (o.values.items) |v| {
-            try writeFlex(&vals, v.key);
-            try vals.append(@intFromEnum(v.type));
+            try writeFlex(a, &vals, v.key);
+            try vals.append(a, @intFromEnum(v.type));
             switch (v.type) {
-                .int8 => try vals.append(@bitCast(@as(i8, @intCast(v.int)))),
-                .int16 => try vals.writer().writeInt(i16, @intCast(v.int), .little),
-                .int32 => try vals.writer().writeInt(i32, @intCast(v.int), .little),
-                .int64 => try vals.writer().writeInt(i64, v.int, .little),
-                .object => try vals.writer().writeInt(u32, @intCast(v.int), .little),
-                .double => try vals.writer().writeInt(u64, @bitCast(v.double), .little),
-                .float => try vals.writer().writeInt(u32, @bitCast(@as(f32, @floatCast(v.double))), .little),
+                .int8 => try vals.append(a, @bitCast(@as(i8, @intCast(v.int)))),
+                .int16 => try putInt(a, &vals, i16, @intCast(v.int)),
+                .int32 => try putInt(a, &vals, i32, @intCast(v.int)),
+                .int64 => try putInt(a, &vals, i64, v.int),
+                .object => try putInt(a, &vals, u32, @intCast(v.int)),
+                .double => try putInt(a, &vals, u64, @bitCast(v.double)),
+                .float => try putInt(a, &vals, u32, @bitCast(@as(f32, @floatCast(v.double)))),
                 .data => {
-                    try writeFlex(&vals, v.data.len);
-                    try vals.appendSlice(v.data);
+                    try writeFlex(a, &vals, v.data.len);
+                    try vals.appendSlice(a, v.data);
                 },
                 .true, .false, .nil => {},
             }
         }
     }
-    var keys = std.ArrayList(u8).init(a);
+    var keys: std.ArrayList(u8) = .empty;
     for (e.keys.keys()) |k| {
-        try writeFlex(&keys, k.len);
-        try keys.appendSlice(k);
+        try writeFlex(a, &keys, k.len);
+        try keys.appendSlice(a, k);
     }
-    var classes = std.ArrayList(u8).init(a);
+    var classes: std.ArrayList(u8) = .empty;
     for (e.classes.keys()) |c| {
-        try writeFlex(&classes, c.len + 1);
-        try classes.append(0x80);
-        try classes.appendSlice(c);
-        try classes.append(0);
+        try writeFlex(a, &classes, c.len + 1);
+        try classes.append(a, 0x80);
+        try classes.appendSlice(a, c);
+        try classes.append(a, 0);
     }
 
-    var out = std.ArrayList(u8).init(a);
-    try out.appendSlice("NIBArchive");
-    const w = out.writer();
-    try w.writeInt(u32, 1, .little);
-    try w.writeInt(u32, 10, .little); // coder version written by current Xcode
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "NIBArchive");
+    try putInt(a, &out, u32, 1);
+    try putInt(a, &out, u32, 10); // coder version written by current Xcode
     const header = 50;
     const sections = [_]struct { usize, usize }{
         .{ e.objects.items.len, header },
@@ -357,13 +362,13 @@ pub fn encode(a: Allocator, root: *const Obj) ![]u8 {
         .{ e.classes.count(), header + objs.items.len + keys.items.len + vals.items.len },
     };
     for (sections) |s| {
-        try w.writeInt(u32, @intCast(s[0]), .little);
-        try w.writeInt(u32, @intCast(s[1]), .little);
+        try putInt(a, &out, u32, @intCast(s[0]));
+        try putInt(a, &out, u32, @intCast(s[1]));
     }
-    try out.appendSlice(objs.items);
-    try out.appendSlice(keys.items);
-    try out.appendSlice(vals.items);
-    try out.appendSlice(classes.items);
+    try out.appendSlice(a, objs.items);
+    try out.appendSlice(a, keys.items);
+    try out.appendSlice(a, vals.items);
+    try out.appendSlice(a, classes.items);
     return out.items;
 }
 
@@ -442,7 +447,7 @@ pub fn decode(a: Allocator, bytes: []const u8) !Archive {
     const values = try a.alloc(Decoded, counts[2]);
     c.pos = offsets[2];
     for (values) |*v| {
-        v.* = .{ .key = try c.flex(), .type = std.meta.intToEnum(Type, try c.byte()) catch return diag.fail("nib: unknown value type at offset {d}", .{c.pos - 1}) };
+        v.* = .{ .key = try c.flex(), .type = std.enums.fromInt(Type, try c.byte()) orelse return diag.fail("nib: unknown value type at offset {d}", .{c.pos - 1}) };
         switch (v.type) {
             .int8 => v.int = @as(i8, @bitCast(try c.byte())),
             .int16 => v.int = try c.int(i16),
@@ -463,7 +468,7 @@ pub fn decode(a: Allocator, bytes: []const u8) !Archive {
         const kind = try c.byte();
         if (kind == 0x81) _ = try c.take(4) else if (kind != 0x80) return diag.fail("nib: unknown class entry type 0x{x}", .{kind});
         const name = try c.take(len);
-        cls.* = std.mem.trimRight(u8, name, "\x00");
+        cls.* = std.mem.trimEnd(u8, name, "\x00");
     }
     for (objects) |o| if (o.class >= classes.len or o.start + o.count > values.len)
         return diag.fail("nib: object table out of range", .{});
@@ -545,19 +550,20 @@ test "encode and decode round trip" {
     };
     try testing.expect(found_mask);
 
-    var out = std.ArrayList(u8).init(a);
-    try dump(a, bytes, out.writer(), false, "");
+    var out: std.Io.Writer.Allocating = .init(a);
+    try dump(a, bytes, &out.writer, false, "");
     for ([_][]const u8{ "UICenter = (160, 240)", "NS.bytes = \"héllo\"", "UIOpaque = true", "UINibEncoderEmptyKey = @" }) |needle|
-        try testing.expect(std.mem.indexOf(u8, out.items, needle) != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), needle) != null);
 }
 
 test "flex numbers" {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-    try writeFlex(&buf, 0);
-    try writeFlex(&buf, 127);
-    try writeFlex(&buf, 128);
-    try writeFlex(&buf, 300);
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try writeFlex(a, &buf, 0);
+    try writeFlex(a, &buf, 127);
+    try writeFlex(a, &buf, 128);
+    try writeFlex(a, &buf, 300);
     try testing.expectEqualSlices(u8, &.{ 0x80, 0xff, 0x00, 0x81, 0x2c, 0x82 }, buf.items);
     var c: Cursor = .{ .buf = buf.items, .pos = 0 };
     for ([_]usize{ 0, 127, 128, 300 }) |n| try testing.expectEqual(n, try c.flex());

@@ -1,5 +1,6 @@
 //! `idl init`: scaffold a new app with an idlproj.yml.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const config = @import("config.zig");
@@ -46,9 +47,9 @@ pub fn init(a: Allocator, name: []const u8, lang: Lang, bundle_id_opt: ?[]const 
     };
     const yml = try std.fmt.allocPrint(a, project_yml, .{ .name = name, .bundle_id = bundle_id });
     // Validate through the real loader before touching the filesystem.
-    _ = try config.parse(a, yml, try std.fs.path.join(a, &.{ "/", config.file_name }));
+    _ = try config.parse(a, yml, try std.Io.Dir.path.join(a, &.{ "/", config.file_name }));
 
-    const cfg_path = try std.fs.path.join(a, &.{ dir, config.file_name });
+    const cfg_path = try std.Io.Dir.path.join(a, &.{ dir, config.file_name });
     if (fsutil.kind(cfg_path) != .missing) return diag.fail("{s} already exists", .{cfg_path});
     const files = [_]struct { []const u8, []const u8 }{
         .{ config.file_name, yml },
@@ -59,13 +60,13 @@ pub fn init(a: Allocator, name: []const u8, lang: Lang, bundle_id_opt: ?[]const 
         },
     };
     for (files) |f| {
-        const path = try std.fs.path.join(a, &.{ dir, f[0] });
+        const path = try std.Io.Dir.path.join(a, &.{ dir, f[0] });
         if (fsutil.kind(path) != .missing) {
             diag.warn("keeping existing {s}", .{path});
             continue;
         }
-        if (std.fs.path.dirname(path)) |d| try std.fs.cwd().makePath(d);
-        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = f[1] });
+        if (std.Io.Dir.path.dirname(path)) |d| try sys.makePath(d);
+        try sys.cwd().writeFile(sys.io, .{ .sub_path = path, .data = f[1] });
         diag.info("  NEW  {s}", .{path});
     }
     return dir;

@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
     mod.addImport("yaml", yaml.module("yaml"));
     mod.addImport("xml", xml.module("xml"));
     mod.linkLibrary(libplist);
+    // Zig 0.16+ has no @cImport: plist.h is translated by the build and
+    // imported as `c` in src/plist.zig.
+    const plist_c = b.addTranslateC(.{ .root_source_file = b.path("src/plist_c.h"), .target = target, .optimize = optimize });
+    plist_c.addIncludePath(b.dependency("libplist", .{}).path("include"));
+    mod.addImport("plist_c", plist_c.createModule());
     // `idl init` scaffolds from the real examples so templates never drift.
     mod.addAnonymousImport("scaffold_main_m", .{ .root_source_file = b.path("examples/objc-app/Sources/main.m") });
     mod.addAnonymousImport("scaffold_main_swift", .{ .root_source_file = b.path("examples/swift-app/Sources/main.swift") });
@@ -28,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run idl (pass arguments after --)").dependOn(&run.step);
 
     // idl-actool: AssetKit (Swift) wrapper that compiles .xcassets. Needs a
@@ -68,13 +73,13 @@ fn buildLibplist(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .linkage = .static,
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
-    lib.addIncludePath(dep.path("include"));
-    lib.addIncludePath(dep.path("src"));
-    lib.addIncludePath(dep.path("libcnary/include"));
+    lib.root_module.addIncludePath(dep.path("include"));
+    lib.root_module.addIncludePath(dep.path("src"));
+    lib.root_module.addIncludePath(dep.path("libcnary/include"));
     lib.root_module.addCMacro("PACKAGE_VERSION", "\"2.8.1\"");
     for ([_][]const u8{ "HAVE_STRNDUP", "HAVE_STRPTIME", "HAVE_GMTIME_R", "HAVE_LOCALTIME_R", "HAVE_MEMMEM", "HAVE_TM_TM_GMTOFF", "HAVE_TM_TM_ZONE" }) |m|
         lib.root_module.addCMacro(m, "1");
-    lib.addCSourceFiles(.{
+    lib.root_module.addCSourceFiles(.{
         .root = dep.path(""),
         .files = &.{
             "src/base64.c",         "src/bytearray.c", "src/hashtable.c", "src/ptrarray.c",

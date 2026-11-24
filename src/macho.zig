@@ -76,9 +76,9 @@ pub fn parse(a: Allocator, b: []const u8) !Info {
         .filetype = std.mem.readInt(u32, b[12..16], .little),
     };
     const ncmds = std.mem.readInt(u32, b[16..20], .little);
-    var dylibs = std.ArrayList([]const u8).init(a);
-    var weak = std.ArrayList([]const u8).init(a);
-    var rpaths = std.ArrayList([]const u8).init(a);
+    var dylibs: std.ArrayList([]const u8) = .empty;
+    var weak: std.ArrayList([]const u8) = .empty;
+    var rpaths: std.ArrayList([]const u8) = .empty;
     var off: usize = 32;
     for (0..ncmds) |_| {
         if (off + 8 > b.len) return diag.fail("Mach-O load commands truncated", .{});
@@ -101,11 +101,11 @@ pub fn parse(a: Allocator, b: []const u8) !Info {
             },
             lc_load_dylib, lc_load_weak_dylib, lc_reexport_dylib => if (size >= 24) {
                 if (lcString(lc, 8)) |name| {
-                    try dylibs.append(name);
-                    if (cmd == lc_load_weak_dylib) try weak.append(name);
+                    try dylibs.append(a, name);
+                    if (cmd == lc_load_weak_dylib) try weak.append(a, name);
                 }
             },
-            lc_rpath => if (lcString(lc, 8)) |p| try rpaths.append(p),
+            lc_rpath => if (lcString(lc, 8)) |p| try rpaths.append(a, p),
             lc_id_dylib => info.id_dylib = lcString(lc, 8),
             else => {},
         }
@@ -124,11 +124,26 @@ pub fn isSystemOrBundled(path: []const u8) bool {
     return false;
 }
 
+const LeWriter = struct {
+    w: *std.Io.Writer,
+    fn writeInt(x: LeWriter, comptime T: type, v: T, comptime _: std.builtin.Endian) !void {
+        var b: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &b, v, .little);
+        try x.w.writeAll(&b);
+    }
+    fn writeAll(x: LeWriter, bytes: []const u8) !void {
+        try x.w.writeAll(bytes);
+    }
+    fn writeByteNTimes(x: LeWriter, byte: u8, n: usize) !void {
+        try x.w.splatByteAll(byte, n);
+    }
+};
+
 test "parse a synthetic arm64 executable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var buf = std.ArrayList(u8).init(arena.allocator());
-    const w = buf.writer();
+    var buf: std.Io.Writer.Allocating = .init(arena.allocator());
+    const w: LeWriter = .{ .w = &buf.writer };
     const dylib_name = "/usr/lib/libobjc.A.dylib\x00\x00\x00\x00\x00\x00\x00\x00";
     const cmds = [_]u32{ 24, 24 + @as(u32, dylib_name.len), 24, 16 };
     try w.writeInt(u32, 0xfeedfacf, .little);
@@ -163,7 +178,7 @@ test "parse a synthetic arm64 executable" {
     try w.writeInt(u32, lc_code_signature, .little);
     try w.writeInt(u32, 16, .little);
     try w.writeInt(u64, 0, .little);
-    const info = try parse(arena.allocator(), buf.items);
+    const info = try parse(arena.allocator(), buf.written());
     try std.testing.expect(info.has_main and info.has_code_signature);
     try std.testing.expectEqual(platform_ios, info.platform.?);
     var vb: [32]u8 = undefined;

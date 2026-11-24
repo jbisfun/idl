@@ -1,6 +1,7 @@
 //! idl — iOS development on Linux. Reads idlproj.yml, generates project files
 //! and orchestrates clang/swiftc/ldid/xtool to produce IPAs.
 const std = @import("std");
+const sys = @import("sys.zig");
 const clap = @import("clap");
 const diag = @import("diag.zig");
 const config = @import("config.zig");
@@ -76,12 +77,11 @@ const Global = struct {
     verbose: bool,
 };
 
-pub fn main() !u8 {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    sys.init(init.io, init.environ_map);
+    const a = init.arena.allocator();
 
-    var iter = try std.process.ArgIterator.initWithAllocator(a);
+    var iter = try init.minimal.args.iterateAllocator(a);
     _ = iter.next();
     var parse_diag: clap.Diagnostic = .{};
     const res = clap.parseEx(clap.Help, &main_params, main_parsers, &iter, .{
@@ -89,25 +89,29 @@ pub fn main() !u8 {
         .allocator = a,
         .terminating_positional = 0,
     }) catch |err| {
-        parse_diag.report(std.io.getStdErr().writer(), err) catch {};
+        parse_diag.reportToFile(sys.io, .stderr(), err) catch {};
         return 2;
     };
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(sys.io, &stdout_buf);
+    const stdout = &stdout_writer.interface;
     const command = res.positionals[0] orelse {
         try stdout.writeAll(usage_text);
         try clap.help(stdout, clap.Help, &main_params, .{});
+        try stdout.flush();
         return if (res.args.help != 0) 0 else 2;
     };
     if (res.args.help != 0 or command == .help) {
         try stdout.writeAll(usage_text);
         try clap.help(stdout, clap.Help, &main_params, .{});
+        try stdout.flush();
         return 0;
     }
     const global: Global = .{ .file = res.args.file, .verbose = res.args.verbose != 0 };
 
     dispatch(a, command, &iter, global) catch |err| switch (err) {
         error.Invalid => {
-            std.io.getStdErr().writer().print("error: {s}\n", .{diag.msg}) catch {};
+            sys.stderrPrint("error: {s}\n", .{diag.msg});
             return 1;
         },
         error.Usage => return 2,
@@ -117,7 +121,7 @@ pub fn main() !u8 {
     return 0;
 }
 
-fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: Global) !void {
+fn dispatch(a: Allocator, command: Command, iter: *std.process.Args.Iterator, g: Global) !void {
     switch (command) {
         .build => try cmdBuild(a, iter, g),
         .gen => try cmdGen(a, iter, g),
@@ -140,19 +144,22 @@ fn dispatch(a: Allocator, command: Command, iter: *std.process.ArgIterator, g: G
 }
 
 /// Parse a subcommand's arguments; prints help/diagnostics itself.
-fn parseSub(a: Allocator, comptime name: []const u8, comptime params: anytype, comptime value_parsers: anytype, iter: *std.process.ArgIterator) !clap.ResultEx(clap.Help, params, value_parsers) {
+fn parseSub(a: Allocator, comptime name: []const u8, comptime params: anytype, comptime value_parsers: anytype, iter: *std.process.Args.Iterator) !clap.ResultEx(clap.Help, params, value_parsers) {
     var d: clap.Diagnostic = .{};
     const res = clap.parseEx(clap.Help, params, value_parsers, iter, .{ .diagnostic = &d, .allocator = a }) catch |err| {
-        d.report(std.io.getStdErr().writer(), err) catch {};
-        std.io.getStdErr().writer().print("see: idl {s} --help\n", .{name}) catch {};
+        d.reportToFile(sys.io, .stderr(), err) catch {};
+        sys.stderrPrint("see: idl {s} --help\n", .{name});
         return error.Usage;
     };
     if (res.args.help != 0) {
-        const out = std.io.getStdOut().writer();
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writer(sys.io, &buf);
+        const out = &w.interface;
         try out.print("usage: idl {s} ", .{name});
         try clap.usage(out, clap.Help, params);
         try out.writeAll("\n\n");
         try clap.help(out, clap.Help, params, .{});
+        try out.flush();
         return error.HelpShown;
     }
     return res;
@@ -184,7 +191,7 @@ const DevicesAction = enum { list };
 
 /// Jimpactor's data dir: toolchain.jimpactor_dir from idlproj.yml if there is one, else the default.
 fn jimpactorDir(a: Allocator, g: Global) ![]const u8 {
-    var env = try std.process.getEnvMap(a);
+    var env = try sys.envMap(a);
     const path: ?[]const u8 = g.file orelse (config.find(a, ".") catch null);
     if (path) |p| {
         const cfg = try config.load(a, p);
@@ -206,7 +213,7 @@ fn printProgress(message: []const u8, percent: i64) void {
     diag.info("  [{d:>3}%] {s}", .{ percent, message });
 }
 
-fn cmdDevices(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdDevices(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help  Show this help.
         \\<action>
@@ -218,7 +225,7 @@ fn cmdDevices(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     }
 }
 
-fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdInstall(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\    --strict         Reject unsupported inputs instead of warnings.
@@ -238,10 +245,10 @@ fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const device = try jimpactor.resolveDevice(try jimpactor.listDevices(a, data_dir), query);
     if (!device.available) diag.warn("{s} is not reachable right now; Jimpactor will try anyway", .{device.name});
 
-    var ipas = std.ArrayList([]const u8).init(a);
+    var ipas: std.ArrayList([]const u8) = .empty;
     if (res.args.ipa) |ipa| {
         if (res.positionals[1].len > 0) return diag.fail("install: give either --ipa or targets, not both", .{});
-        try ipas.append(try std.fs.cwd().realpathAlloc(a, ipa));
+        try ipas.append(a, try sys.realpath(a, ipa));
     } else {
         var p = try loadProjectConfiguration(a, g, res.args.configuration);
         const selected = try p.cfg.select(a, res.positionals[1]);
@@ -253,17 +260,17 @@ fn cmdInstall(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
             const ipa = if (res.args.@"no-build" != 0) try t.ipaPath(a) else (try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.?.prepared[i], .strict = res.args.strict != 0, .products = &products })).ipa orelse continue;
             if (t.type != .app) continue;
             if (fsutil.kind(ipa) != .file) return diag.fail("{s} does not exist; run `idl build {s}` first", .{ ipa, t.name });
-            try ipas.append(ipa);
+            try ipas.append(a, ipa);
         }
     }
     for (ipas.items) |ipa| {
-        diag.info("==> installing {s} on {s} ({s})", .{ std.fs.path.basename(ipa), device.name, device.udid });
+        diag.info("==> installing {s} on {s} ({s})", .{ std.Io.Dir.path.basename(ipa), device.name, device.udid });
         const event = try jimpactor.send(a, data_dir, .{ .install = .{ .path = ipa, .udid = device.udid } }, printProgress);
         diag.info("{s}", .{event.message orelse event.event});
     }
 }
 
-fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdBuild(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\    --strict         Reject unsupported inputs instead of warnings.
@@ -281,19 +288,19 @@ fn cmdBuild(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const targets = try config.buildOrder(a, p.cfg.targets, try p.cfg.select(a, res.positionals[0]));
     var session = try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0);
     defer session.release();
-    var ipas = std.ArrayList([]const u8).init(a);
+    var ipas: std.ArrayList([]const u8) = .empty;
     var products = builder.Products.init(a);
     for (targets, 0..) |t, i| {
         if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
         const built = try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0, .products = &products, .post_build = res.args.@"no-post-build" == 0 });
-        if (built.ipa) |ipa| try ipas.append(ipa);
+        if (built.ipa) |ipa| try ipas.append(a, ipa);
     }
     diag.info("\nbuilt {d} IPA(s):", .{ipas.items.len});
     for (ipas.items) |ipa| diag.info("  {s}", .{ipa});
     if (targets.len > 0) diag.info("ad-hoc signatures are not provisioning; re-sign before installing.", .{});
 }
 
-fn cmdGen(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdGen(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
@@ -322,7 +329,7 @@ fn buildForQuality(a: Allocator, p: *Project, selected: []const config.Target, j
     return products;
 }
 
-fn cmdFmt(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdFmt(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help          Show this help.
         \\    --check         Report files that need formatting; change nothing (exit 1 if any).
@@ -340,7 +347,7 @@ fn cmdFmt(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     if (!ok) return diag.fail("{s}", .{if (res.args.check != 0) "some files need formatting (run `idl fmt`)" else "formatting failed"});
 }
 
-fn cmdLint(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdLint(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help          Show this help.
         \\-c, --configuration <str>  Build profile: debug or release.
@@ -375,7 +382,7 @@ fn cmdLint(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     if (!ok) return diag.fail("lint failed", .{});
 }
 
-fn cmdTest(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdTest(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help          Show this help.
         \\-c, --configuration <str>  Build profile: debug or release.
@@ -391,15 +398,15 @@ fn cmdTest(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const selected = try p.cfg.select(a, res.positionals[0]);
     const verbose = g.verbose or res.args.verbose != 0;
     if (res.args.@"no-build" == 0) _ = try buildForQuality(a, &p, selected, res.args.jobs, verbose, res.args.strict != 0);
-    var apps = std.ArrayList(config.Target).init(a);
-    for (selected) |t| if (t.type == .app) try apps.append(t);
+    var apps: std.ArrayList(config.Target) = .empty;
+    for (selected) |t| if (t.type == .app) try apps.append(a, t);
     if (apps.items.len == 0) return diag.fail("test: no app targets selected", .{});
     const locks = try builder.lockTargets(a, apps.items);
     defer for (locks) |*lock| lock.release();
     if (!try quality.runTests(a, &p.tc, apps.items, .{ .verbose = verbose })) return diag.fail("tests failed", .{});
 }
 
-fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdCheck(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help                  Show this help.
         \\-c, --configuration <str>   Build profile: debug or release.
@@ -418,12 +425,12 @@ fn cmdCheck(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
         diag.info("preflight passed (no application sources compiled)", .{});
     } else {
         if (res.positionals[0].len > 0 or res.args.configuration != null) return diag.fail("check: target/profile selection requires idlproj.yml", .{});
-        const tc = try Toolchain.init(a, .{}, try std.fs.cwd().realpathAlloc(a, "."));
+        const tc = try Toolchain.init(a, .{}, try sys.realpath(a, "."));
         if (!try tc.check()) return diag.fail("toolchain incomplete", .{});
     }
 }
 
-fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdList(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
@@ -432,12 +439,12 @@ fn cmdList(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     const res = try parseSub(a, "list", &params, parsers, iter);
     const p = try loadProjectConfiguration(a, g, res.args.configuration);
     for (p.cfg.targets) |t| {
-        const rel = try std.fs.path.relative(a, p.cfg.root, t.dir);
+        const rel = try sys.relative(a, p.cfg.root, t.dir);
         diag.info("{s:<24} {s:<9} {s:<7} {s:<36} iOS {s:<6} {s}", .{ t.name, @tagName(t.type), @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
     }
 }
 
-fn cmdClean(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdClean(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help  Show this help.
@@ -452,7 +459,7 @@ fn cmdClean(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
     for (targets) |t| try builder.clean(a, t);
 }
 
-fn cmdVerify(a: Allocator, iter: *std.process.ArgIterator) !void {
+fn cmdVerify(a: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help              Show this help.
         \\    --bundle-id <str>   Require this CFBundleIdentifier.
@@ -465,7 +472,7 @@ fn cmdVerify(a: Allocator, iter: *std.process.ArgIterator) !void {
     for (res.positionals[0]) |ipa| _ = try verify.verifyFile(a, ipa, .{ .bundle_id = res.args.@"bundle-id", .allow_unsigned = res.args.@"allow-unsigned" != 0 });
 }
 
-fn cmdInit(a: Allocator, iter: *std.process.ArgIterator) !void {
+fn cmdInit(a: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help             Show this help.
         \\    --lang <lang>      objc or swift (default: swift).
@@ -480,7 +487,7 @@ fn cmdInit(a: Allocator, iter: *std.process.ArgIterator) !void {
     diag.info("\nnext:\n  cd {s}\n  idl check\n  idl build", .{dir});
 }
 
-fn cmdXcodeproj(a: Allocator, iter: *std.process.ArgIterator, g: Global) !void {
+fn cmdXcodeproj(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const params = comptime clap.parseParamsComptime(
         \\-c, --configuration <str>  Build profile: debug or release.
         \\-h, --help           Show this help.
@@ -504,7 +511,7 @@ fn splitAssignment(s: []const u8) struct { []const u8, []const u8 } {
     return .{ s[0..eq], s[eq + 1 ..] };
 }
 
-fn cmdPlist(a: Allocator, iter: *std.process.ArgIterator) !void {
+fn cmdPlist(a: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help              Show this help.
         \\-i, --input <path>      Input plist (XML, binary, JSON or OpenStep); omit to start empty.
@@ -534,14 +541,14 @@ fn cmdPlist(a: Allocator, iter: *std.process.ArgIterator) !void {
         try root.set(a, k, try plist.parseCliValue(a, k, v));
     }
     for (res.args.delete) |k| try root.remove(a, k);
-    var env = try std.process.getEnvMap(a);
+    var env = try sys.envMap(a);
     try plist.expand(a, root.node, &vars, &env);
     const xml = try root.toXml(a);
-    if (std.fs.path.dirname(output)) |d| try std.fs.cwd().makePath(d);
-    try std.fs.cwd().writeFile(.{ .sub_path = output, .data = xml });
+    if (std.Io.Dir.path.dirname(output)) |d| try sys.makePath(d);
+    try sys.cwd().writeFile(sys.io, .{ .sub_path = output, .data = xml });
 }
 
-fn cmdXcstrings(a: Allocator, iter: *std.process.ArgIterator) !void {
+fn cmdXcstrings(a: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help  Show this help.
         \\<path>
@@ -551,13 +558,13 @@ fn cmdXcstrings(a: Allocator, iter: *std.process.ArgIterator) !void {
     const res = try parseSub(a, "xcstrings", &params, parsers, iter);
     const input = res.positionals[0] orelse return diag.fail("xcstrings: expected <input.xcstrings> <outdir>", .{});
     const outdir = res.positionals[1] orelse return diag.fail("xcstrings: expected <input.xcstrings> <outdir>", .{});
-    const source = std.fs.cwd().readFileAlloc(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
-    var dir = try std.fs.cwd().makeOpenPath(outdir, .{});
-    defer dir.close();
+    const source = sys.readFile(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
+    var dir = try sys.cwd().createDirPathOpen(sys.io, outdir, .{});
+    defer dir.close(sys.io);
     try xcstrings.convert(a, source, dir);
 }
 
-fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
+fn cmdIbtool(a: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\    --strict         Reject unsupported IB features.
         \\-h, --help           Show this help.
@@ -569,7 +576,10 @@ fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
     );
     const res = try parseSub(a, "ibtool", &params, parsers, iter);
     const input = res.positionals[0] orelse return diag.fail("ibtool: expected a .xib, .storyboard or .nib file", .{});
-    const out = std.io.getStdOut().writer();
+    var out_buf: [4096]u8 = undefined;
+    var out_writer = std.Io.File.stdout().writer(sys.io, &out_buf);
+    const out = &out_writer.interface;
+    defer out.flush() catch {};
     const show_types = res.args.types != 0;
     const sfx = fsutil.suffix(input);
     if (res.args.strict != 0 and fsutil.oneOf(sfx, &.{ ".xib", ".storyboard" })) try ibtool.validate(a, input, true);
@@ -578,7 +588,7 @@ fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
         if (res.args.strict != 0 and result.warnings > 0) return diag.fail("ibtool: {d} compiler warning(s) in strict mode", .{result.warnings});
         if (res.args.dump != 0 and res.args.output == null) return nib.dump(a, bytes, out, show_types, "");
         const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.nib", .{input[0 .. input.len - sfx.len]});
-        try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = bytes });
+        try sys.cwd().writeFile(sys.io, .{ .sub_path = dest, .data = bytes });
         diag.info("wrote {s}", .{dest});
     } else if (std.mem.eql(u8, sfx, ".storyboard")) {
         const dest = res.args.output orelse try std.fmt.allocPrint(a, "{s}.storyboardc", .{input[0 .. input.len - sfx.len]});
@@ -586,7 +596,7 @@ fn cmdIbtool(a: Allocator, iter: *std.process.ArgIterator) !void {
         if (res.args.strict != 0 and result.warnings > 0) return diag.fail("ibtool: {d} compiler warning(s) in strict mode", .{result.warnings});
         diag.info("wrote {s}", .{dest});
     } else {
-        const bytes = std.fs.cwd().readFileAlloc(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
+        const bytes = sys.readFile(a, input, 64 << 20) catch |err| return diag.fail("cannot read {s}: {s}", .{ input, @errorName(err) });
         if (!nib.isArchive(bytes)) return diag.fail("{s}: not a .xib, .storyboard or NIBArchive .nib", .{input});
         try nib.dump(a, bytes, out, show_types, "");
     }

@@ -46,12 +46,12 @@ pub const Element = struct {
 /// Parse a whole document; everything is allocated in `a` (use an arena).
 /// Text content is ignored: IB documents keep everything in attributes.
 pub fn parse(a: Allocator, data: []const u8, name: []const u8) !*Element {
-    var doc = xml.StaticDocument.init(data);
-    var reader = doc.reader(a, .{ .namespace_aware = false });
-    defer reader.deinit();
+    var static_reader: xml.Reader.Static = .init(a, data, .{ .namespace_aware = false });
+    defer static_reader.deinit();
+    const reader = &static_reader.interface;
 
-    const Frame = struct { el: *Element, kids: std.ArrayListUnmanaged(*Element) };
-    var stack: std.ArrayListUnmanaged(Frame) = .empty;
+    const Frame = struct { el: *Element, kids: std.ArrayList(*Element) };
+    var stack: std.ArrayList(Frame) = .empty;
     var root: ?*Element = null;
     while (true) {
         const node = reader.read() catch |err| switch (err) {

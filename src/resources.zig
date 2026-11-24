@@ -1,5 +1,6 @@
 //! Resource planning, collision detection and content-addressed compiler cache.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const state = @import("buildstate.zig");
@@ -24,10 +25,10 @@ test "generated string output cannot overwrite a raw localized resource" {
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
-    try tmp.dir.makePath("R/en.lproj");
-    try tmp.dir.writeFile(.{ .sub_path = "R/en.lproj/Localizable.strings", .data = "raw" });
-    try tmp.dir.writeFile(.{ .sub_path = "R/Localizable.xcstrings", .data = "{\"strings\":{\"Hello\":{}}}" });
+    const root = try tmp.dir.realPathFileAlloc(sys.io, ".", a);
+    try tmp.dir.createDirPath(sys.io, "R/en.lproj");
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "R/en.lproj/Localizable.strings", .data = "raw" });
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "R/Localizable.xcstrings", .data = "{\"strings\":{\"Hello\":{}}}" });
     var tc = try Toolchain.init(a, .{}, root);
     const t: Target = .{ .name = "App", .bundle_id = "com.example.app", .dir = root, .resources = &.{"R"} };
     try std.testing.expectError(error.Invalid, prepare(a, &tc, t, true, false));
@@ -40,8 +41,8 @@ test "missing configured storyboard is rejected before compilation" {
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
-    const cfg = try @import("config.zig").parse(a, "targets:\n  - name: App\n    bundle_id: com.example.app\n    info:\n      UIMainStoryboardFile: Missing\n", try std.fs.path.join(a, &.{ root, "idlproj.yml" }));
+    const root = try tmp.dir.realPathFileAlloc(sys.io, ".", a);
+    const cfg = try @import("config.zig").parse(a, "targets:\n  - name: App\n    bundle_id: com.example.app\n    info:\n      UIMainStoryboardFile: Missing\n", try std.Io.Dir.path.join(a, &.{ root, "idlproj.yml" }));
     var tc = try Toolchain.init(a, .{}, root);
     try std.testing.expectError(error.Invalid, prepare(a, &tc, cfg.targets[0], true, false));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "Missing") != null);
@@ -53,18 +54,18 @@ test "resource cache survives unchanged build and invalidates same-length edit" 
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
-    try tmp.dir.makePath("R");
-    try tmp.dir.writeFile(.{ .sub_path = "R/Text.xcstrings", .data = "{\"strings\":{\"Hello\":{}}}" });
+    const root = try tmp.dir.realPathFileAlloc(sys.io, ".", a);
+    try tmp.dir.createDirPath(sys.io, "R");
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "R/Text.xcstrings", .data = "{\"strings\":{\"Hello\":{}}}" });
     var tc = try Toolchain.init(a, .{}, root);
     const t: Target = .{ .name = "App", .bundle_id = "com.example.app", .dir = root, .resources = &.{"R"} };
     const first = try prepare(a, &tc, t, true, false);
     const file = first.outputs[0].source;
-    const before = (try std.fs.cwd().statFile(file)).mtime;
+    const before = (try sys.cwd().statFile(sys.io, file, .{})).mtime;
     const second = try prepare(a, &tc, t, true, false);
     try std.testing.expectEqualStrings(first.digest, second.digest);
-    try std.testing.expectEqual(before, (try std.fs.cwd().statFile(file)).mtime);
-    try tmp.dir.writeFile(.{ .sub_path = "R/Text.xcstrings", .data = "{\"strings\":{\"World\":{}}}" });
+    try std.testing.expectEqual(before, (try sys.cwd().statFile(sys.io, file, .{})).mtime);
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = "R/Text.xcstrings", .data = "{\"strings\":{\"World\":{}}}" });
     const third = try prepare(a, &tc, t, true, false);
     try std.testing.expect(!std.mem.eql(u8, second.digest, third.digest));
 }
@@ -75,35 +76,32 @@ fn log(comptime fmt: []const u8, args: anytype) void {
 
 fn run(a: Allocator, tc: *Toolchain, argv: []const []const u8, cwd: []const u8, verbose: bool) !void {
     if (verbose) log("  {s}", .{try std.mem.join(a, " ", argv)});
-    var child = std.process.Child.init(argv, a);
-    child.cwd = cwd;
-    child.env_map = &tc.env;
-    child.spawn() catch |err| return diag.fail("cannot execute {s}: {s}", .{ argv[0], @errorName(err) });
-    const term = try child.wait();
-    if (term != .Exited or term.Exited != 0) return diag.fail("resource compiler failed: {s}", .{argv[0]});
+    var child = sys.spawn(argv, .{ .cwd = cwd, .env = &tc.env }) catch |err| return diag.fail("cannot execute {s}: {s}", .{ argv[0], @errorName(err) });
+    const term = try sys.wait(&child);
+    if (!sys.succeeded(term)) return diag.fail("resource compiler failed: {s}", .{argv[0]});
 }
 
 fn destName(a: Allocator, rel: []const u8) ![]const u8 {
-    const name = std.fs.path.basename(rel);
+    const name = std.Io.Dir.path.basename(rel);
     if (std.mem.eql(u8, fsutil.suffix(rel), ".framework")) return std.fmt.allocPrint(a, "Frameworks/{s}", .{name});
-    if (std.fs.path.dirname(rel)) |parent| if (std.mem.eql(u8, fsutil.suffix(parent), ".lproj"))
-        return std.fmt.allocPrint(a, "{s}/{s}", .{ std.fs.path.basename(parent), name });
+    if (std.Io.Dir.path.dirname(rel)) |parent| if (std.mem.eql(u8, fsutil.suffix(parent), ".lproj"))
+        return std.fmt.allocPrint(a, "{s}/{s}", .{ std.Io.Dir.path.basename(parent), name });
     return name;
 }
 
 fn appendTree(a: Allocator, outputs: *std.ArrayList(Output), source: []const u8, dest: []const u8, owner: []const u8) anyerror!void {
     switch (fsutil.kind(source)) {
-        .file => try outputs.append(.{ .source = source, .dest = dest, .owner = owner }),
+        .file => try outputs.append(a, .{ .source = source, .dest = dest, .owner = owner }),
         .dir => {
-            var dir = try std.fs.cwd().openDir(source, .{ .iterate = true, .no_follow = true });
-            defer dir.close();
+            var dir = try sys.cwd().openDir(sys.io, source, .{ .iterate = true, .follow_symlinks = false });
+            defer dir.close(sys.io);
             var it = dir.iterate();
             var empty = true;
-            while (try it.next()) |entry| {
+            while (try it.next(sys.io)) |entry| {
                 empty = false;
-                try appendTree(a, outputs, try std.fs.path.join(a, &.{ source, entry.name }), if (dest.len == 0) try a.dupe(u8, entry.name) else try std.fs.path.join(a, &.{ dest, entry.name }), owner);
+                try appendTree(a, outputs, try std.Io.Dir.path.join(a, &.{ source, entry.name }), if (dest.len == 0) try a.dupe(u8, entry.name) else try std.Io.Dir.path.join(a, &.{ dest, entry.name }), owner);
             }
-            if (empty and dest.len > 0) try outputs.append(.{ .source = source, .dest = dest, .owner = owner });
+            if (empty and dest.len > 0) try outputs.append(a, .{ .source = source, .dest = dest, .owner = owner });
         },
         else => return diag.fail("unsupported resource file: {s}", .{source}),
     }
@@ -126,10 +124,10 @@ fn validateOutputs(t: Target, outputs: []Output, info: plist.Plist, a: Allocator
         for ([_][]const u8{ "Info.plist", "PkgInfo", t.name }) |reserved| if (collision(o.dest, reserved))
             return diag.fail("resource {s} would overwrite reserved bundle output {s}", .{ o.owner, reserved });
         if (seen.get(o.dest)) |owner| return diag.fail("resources {s} and {s} both produce {s}", .{ owner, o.owner, o.dest });
-        var parent = std.fs.path.dirnamePosix(o.dest);
+        var parent = std.Io.Dir.path.dirnamePosix(o.dest);
         while (parent) |p| {
             if (seen.get(p)) |owner| return diag.fail("resource output {s} from {s} conflicts with {s}", .{ o.dest, o.owner, owner });
-            parent = std.fs.path.dirnamePosix(p);
+            parent = std.Io.Dir.path.dirnamePosix(p);
         }
         try seen.put(o.dest, o.owner);
     }
@@ -180,7 +178,7 @@ pub fn prepare(a: Allocator, tc: *Toolchain, t: Target, strict: bool, verbose: b
     const info = try plist.parse(xml);
     defer info.deinit();
     if (try metadata.entitlements(a, t, &tc.env)) |_| {}
-    var outputs = std.ArrayList(Output).init(a);
+    var outputs: std.ArrayList(Output) = .empty;
     var additions: ?plist.Plist = null;
     errdefer if (additions) |p| p.deinit();
     var catalog: ?[]const u8 = null;
@@ -220,46 +218,46 @@ pub fn prepare(a: Allocator, tc: *Toolchain, t: Target, strict: bool, verbose: b
         const key = try f.finish(a);
         var slot_hash: state.Fingerprint = .{};
         slot_hash.add(rel);
-        const slot = try std.fs.path.join(a, &.{ try t.buildPath(a), "resources", try slot_hash.finish(a), key });
-        const out = try std.fs.path.join(a, &.{ slot, "output" });
-        const stamp = try std.fs.path.join(a, &.{ slot, "state" });
+        const slot = try std.Io.Dir.path.join(a, &.{ try t.buildPath(a), "resources", try slot_hash.finish(a), key });
+        const out = try std.Io.Dir.path.join(a, &.{ slot, "output" });
+        const stamp = try std.Io.Dir.path.join(a, &.{ slot, "state" });
         const dest = try destName(a, rel);
         const produced = if (std.mem.eql(u8, sfx, ".storyboard")) try std.fmt.allocPrint(a, "{s}c", .{dest}) else if (std.mem.eql(u8, sfx, ".xib")) try std.fmt.allocPrint(a, "{s}.nib", .{dest[0 .. dest.len - 4]}) else "";
         if (!try state.hit(a, stamp, key, out)) {
-            const pending = try std.fs.path.join(a, &.{ slot, "partial" });
-            try std.fs.cwd().deleteTree(pending);
-            try std.fs.cwd().makePath(pending);
+            const pending = try std.Io.Dir.path.join(a, &.{ slot, "partial" });
+            try sys.deleteTree(pending);
+            try sys.makePath(pending);
             if (std.mem.eql(u8, sfx, ".xcassets")) {
                 log("  ACTOOL {s}", .{rel});
                 try run(a, tc, &.{ try tc.actool(), src, pending, t.min_ios }, t.dir, verbose);
             } else if (std.mem.eql(u8, sfx, ".storyboard")) {
                 log("  IBTOOL {s}", .{rel});
-                const result = try ibtool.compileStoryboard(a, src, try std.fs.path.join(a, &.{ pending, produced }));
+                const result = try ibtool.compileStoryboard(a, src, try std.Io.Dir.path.join(a, &.{ pending, produced }));
                 if (strict and result.warnings > 0) return diag.fail("{s}: storyboard compiler reported {d} warning(s) in strict mode", .{ rel, result.warnings });
             } else if (std.mem.eql(u8, sfx, ".xib")) {
                 log("  IBTOOL {s}", .{rel});
                 const bytes, const result = try ibtool.compileXib(a, src);
                 if (strict and result.warnings > 0) return diag.fail("{s}: XIB compiler reported {d} warning(s) in strict mode", .{ rel, result.warnings });
-                const path = try std.fs.path.join(a, &.{ pending, produced });
-                try std.fs.cwd().makePath(std.fs.path.dirname(path).?);
-                try std.fs.cwd().writeFile(.{ .sub_path = path, .data = bytes });
+                const path = try std.Io.Dir.path.join(a, &.{ pending, produced });
+                try sys.makePath(std.Io.Dir.path.dirname(path).?);
+                try sys.cwd().writeFile(sys.io, .{ .sub_path = path, .data = bytes });
             } else {
                 log("  STRINGS {s}", .{rel});
-                var dir = try std.fs.cwd().openDir(pending, .{});
-                defer dir.close();
-                try xcstrings.convert(a, try std.fs.cwd().readFileAlloc(a, src, 64 << 20), dir);
+                var dir = try sys.cwd().openDir(sys.io, pending, .{});
+                defer dir.close(sys.io);
+                try xcstrings.convert(a, try sys.readFile(a, src, 64 << 20), dir);
             }
             if (!std.mem.eql(u8, input_digest, try state.treeDigest(a, src)))
                 return diag.fail("resource changed while compiling: {s}; retry the build", .{rel});
-            try std.fs.cwd().deleteTree(out);
-            try std.fs.cwd().rename(pending, out);
+            try sys.deleteTree(out);
+            try sys.cwd().rename(pending, sys.cwd(), out, sys.io);
             try state.record(a, stamp, key, out);
         } else if (verbose) log("  CACHED {s}", .{rel});
         const start = outputs.items.len;
         try appendTree(a, &outputs, out, "", rel);
         if (std.mem.eql(u8, sfx, ".xcassets")) {
-            const json_path = try std.fs.path.join(a, &.{ out, "assetcatalog_generated_info.json" });
-            const json = try std.fs.cwd().readFileAlloc(a, json_path, 1 << 20);
+            const json_path = try std.Io.Dir.path.join(a, &.{ out, "assetcatalog_generated_info.json" });
+            const json = try sys.readFile(a, json_path, 1 << 20);
             var node: plist.c.plist_t = null;
             if (plist.c.plist_from_json(json.ptr, @intCast(json.len), &node) != plist.c.PLIST_ERR_SUCCESS or node == null)
                 return diag.fail("invalid asset compiler metadata: {s}", .{rel});
@@ -302,19 +300,19 @@ test "strict asset validation rejects unsupported dataset packages" {
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("Assets.xcassets/Data.dataset");
-    const path = try tmp.dir.realpathAlloc(a, "Assets.xcassets");
+    try tmp.dir.createDirPath(sys.io, "Assets.xcassets/Data.dataset");
+    const path = try tmp.dir.realPathFileAlloc(sys.io, "Assets.xcassets", a);
     try std.testing.expectError(error.Invalid, validateCatalog(a, path, "AppIcon", true));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "dataset") != null);
 }
 
 pub fn validateCatalog(a: Allocator, path: []const u8, app_icon: []const u8, strict: bool) !void {
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try sys.cwd().openDir(sys.io, path, .{ .iterate = true });
+    defer dir.close(sys.io);
     var walker = try dir.walk(a);
     defer walker.deinit();
     var icons: usize = 0;
-    while (try walker.next()) |entry| {
+    while (try walker.next(sys.io)) |entry| {
         if (entry.kind != .directory) continue;
         const suffix = fsutil.suffix(entry.basename);
         if (std.mem.eql(u8, suffix, ".appiconset")) {

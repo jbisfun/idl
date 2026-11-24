@@ -1,6 +1,7 @@
 //! `idlproj.yml` loader. One file configures the toolchain and every target;
 //! keys under `defaults:` apply to all targets unless a target overrides them.
 const std = @import("std");
+const sys = @import("sys.zig");
 const ynode = @import("ynode.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
@@ -264,14 +265,14 @@ pub const Config = struct {
 
     pub fn select(c: Config, a: Allocator, names: []const []const u8) ![]const Target {
         if (names.len == 0) return c.targets;
-        var out = std.ArrayList(Target).init(a);
+        var out: std.ArrayList(Target) = .empty;
         outer: for (names) |n| {
             for (c.targets) |t| if (std.mem.eql(u8, t.name, n)) {
-                try out.append(t);
+                try out.append(a, t);
                 continue :outer;
             };
-            var known = std.ArrayList([]const u8).init(a);
-            for (c.targets) |t| try known.append(t.name);
+            var known: std.ArrayList([]const u8) = .empty;
+            for (c.targets) |t| try known.append(a, t.name);
             return diag.fail("unknown target '{s}' (known: {s})", .{ n, try std.mem.join(a, ", ", known.items) });
         }
         return out.items;
@@ -282,11 +283,11 @@ pub const Config = struct {
 
 /// Walk up from `start` looking for idlproj.yml.
 pub fn find(a: Allocator, start: []const u8) ![]const u8 {
-    var dir: []const u8 = try std.fs.cwd().realpathAlloc(a, start);
+    var dir: []const u8 = try sys.realpath(a, start);
     while (true) {
-        const candidate = try std.fs.path.join(a, &.{ dir, file_name });
+        const candidate = try std.Io.Dir.path.join(a, &.{ dir, file_name });
         if (fsutil.kind(candidate) == .file) return candidate;
-        dir = std.fs.path.dirname(dir) orelse return diag.fail("no {s} found in {s} or any parent directory (run `idl init`)", .{ file_name, start });
+        dir = std.Io.Dir.path.dirname(dir) orelse return diag.fail("no {s} found in {s} or any parent directory (run `idl init`)", .{ file_name, start });
     }
 }
 
@@ -352,19 +353,16 @@ const Ctx = struct {
     fn section(c: Ctx, comptime T: type, n: Node, key: []const u8) !T {
         var out: T = .{};
         const m = (try c.map(n, key)) orelse return out;
-        const names = comptime blk: {
-            var ns: [std.meta.fields(T).len][]const u8 = undefined;
-            for (std.meta.fields(T), 0..) |f, i| ns[i] = f.name;
-            break :blk ns;
-        };
-        try checkKeys(m, &names, try std.fmt.allocPrint(c.a, "{s}.{s}", .{ c.where, key }));
-        inline for (std.meta.fields(T)) |f| if (m.get(f.name)) |v| {
-            @field(out, f.name) = switch (f.type) {
-                []const u8 => try c.str(v, f.name),
-                ?ynode.Map => try c.map(v, f.name),
-                []const []const u8 => try c.strList(v, f.name),
-                bool => try c.boolean(v, f.name),
-                ?bool => if (v == .null) null else try c.boolean(v, f.name),
+        const names = std.meta.fieldNames(T);
+        try checkKeys(m, names, try std.fmt.allocPrint(c.a, "{s}.{s}", .{ c.where, key }));
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types) |name, FT| if (m.get(name)) |v| {
+            @field(out, name) = switch (FT) {
+                []const u8 => try c.str(v, name),
+                ?ynode.Map => try c.map(v, name),
+                []const []const u8 => try c.strList(v, name),
+                bool => try c.boolean(v, name),
+                ?bool => if (v == .null) null else try c.boolean(v, name),
                 else => @compileError("unhandled section field type"),
             };
         };
@@ -468,7 +466,7 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     const dir_rel = if (m.get("dir")) |d| try c.str(d, "dir") else ".";
     var t: Target = .{
         .name = name,
-        .dir = try std.fs.path.resolve(a, &.{ root, dir_rel }),
+        .dir = try sys.resolve(a, &.{ root, dir_rel }),
         .bundle_id = "",
     };
     const kind_node = m.get("type") orelse if (defaults) |d| d.get("type") else null;
@@ -484,22 +482,23 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
         t.bundle_id = try c.str(b, "bundle_id");
     } else if (t.type.bundled()) return diag.fail("{s}: 'bundle_id' is required", .{c.where});
 
-    inline for (std.meta.fields(Target)) |field| {
-        if (comptime (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "dir") or std.mem.eql(u8, field.name, "bundle_id") or std.mem.eql(u8, field.name, "profile") or std.mem.eql(u8, field.name, "variants") or std.mem.eql(u8, field.name, "type") or std.mem.eql(u8, field.name, "post_build") or std.mem.eql(u8, field.name, "tests") or std.mem.eql(u8, field.name, "lint") or std.mem.eql(u8, field.name, "format"))) continue;
-        const value = m.get(field.name) orelse if (defaults) |d| d.get(field.name) else null;
+    const target_info = @typeInfo(Target).@"struct";
+    inline for (target_info.field_names, target_info.field_types) |field_name, field_type| {
+        if (comptime (std.mem.eql(u8, field_name, "name") or std.mem.eql(u8, field_name, "dir") or std.mem.eql(u8, field_name, "bundle_id") or std.mem.eql(u8, field_name, "profile") or std.mem.eql(u8, field_name, "variants") or std.mem.eql(u8, field_name, "type") or std.mem.eql(u8, field_name, "post_build") or std.mem.eql(u8, field_name, "tests") or std.mem.eql(u8, field_name, "lint") or std.mem.eql(u8, field_name, "format"))) continue;
+        const value = m.get(field_name) orelse if (defaults) |d| d.get(field_name) else null;
         if (value) |v| {
-            if (comptime std.mem.eql(u8, field.name, "entitlements")) {
-                if (v == .map) t.entitlement_values = v.map else t.entitlements = if (v == .null) null else try c.str(v, field.name);
-            } else @field(t, field.name) = switch (field.type) {
-                []const u8 => try c.str(v, field.name),
-                ?[]const u8 => if (v == .null) null else try c.str(v, field.name),
-                []const []const u8 => try c.strList(v, field.name),
-                bool => try c.boolean(v, field.name),
-                ?bool => if (v == .null) null else try c.boolean(v, field.name),
-                ?ynode.Map => try c.map(v, field.name),
-                Builder => std.meta.stringToEnum(Builder, try c.str(v, field.name)) orelse
+            if (comptime std.mem.eql(u8, field_name, "entitlements")) {
+                if (v == .map) t.entitlement_values = v.map else t.entitlements = if (v == .null) null else try c.str(v, field_name);
+            } else @field(t, field_name) = switch (field_type) {
+                []const u8 => try c.str(v, field_name),
+                ?[]const u8 => if (v == .null) null else try c.str(v, field_name),
+                []const []const u8 => try c.strList(v, field_name),
+                bool => try c.boolean(v, field_name),
+                ?bool => if (v == .null) null else try c.boolean(v, field_name),
+                ?ynode.Map => try c.map(v, field_name),
+                Builder => std.meta.stringToEnum(Builder, try c.str(v, field_name)) orelse
                     return diag.fail("{s}: builder must be 'direct' or 'xtool'", .{c.where}),
-                else => @compileError("unhandled target field type: " ++ @typeName(field.type)),
+                else => @compileError("unhandled target field type: " ++ @typeName(field_type)),
             };
         }
     }
@@ -548,14 +547,14 @@ pub fn parse(a: Allocator, source: []const u8, path: []const u8) !Config {
 
 /// Maps merge recursively, sequences replace, null explicitly clears a value.
 fn merge(a: Allocator, base: ynode.Map, overlay: ynode.Map) anyerror!ynode.Map {
-    var result = std.StringArrayHashMap(Node).init(a);
-    for (base.keys, base.values) |k, v| try result.put(k, v);
+    var result: std.array_hash_map.String(Node) = .empty;
+    for (base.keys, base.values) |k, v| try result.put(a, k, v);
     for (overlay.keys, overlay.values) |k, v| {
         var value = v;
         if (result.get(k)) |old| if (old == .map and v == .map) {
             value = .{ .map = try merge(a, old.map, v.map) };
         };
-        try result.put(k, value);
+        try result.put(a, k, value);
     }
     return .{ .keys = result.keys(), .values = result.values() };
 }
@@ -597,13 +596,13 @@ fn profileTarget(a: Allocator, root: []const u8, index: usize, base: ynode.Map, 
     t.configuration = name;
     t.build_dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ t.build_dir, name });
     if (std.mem.eql(u8, name, "debug")) {
-        var flags = std.ArrayList([]const u8).init(a);
-        try flags.appendSlice(t.defines);
+        var flags: std.ArrayList([]const u8) = .empty;
+        try flags.appendSlice(a, t.defines);
         var has_debug = false;
         for (t.defines) |d| if (std.mem.eql(u8, d, "DEBUG")) {
             has_debug = true;
         };
-        if (!has_debug) try flags.append("DEBUG");
+        if (!has_debug) try flags.append(a, "DEBUG");
         t.defines = flags.items;
     }
     return t;
@@ -619,18 +618,19 @@ pub fn parseConfiguration(a: Allocator, source: []const u8, path: []const u8, pr
         else => return diag.fail("{s}: top level must be a mapping", .{path}),
     };
     try checkKeys(top, &top_keys, path);
-    const root = std.fs.path.dirname(path) orelse ".";
+    const root = std.Io.Dir.path.dirname(path) orelse ".";
     var cfg: Config = .{ .path = path, .root = root, .toolchain = .{}, .targets = &.{} };
 
     const c: Ctx = .{ .a = a, .where = "toolchain" };
     if (try c.map(top.get("toolchain") orelse .null, "toolchain")) |tc| {
         try checkKeys(tc, &toolchain_keys, "toolchain");
-        inline for (std.meta.fields(ToolchainConfig)) |field| if (tc.get(field.name)) |v| {
-            @field(cfg.toolchain, field.name) = switch (field.type) {
-                []const u8 => try c.str(v, field.name),
-                ?[]const u8 => if (v == .null) null else try c.str(v, field.name),
-                usize => std.fmt.parseInt(usize, try c.str(v, field.name), 10) catch
-                    return diag.fail("toolchain: '{s}' must be a non-negative integer", .{field.name}),
+        const tc_info = @typeInfo(ToolchainConfig).@"struct";
+        inline for (tc_info.field_names, tc_info.field_types) |name, FT| if (tc.get(name)) |v| {
+            @field(cfg.toolchain, name) = switch (FT) {
+                []const u8 => try c.str(v, name),
+                ?[]const u8 => if (v == .null) null else try c.str(v, name),
+                usize => std.fmt.parseInt(usize, try c.str(v, name), 10) catch
+                    return diag.fail("toolchain: '{s}' must be a non-negative integer", .{name}),
                 else => @compileError("unhandled toolchain field type"),
             };
         };
@@ -692,22 +692,22 @@ fn validateGraph(a: Allocator, targets: []const Target) !void {
 /// `selected` plus everything it links or embeds (transitively), ordered so
 /// every target comes after its dependencies.
 pub fn buildOrder(a: Allocator, all: []const Target, selected: []const Target) ![]const Target {
-    var out = std.ArrayList(Target).init(a);
+    var out: std.ArrayList(Target) = .empty;
     var state = std.StringHashMap(u8).init(a); // 1 = visiting, 2 = done
     const Visit = struct {
-        fn visit(al: []const Target, o: *std.ArrayList(Target), st: *std.StringHashMap(u8), t: Target) !void {
+        fn visit(ga: Allocator, al: []const Target, o: *std.ArrayList(Target), st: *std.StringHashMap(u8), t: Target) !void {
             if (st.get(t.name)) |s| {
                 if (s == 1) return diag.fail("dependency cycle through target '{s}'", .{t.name});
                 return;
             }
             try st.put(t.name, 1);
             for ([_][]const []const u8{ t.link, t.embed }) |names| for (names) |n|
-                try visit(al, o, st, findTarget(al, n) orelse return diag.fail("unknown target '{s}'", .{n}));
+                try visit(ga, al, o, st, findTarget(al, n) orelse return diag.fail("unknown target '{s}'", .{n}));
             try st.put(t.name, 2);
-            try o.append(t);
+            try o.append(ga, t);
         }
     };
-    for (selected) |t| try Visit.visit(all, &out, &state, t);
+    for (selected) |t| try Visit.visit(a, all, &out, &state, t);
     return out.items;
 }
 
@@ -716,8 +716,8 @@ pub fn load(a: Allocator, path: []const u8) !Config {
 }
 
 pub fn loadConfiguration(a: Allocator, path: []const u8, profile: ?[]const u8) !Config {
-    const abs = try std.fs.cwd().realpathAlloc(a, path);
-    const source = std.fs.cwd().readFileAlloc(a, abs, 4 << 20) catch |err|
+    const abs = try sys.realpath(a, path);
+    const source = sys.readFile(a, abs, 4 << 20) catch |err|
         return diag.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
     return parseConfiguration(a, source, abs, profile);
 }

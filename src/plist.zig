@@ -2,9 +2,10 @@
 //! build.zig). This module adds only what libplist lacks: Xcode-style
 //! `$(VAR)` expansion and the CLI's `KEY=VALUE` value parsing.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 
-pub const c = @cImport(@cInclude("plist/plist.h"));
+pub const c = @import("plist_c");
 const Allocator = std.mem.Allocator;
 
 /// An owned libplist node. Child nodes handed to `set` become owned by the parent.
@@ -24,7 +25,7 @@ pub const Plist = struct {
     }
 
     pub fn get(p: Plist, a: Allocator, key: []const u8) !c.plist_t {
-        return c.plist_dict_get_item(p.node, try a.dupeZ(u8, key));
+        return c.plist_dict_get_item(p.node, try a.dupeSentinel(u8, key, 0));
     }
 
     /// String value of `key`, or null if absent / not a string.
@@ -34,7 +35,7 @@ pub const Plist = struct {
 
     /// Insert or replace `key`; takes ownership of `value`.
     pub fn set(p: Plist, a: Allocator, key: []const u8, value: c.plist_t) !void {
-        if (c.plist_dict_set_item(p.node, try a.dupeZ(u8, key), value) != c.PLIST_ERR_SUCCESS)
+        if (c.plist_dict_set_item(p.node, try a.dupeSentinel(u8, key, 0), value) != c.PLIST_ERR_SUCCESS)
             return diag.fail("cannot set plist key {s}", .{key});
     }
 
@@ -43,7 +44,7 @@ pub const Plist = struct {
     }
 
     pub fn remove(p: Plist, a: Allocator, key: []const u8) !void {
-        _ = c.plist_dict_remove_item(p.node, try a.dupeZ(u8, key));
+        _ = c.plist_dict_remove_item(p.node, try a.dupeSentinel(u8, key, 0));
     }
 
     pub fn toBinary(p: Plist, a: Allocator) ![]u8 {
@@ -73,7 +74,7 @@ pub fn stringOf(node: c.plist_t) ?[]const u8 {
 }
 
 pub fn newString(a: Allocator, s: []const u8) !c.plist_t {
-    return c.plist_new_string(try a.dupeZ(u8, s));
+    return c.plist_new_string(try a.dupeSentinel(u8, s, 0));
 }
 
 /// Parse XML, binary, JSON or OpenStep plist data.
@@ -87,7 +88,7 @@ pub fn parse(bytes: []const u8) !Plist {
 }
 
 pub fn readFile(a: Allocator, path: []const u8) !Plist {
-    const bytes = std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch |err|
+    const bytes = sys.readFile(a, path, 64 << 20) catch |err|
         return diag.fail("cannot read plist {s}: {s}", .{ path, @errorName(err) });
     return parse(bytes) catch diag.fail("{s}: {s}", .{ path, diag.msg });
 }
@@ -98,9 +99,9 @@ pub const Vars = std.StringHashMap([]const u8);
 
 /// Replace `$(NAME)`, `${NAME}` and `$(NAME:modifier)` with values from
 /// `vars`, falling back to the process environment, else "".
-pub fn expandString(a: Allocator, s: []const u8, vars: *const Vars, env: ?*const std.process.EnvMap) ![]const u8 {
+pub fn expandString(a: Allocator, s: []const u8, vars: *const Vars, env: ?*const std.process.Environ.Map) ![]const u8 {
     if (std.mem.indexOfScalar(u8, s, '$') == null) return s;
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '$' and i + 2 < s.len and (s[i + 1] == '(' or s[i + 1] == '{')) {
@@ -128,12 +129,12 @@ pub fn expandString(a: Allocator, s: []const u8, vars: *const Vars, env: ?*const
 }
 
 /// Expand variables in every string value (not keys), in place.
-pub fn expand(a: Allocator, node: c.plist_t, vars: *const Vars, env: ?*const std.process.EnvMap) !void {
+pub fn expand(a: Allocator, node: c.plist_t, vars: *const Vars, env: ?*const std.process.Environ.Map) !void {
     switch (c.plist_get_node_type(node)) {
         c.PLIST_STRING => {
             const s = stringOf(node).?;
             const expanded = try expandString(a, s, vars, env);
-            if (expanded.ptr != s.ptr) c.plist_set_string_val(node, try a.dupeZ(u8, expanded));
+            if (expanded.ptr != s.ptr) c.plist_set_string_val(node, try a.dupeSentinel(u8, expanded, 0));
         },
         c.PLIST_ARRAY => {
             const n = c.plist_array_get_size(node);

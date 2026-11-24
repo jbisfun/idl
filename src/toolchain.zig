@@ -1,6 +1,7 @@
 //! Linux -> iOS toolchain discovery (xtool Darwin SDK bundle + a modern
 //! Swift-toolchain clang/swiftc) and the compiler/linker flag sets.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const config = @import("config.zig");
@@ -12,7 +13,7 @@ pub const Toolchain = struct {
     a: Allocator,
     cfg: config.ToolchainConfig,
     root: []const u8,
-    env: std.process.EnvMap,
+    env: std.process.Environ.Map,
     sdk_bundle: []const u8,
     sdk: ?[]const u8,
     sdk_version: ?[]const u8,
@@ -26,7 +27,7 @@ pub const Toolchain = struct {
     identities: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn init(a: Allocator, cfg: config.ToolchainConfig, root: []const u8) !Toolchain {
-        var env = try std.process.getEnvMap(a);
+        var env = try sys.envMap(a);
         const swiftly_bin = try fsutil.expandHome(a, cfg.swiftly_bin, &env);
         // Append (never prepend) so host tools keep priority, like the old Makefiles.
         const old_path = env.get("PATH") orelse "/usr/bin:/bin";
@@ -37,20 +38,20 @@ pub const Toolchain = struct {
             .{ "GIT_BRANCH", &.{ "git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD" } },
             .{ "GIT_COMMIT", &.{ "git", "-C", root, "log", "-1", "--format=%h" } },
         }) |entry| if (env.get(entry[0]) == null) {
-            const value = if (std.process.Child.run(.{ .allocator = a, .argv = entry[1] })) |r|
-                (if (r.term == .Exited and r.term.Exited == 0) std.mem.trim(u8, r.stdout, " \n\r") else "unknown")
+            const value = if (sys.run(a, entry[1], .{})) |r|
+                (if (sys.succeeded(r.term)) std.mem.trim(u8, r.stdout, " \n\r") else "unknown")
             else |_| "unknown";
             try env.put(entry[0], value);
         };
 
         const bundle = try fsutil.expandHome(a, cfg.sdk_bundle, &env);
-        const sdks_dir = try std.fs.path.join(a, &.{ bundle, "Developer/Platforms/iPhoneOS.platform/Developer/SDKs" });
+        const sdks_dir = try std.Io.Dir.path.join(a, &.{ bundle, "Developer/Platforms/iPhoneOS.platform/Developer/SDKs" });
         const sdk = if (cfg.sdk) |s| try fsutil.expandHome(a, s, &env) else try newestEntry(a, sdks_dir, "iPhoneOS", ".sdk");
-        const toolchain_lib = try std.fs.path.join(a, &.{ bundle, "Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" });
+        const toolchain_lib = try std.Io.Dir.path.join(a, &.{ bundle, "Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib" });
         const clang_rt = blk: {
-            const clang_dir = try std.fs.path.join(a, &.{ toolchain_lib, "clang" });
+            const clang_dir = try std.Io.Dir.path.join(a, &.{ toolchain_lib, "clang" });
             const version = try newestEntry(a, clang_dir, "", "") orelse break :blk null;
-            const p = try std.fs.path.join(a, &.{ version, "lib/darwin/libclang_rt.ios.a" });
+            const p = try std.Io.Dir.path.join(a, &.{ version, "lib/darwin/libclang_rt.ios.a" });
             break :blk if (fsutil.kindFollow(p) == .file) p else null;
         };
         return .{
@@ -61,9 +62,9 @@ pub const Toolchain = struct {
             .sdk_bundle = bundle,
             .sdk = sdk,
             .sdk_version = if (sdk) |s| sdkVersion(a, s) else null,
-            .swift_resource_dir = try std.fs.path.join(a, &.{ toolchain_lib, "swift" }),
-            .platform_lib_dir = try std.fs.path.join(a, &.{ bundle, "Developer/Platforms/iPhoneOS.platform/Developer/usr/lib" }),
-            .ld64 = try std.fs.path.join(a, &.{ bundle, "toolset/bin/orig/ld64.lld" }),
+            .swift_resource_dir = try std.Io.Dir.path.join(a, &.{ toolchain_lib, "swift" }),
+            .platform_lib_dir = try std.Io.Dir.path.join(a, &.{ bundle, "Developer/Platforms/iPhoneOS.platform/Developer/usr/lib" }),
+            .ld64 = try std.Io.Dir.path.join(a, &.{ bundle, "toolset/bin/orig/ld64.lld" }),
             .clang_rt = clang_rt,
             .cc = try fsutil.which(a, cfg.cc, path_env),
             .cxx = try fsutil.which(a, cfg.cxx, path_env),
@@ -107,96 +108,96 @@ pub const Toolchain = struct {
 
     /// clang flags for one C-family source (without -c/-o).
     pub fn cflags(t: *const Toolchain, target: config.Target, lang: Lang, module_cache: []const u8) ![]const []const u8 {
-        var f = std.ArrayList([]const u8).init(t.a);
-        try f.appendSlice(&.{ "-target", try t.triple(target), "-isysroot", t.sdk.?, target.opt, if (target.debug_symbols) "-g" else "-g0", "-fmodules", try std.fmt.allocPrint(t.a, "-fmodules-cache-path={s}", .{module_cache}), "-fno-common", "-MMD", "-MP" });
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.appendSlice(t.a, &.{ "-target", try t.triple(target), "-isysroot", t.sdk.?, target.opt, if (target.debug_symbols) "-g" else "-g0", "-fmodules", try std.fmt.allocPrint(t.a, "-fmodules-cache-path={s}", .{module_cache}), "-fno-common", "-MMD", "-MP" });
         switch (lang) {
-            .objc => try f.appendSlice(&.{ "-fobjc-arc", "-fobjc-weak", "-std=gnu17" }),
-            .cxx => try f.appendSlice(&.{ "-std=gnu++20", "-stdlib=libc++" }),
-            .objcxx => try f.appendSlice(&.{ "-fobjc-arc", "-fobjc-weak", "-std=gnu++20", "-stdlib=libc++" }),
+            .objc => try f.appendSlice(t.a, &.{ "-fobjc-arc", "-fobjc-weak", "-std=gnu17" }),
+            .cxx => try f.appendSlice(t.a, &.{ "-std=gnu++20", "-stdlib=libc++" }),
+            .objcxx => try f.appendSlice(t.a, &.{ "-fobjc-arc", "-fobjc-weak", "-std=gnu++20", "-stdlib=libc++" }),
             .c, .asm_, .swift => {},
         }
-        for (target.include_dirs) |inc| try f.appendSlice(&.{ "-I", try target.path(t.a, inc) });
-        for (target.quote_include_dirs) |d| try f.appendSlice(&.{ "-iquote", try target.path(t.a, d) });
-        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
-        if (target.type == .appex) try f.append("-fapplication-extension");
-        for (target.defines) |d| try f.append(try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
-        try f.appendSlice(target.cflags);
+        for (target.include_dirs) |inc| try f.appendSlice(t.a, &.{ "-I", try target.path(t.a, inc) });
+        for (target.quote_include_dirs) |d| try f.appendSlice(t.a, &.{ "-iquote", try target.path(t.a, d) });
+        for (target.framework_dirs) |d| try f.appendSlice(t.a, &.{ "-F", try target.path(t.a, d) });
+        if (target.type == .appex) try f.append(t.a, "-fapplication-extension");
+        for (target.defines) |d| try f.append(t.a, try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
+        try f.appendSlice(t.a, target.cflags);
         return f.items;
     }
 
     pub fn swiftflags(t: *const Toolchain, target: config.Target, module_cache: []const u8) ![]const []const u8 {
-        var f = std.ArrayList([]const u8).init(t.a);
-        try f.appendSlice(&.{
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.appendSlice(t.a, &.{
             "-target",        try t.triple(target), "-sdk",               t.sdk.?,
             "-resource-dir",  t.swift_resource_dir, "-I",                 t.platform_lib_dir,
             "-L",             t.platform_lib_dir,   "-module-cache-path", module_cache,
             target.swift_opt, "-wmo",               "-suppress-warnings", "-module-name",
             target.name,
         });
-        if (target.debug_symbols) try f.append("-g");
-        if (target.bridging_header) |h| try f.appendSlice(&.{ "-import-objc-header", try target.path(t.a, h) });
-        for (target.include_dirs) |inc| try f.appendSlice(&.{ "-I", try target.path(t.a, inc) });
-        for (target.quote_include_dirs) |d| try f.appendSlice(&.{ "-Xcc", "-iquote", "-Xcc", try target.path(t.a, d) });
-        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
-        if (target.type == .appex) try f.append("-application-extension");
+        if (target.debug_symbols) try f.append(t.a, "-g");
+        if (target.bridging_header) |h| try f.appendSlice(t.a, &.{ "-import-objc-header", try target.path(t.a, h) });
+        for (target.include_dirs) |inc| try f.appendSlice(t.a, &.{ "-I", try target.path(t.a, inc) });
+        for (target.quote_include_dirs) |d| try f.appendSlice(t.a, &.{ "-Xcc", "-iquote", "-Xcc", try target.path(t.a, d) });
+        for (target.framework_dirs) |d| try f.appendSlice(t.a, &.{ "-F", try target.path(t.a, d) });
+        if (target.type == .appex) try f.append(t.a, "-application-extension");
         // Swift conditions are flags only; NAME=VALUE defines apply to C-family code.
-        for (target.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try f.append(try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
-        try f.appendSlice(target.swiftflags);
+        for (target.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try f.append(t.a, try std.fmt.allocPrint(t.a, "-D{s}", .{d}));
+        try f.appendSlice(t.a, target.swiftflags);
         return f.items;
     }
 
     /// Linker inputs shared by clang and swiftc drivers: frameworks, libraries, extra flags.
     fn linkInputs(t: *const Toolchain, f: *std.ArrayList([]const u8), target: config.Target, need_cxx: bool) !void {
-        for (target.framework_dirs) |d| try f.appendSlice(&.{ "-F", try target.path(t.a, d) });
-        for (target.frameworks) |fw| try f.appendSlice(&.{ "-framework", stripFramework(fw) });
-        for (target.weak_frameworks) |fw| try f.appendSlice(&.{ "-weak_framework", stripFramework(fw) });
-        for (target.libraries) |l| try f.append(try std.fmt.allocPrint(t.a, "-l{s}", .{l}));
-        if (need_cxx) try f.append("-lc++");
+        for (target.framework_dirs) |d| try f.appendSlice(t.a, &.{ "-F", try target.path(t.a, d) });
+        for (target.frameworks) |fw| try f.appendSlice(t.a, &.{ "-framework", stripFramework(fw) });
+        for (target.weak_frameworks) |fw| try f.appendSlice(t.a, &.{ "-weak_framework", stripFramework(fw) });
+        for (target.libraries) |l| try f.append(t.a, try std.fmt.allocPrint(t.a, "-l{s}", .{l}));
+        if (need_cxx) try f.append(t.a, "-lc++");
         // Xcode's default LD_RUNPATH_SEARCH_PATHS, so embedded frameworks resolve.
-        try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/Frameworks" });
+        try f.appendSlice(t.a, &.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/Frameworks" });
         switch (target.type) {
             .framework, .dylib => {
-                if (target.type == .framework) try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks" });
+                if (target.type == .framework) try f.appendSlice(t.a, &.{ "-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks" });
                 const install = if (target.type == .framework)
                     try std.fmt.allocPrint(t.a, "@rpath/{s}.framework/{s}", .{ target.name, target.name })
                 else
                     try std.fmt.allocPrint(t.a, "@rpath/{s}.dylib", .{target.name});
-                try f.appendSlice(&.{ "-Xlinker", "-install_name", "-Xlinker", install });
+                try f.appendSlice(t.a, &.{ "-Xlinker", "-install_name", "-Xlinker", install });
             },
             // Extensions live in <app>/PlugIns/<name>.appex and load the app's frameworks.
-            .appex => try f.appendSlice(&.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../Frameworks", "-Xlinker", "-application_extension" }),
+            .appex => try f.appendSlice(t.a, &.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../Frameworks", "-Xlinker", "-application_extension" }),
             .app, .static => {},
         }
-        if (target.dead_strip) try f.appendSlice(&.{ "-Xlinker", "-dead_strip" });
-        for (target.ldflags) |l| try f.appendSlice(&.{ "-Xlinker", l });
+        if (target.dead_strip) try f.appendSlice(t.a, &.{ "-Xlinker", "-dead_strip" });
+        for (target.ldflags) |l| try f.appendSlice(t.a, &.{ "-Xlinker", l });
     }
 
     pub fn clangLink(t: *const Toolchain, target: config.Target, objects: []const []const u8, out: []const u8, need_cxx: bool) ![]const []const u8 {
-        var f = std.ArrayList([]const u8).init(t.a);
-        try f.appendSlice(&.{
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.appendSlice(t.a, &.{
             if (need_cxx) t.cxx orelse t.cc.? else t.cc.?, "-target",                                               try t.triple(target), "-isysroot", t.sdk.?,
             "-fuse-ld=lld",                                try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}), "-Wl,-headerpad_max_install_names", t.clang_rt.?,
         });
-        if (target.type == .framework or target.type == .dylib) try f.append("-dynamiclib");
-        try f.appendSlice(objects);
-        try f.appendSlice(&.{ "-o", out });
+        if (target.type == .framework or target.type == .dylib) try f.append(t.a, "-dynamiclib");
+        try f.appendSlice(t.a, objects);
+        try f.appendSlice(t.a, &.{ "-o", out });
         try t.linkInputs(&f, target, need_cxx);
         return f.items;
     }
 
     pub fn swiftLink(t: *const Toolchain, target: config.Target, module_cache: []const u8, swift_sources: []const []const u8, objects: []const []const u8, out: []const u8, need_cxx: bool) ![]const []const u8 {
-        var f = std.ArrayList([]const u8).init(t.a);
-        try f.append(t.swiftc.?);
-        try f.appendSlice(try t.swiftflags(target, module_cache));
-        try f.appendSlice(&.{
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.append(t.a, t.swiftc.?);
+        try f.appendSlice(t.a, try t.swiftflags(target, module_cache));
+        try f.appendSlice(t.a, &.{
             "-use-ld=lld", try std.fmt.allocPrint(t.a, "-ld-path={s}", .{t.ld64}),
             "-Xlinker",    "-headerpad_max_install_names",
             "-Xlinker",    t.clang_rt.?,
         });
-        if (target.type == .framework or target.type == .dylib) try f.append("-emit-library");
-        try f.appendSlice(swift_sources);
-        try f.appendSlice(objects);
-        try f.appendSlice(&.{ "-o", out });
+        if (target.type == .framework or target.type == .dylib) try f.append(t.a, "-emit-library");
+        try f.appendSlice(t.a, swift_sources);
+        try f.appendSlice(t.a, objects);
+        try f.appendSlice(t.a, &.{ "-o", out });
         try t.linkInputs(&f, target, need_cxx);
         return f.items;
     }
@@ -213,14 +214,14 @@ pub const Toolchain = struct {
 
     fn identityWithArg(t: *Toolchain, path: []const u8, probe_arg: ?[]const u8) ![]const u8 {
         if (t.identities.get(path)) |id| return id;
-        const resolved = std.fs.cwd().realpathAlloc(t.a, path) catch return diag.fail("missing tool: {s}", .{path});
+        const resolved = sys.realpath(t.a, path) catch return diag.fail("missing tool: {s}", .{path});
         var f: @import("buildstate.zig").Fingerprint = .{};
         f.add(path);
         f.add(try @import("buildstate.zig").treeDigest(t.a, resolved));
         if (probe_arg) |arg| {
-            const result = std.process.Child.run(.{ .allocator = t.a, .argv = &.{ path, arg }, .env_map = &t.env, .max_output_bytes = 1 << 20 }) catch |err|
+            const result = sys.run(t.a, &.{ path, arg }, .{ .env = &t.env, .max_output_bytes = 1 << 20 }) catch |err|
                 return diag.fail("cannot execute {s}: {s}", .{ path, @errorName(err) });
-            if (result.term != .Exited or result.term.Exited != 0)
+            if (!sys.succeeded(result.term))
                 return diag.fail("{s} {s} failed; check the executable and shared runtime: {s}", .{ path, arg, result.stderr });
             f.add(result.stdout);
             f.add(result.stderr);
@@ -231,7 +232,7 @@ pub const Toolchain = struct {
     }
 
     pub fn selfIdentity(t: *Toolchain) ![]const u8 {
-        return t.identity(try std.fs.selfExePathAlloc(t.a), false);
+        return t.identity(try sys.selfExePath(t.a), false);
     }
 
     // ------------------------------------------------------------- ldid
@@ -250,8 +251,8 @@ pub const Toolchain = struct {
         if (try fsutil.which(t.a, p, t.pathEnv())) |found| return found;
         if (std.mem.indexOfScalar(u8, p, '/') != null) return null;
         // `zig build actool` installs it next to idl.
-        const self_dir = std.fs.selfExeDirPathAlloc(t.a) catch return null;
-        const sibling = try std.fs.path.join(t.a, &.{ self_dir, p });
+        const self_dir = sys.selfExeDirPath(t.a) catch return null;
+        const sibling = try std.Io.Dir.path.join(t.a, &.{ self_dir, p });
         return if (fsutil.kindFollow(sibling) == .file) sibling else null;
     }
 
@@ -271,14 +272,14 @@ pub const Toolchain = struct {
 
     /// The SDK bundle's XcodeDefault.xctoolchain (`--toolchain-dir`).
     pub fn xcodeToolchainDir(t: *const Toolchain) ![]const u8 {
-        return std.fs.path.join(t.a, &.{ t.sdk_bundle, "Developer/Toolchains/XcodeDefault.xctoolchain" });
+        return std.Io.Dir.path.join(t.a, &.{ t.sdk_bundle, "Developer/Toolchains/XcodeDefault.xctoolchain" });
     }
 
     /// ProductBuildVersion of the Xcode the SDK bundle was made from (`--xcode-version`),
     /// recorded as the metadata's toolsVersion.
     pub fn xcodeBuildVersion(t: *const Toolchain) []const u8 {
         const fallback = "16A242d";
-        const path = std.fs.path.join(t.a, &.{ t.sdk_bundle, "Xcode.app/Contents/version.plist" }) catch return fallback;
+        const path = std.Io.Dir.path.join(t.a, &.{ t.sdk_bundle, "Xcode.app/Contents/version.plist" }) catch return fallback;
         const p = plist.readFile(t.a, path) catch return fallback;
         defer p.deinit();
         const v = (p.getString(t.a, "ProductBuildVersion") catch null) orelse return fallback;
@@ -288,7 +289,8 @@ pub const Toolchain = struct {
     // ------------------------------------------------------------ check
 
     pub fn check(t: *const Toolchain) !bool {
-        const out = std.io.getStdOut().writer();
+        var stdout_w = sys.stdoutWriter();
+        const out = &stdout_w.interface;
         var ok = true;
         const Row = struct { []const u8, ?[]const u8, bool };
         const rows = [_]Row{
@@ -356,22 +358,22 @@ fn versionLess(l: []const u8, r: []const u8) bool {
 
 /// Entry in `dir` named `<prefix>*<suffix>` with the highest version; absolute path.
 fn newestEntry(a: Allocator, dir_path: []const u8, prefix: []const u8, suffix: []const u8) !?[]const u8 {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close();
+    var dir = sys.cwd().openDir(sys.io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(sys.io);
     var best: ?[]const u8 = null;
     var it = dir.iterate();
-    while (try it.next()) |e| {
+    while (try it.next(sys.io)) |e| {
         if (!std.mem.startsWith(u8, e.name, prefix) or !std.mem.endsWith(u8, e.name, suffix)) continue;
         if (e.name.len < prefix.len + suffix.len) continue;
         const ver = e.name[prefix.len .. e.name.len - suffix.len];
         if (best == null or versionLess(best.?[prefix.len .. best.?.len - suffix.len], ver)) best = try a.dupe(u8, e.name);
     }
-    return if (best) |b| try std.fs.path.join(a, &.{ dir_path, b }) else null;
+    return if (best) |b| try std.Io.Dir.path.join(a, &.{ dir_path, b }) else null;
 }
 
 fn sdkVersion(a: Allocator, sdk: []const u8) ?[]const u8 {
-    const path = std.fs.path.join(a, &.{ sdk, "SDKSettings.json" }) catch return null;
-    const bytes = std.fs.cwd().readFileAlloc(a, path, 16 << 20) catch return null;
+    const path = std.Io.Dir.path.join(a, &.{ sdk, "SDKSettings.json" }) catch return null;
+    const bytes = sys.readFile(a, path, 16 << 20) catch return null;
     const v = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return null;
     if (v != .object) return null;
     const ver = v.object.get("Version") orelse return null;

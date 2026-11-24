@@ -5,6 +5,7 @@
 //! invocations a build uses, generates their configurations from idlproj.yml,
 //! runs them in parallel and merges their diagnostics into one report.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const config = @import("config.zig");
@@ -32,14 +33,12 @@ pub const Task = struct {
     spawn_error: ?[]const u8 = null,
 };
 
-fn runOne(task: *Task, env: *const std.process.EnvMap) void {
+fn runOne(task: *Task, env: *const std.process.Environ.Map) void {
     // The arena is not thread-safe; children use the page allocator and their
     // output simply lives until exit.
-    const r = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = task.argv,
+    const r = sys.run(std.heap.page_allocator, task.argv, .{
         .cwd = task.cwd,
-        .env_map = env,
+        .env = env,
         .max_output_bytes = 256 << 20,
     }) catch |err| {
         task.spawn_error = @errorName(err);
@@ -47,18 +46,30 @@ fn runOne(task: *Task, env: *const std.process.EnvMap) void {
     };
     task.stdout = r.stdout;
     task.stderr = r.stderr;
-    task.ok = r.term == .Exited and r.term.Exited == 0;
+    task.ok = sys.succeeded(r.term);
 }
 
 fn runAll(a: Allocator, tc: *Toolchain, tasks: []Task, jobs: usize, verbose: bool) !void {
     if (tasks.len == 0) return;
     if (verbose) for (tasks) |t| diag.info("  {s}", .{try std.mem.join(a, " ", t.argv)});
-    var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = if (jobs > 0) jobs else @max(1, std.Thread.getCpuCount() catch 4) });
-    defer pool.deinit();
-    var wg: std.Thread.WaitGroup = .{};
-    for (tasks) |*t| pool.spawnWg(&wg, runOne, .{ t, &tc.env });
-    pool.waitAndWork(&wg);
+    // A fixed set of worker threads pulls tasks in order.
+    const Worker = struct {
+        fn work(ts: []Task, next: *std.atomic.Value(usize), env: *const std.process.Environ.Map) void {
+            while (true) {
+                const i = next.fetchAdd(1, .monotonic);
+                if (i >= ts.len) return;
+                runOne(&ts[i], env);
+            }
+        }
+    };
+    var next = std.atomic.Value(usize).init(0);
+    const threads = try a.alloc(std.Thread, @min(tasks.len, if (jobs > 0) jobs else @max(1, sys.cpuCount())));
+    var started: usize = 0;
+    defer for (threads[0..started]) |th| th.join();
+    for (threads) |*th| {
+        th.* = try std.Thread.spawn(.{}, Worker.work, .{ tasks, &next, &tc.env });
+        started += 1;
+    }
 }
 
 // ---------------------------------------------------------- diagnostics
@@ -111,7 +122,7 @@ fn splitFlag(message: []const u8) struct { []const u8, []const u8 } {
     if (std.mem.endsWith(u8, message, "]")) if (std.mem.lastIndexOf(u8, message, " [")) |i|
         return .{ message[0..i], message[i + 2 .. message.len - 1] };
     if (std.mem.startsWith(u8, message, "[")) if (std.mem.indexOfScalar(u8, message, ']')) |i|
-        return .{ std.mem.trimLeft(u8, message[i + 1 ..], " "), message[1..i] };
+        return .{ std.mem.trimStart(u8, message[i + 1 ..], " "), message[1..i] };
     return .{ message, "" };
 }
 
@@ -124,23 +135,23 @@ fn isNoise(line: []const u8) bool {
 fn parseOutput(a: Allocator, tool: []const u8, text: []const u8, cwd: []const u8, out: *std.ArrayList(Diagnostic)) !usize {
     var count: usize = 0;
     var current: ?usize = null;
-    var detail = std.ArrayList(u8).init(a);
+    var detail: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
-        const line = std.mem.trimRight(u8, raw, "\r");
+        const line = std.mem.trimEnd(u8, raw, "\r");
         if (parseHeader(line)) |h| {
-            if (current) |i| out.items[i].detail = try detail.toOwnedSlice();
+            if (current) |i| out.items[i].detail = try detail.toOwnedSlice(a);
             if (std.mem.eql(u8, h.kind, "note") or std.mem.eql(u8, h.kind, "remark")) {
                 if (current != null) {
-                    try detail.appendSlice(line);
-                    try detail.append('\n');
+                    try detail.appendSlice(a, line);
+                    try detail.append(a, '\n');
                 }
                 continue;
             }
             const msg, const flag = splitFlag(h.message);
-            try out.append(.{
+            try out.append(a, .{
                 .tool = tool,
-                .file = try std.fs.path.resolve(a, &.{ cwd, h.file }),
+                .file = try sys.resolve(a, &.{ cwd, h.file }),
                 .line = h.line,
                 .col = h.col,
                 .severity = if (std.mem.eql(u8, h.kind, "warning")) .warning else .@"error",
@@ -151,11 +162,11 @@ fn parseOutput(a: Allocator, tool: []const u8, text: []const u8, cwd: []const u8
             current = out.items.len - 1;
             count += 1;
         } else if (current != null and !isNoise(line)) {
-            try detail.appendSlice(line);
-            try detail.append('\n');
+            try detail.appendSlice(a, line);
+            try detail.append(a, '\n');
         }
     }
-    if (current) |i| out.items[i].detail = try detail.toOwnedSlice();
+    if (current) |i| out.items[i].detail = try detail.toOwnedSlice(a);
     return count;
 }
 
@@ -163,14 +174,14 @@ fn parseOutput(a: Allocator, tool: []const u8, text: []const u8, cwd: []const u8
 /// diagnostics is reported as an error of its own.
 fn collect(a: Allocator, task: Task, out: *std.ArrayList(Diagnostic)) !void {
     if (task.spawn_error) |e| {
-        try out.append(.{ .tool = task.tool, .file = task.label, .line = 0, .col = 0, .severity = .@"error", .message = try std.fmt.allocPrint(a, "cannot run {s}: {s}", .{ task.argv[0], e }), .flag = "", .detail = "" });
+        try out.append(a, .{ .tool = task.tool, .file = task.label, .line = 0, .col = 0, .severity = .@"error", .message = try std.fmt.allocPrint(a, "cannot run {s}: {s}", .{ task.argv[0], e }), .flag = "", .detail = "" });
         return;
     }
     var n = try parseOutput(a, task.tool, task.stderr, task.cwd, out);
     n += try parseOutput(a, task.tool, task.stdout, task.cwd, out);
     if (!task.ok and n == 0) {
         const tail = std.mem.trim(u8, if (task.stderr.len > 0) task.stderr else task.stdout, " \n");
-        try out.append(.{ .tool = task.tool, .file = task.label, .line = 0, .col = 0, .severity = .@"error", .message = "tool failed without diagnostics", .flag = "", .detail = if (tail.len > 2000) tail[tail.len - 2000 ..] else tail });
+        try out.append(a, .{ .tool = task.tool, .file = task.label, .line = 0, .col = 0, .severity = .@"error", .message = "tool failed without diagnostics", .flag = "", .detail = if (tail.len > 2000) tail[tail.len - 2000 ..] else tail });
     }
 }
 
@@ -186,7 +197,7 @@ fn diagLess(_: void, l: Diagnostic, r: Diagnostic) bool {
 /// units) and drop diagnostics outside the project or in excluded paths.
 fn finalize(a: Allocator, items: []Diagnostic, root: []const u8, excluded: *const fn (ctx: *const anyopaque, abs: []const u8) bool, ctx: *const anyopaque) ![]Diagnostic {
     std.mem.sort(Diagnostic, items, {}, diagLess);
-    var out = std.ArrayList(Diagnostic).init(a);
+    var out: std.ArrayList(Diagnostic) = .empty;
     var seen = std.StringHashMap(void).init(a);
     for (items) |d| {
         if (d.line > 0) {
@@ -196,7 +207,7 @@ fn finalize(a: Allocator, items: []Diagnostic, root: []const u8, excluded: *cons
         const key = try std.fmt.allocPrint(a, "{s}|{s}|{d}|{d}|{s}", .{ d.tool, d.file, d.line, d.col, d.message });
         if (seen.contains(key)) continue;
         try seen.put(key, {});
-        try out.append(d);
+        try out.append(a, d);
     }
     return out.items;
 }
@@ -204,12 +215,13 @@ fn finalize(a: Allocator, items: []Diagnostic, root: []const u8, excluded: *cons
 const Totals = struct { errors: usize = 0, warnings: usize = 0 };
 
 fn report(a: Allocator, diags: []const Diagnostic, root: []const u8, quiet: bool, max: ?usize) !Totals {
-    const w = std.io.getStdOut().writer();
+    var stdout_w = sys.stdoutWriter();
+    const w = &stdout_w.interface;
     var totals: Totals = .{};
-    var per_tool = std.StringArrayHashMap(Totals).init(a);
-    var per_flag = std.StringArrayHashMap(usize).init(a);
+    var per_tool: std.array_hash_map.String(Totals) = .empty;
+    var per_flag: std.array_hash_map.String(usize) = .empty;
     for (diags, 0..) |d, i| {
-        const t = try per_tool.getOrPutValue(d.tool, .{});
+        const t = try per_tool.getOrPutValue(a, d.tool, .{});
         switch (d.severity) {
             .@"error" => {
                 totals.errors += 1;
@@ -220,7 +232,7 @@ fn report(a: Allocator, diags: []const Diagnostic, root: []const u8, quiet: bool
                 t.value_ptr.warnings += 1;
             },
         }
-        if (d.flag.len > 0) (try per_flag.getOrPutValue(d.flag, 0)).value_ptr.* += 1;
+        if (d.flag.len > 0) (try per_flag.getOrPutValue(a, d.flag, 0)).value_ptr.* += 1;
         if (quiet or (max != null and i >= max.?)) continue;
         const rel = if (std.mem.startsWith(u8, d.file, root) and d.file.len > root.len) d.file[root.len + 1 ..] else d.file;
         if (d.line > 0) {
@@ -236,8 +248,8 @@ fn report(a: Allocator, diags: []const Diagnostic, root: []const u8, quiet: bool
     if (per_tool.count() == 0) try w.writeAll("  no diagnostics\n");
     if (per_flag.count() > 0) {
         const Entry = struct { []const u8, usize };
-        var flags = std.ArrayList(Entry).init(a);
-        for (per_flag.keys(), per_flag.values()) |k, v| try flags.append(.{ k, v });
+        var flags: std.ArrayList(Entry) = .empty;
+        for (per_flag.keys(), per_flag.values()) |k, v| try flags.append(a, .{ k, v });
         std.mem.sort(Entry, flags.items, {}, struct {
             fn less(_: void, l: Entry, r: Entry) bool {
                 return l[1] > r[1] or (l[1] == r[1] and std.mem.lessThan(u8, l[0], r[0]));
@@ -269,12 +281,12 @@ fn emitYaml(w: anytype, n: ynode.Node, indent: usize) anyerror!void {
         .list => |items| {
             try w.writeByte('\n');
             for (items) |item| {
-                try w.writeByteNTimes(' ', indent);
+                try w.splatByteAll(' ', indent);
                 try w.writeAll("- ");
                 if (item == .map) {
                     // first key inline after "- "
                     for (item.map.keys, item.map.values, 0..) |k, v, i| {
-                        if (i > 0) try w.writeByteNTimes(' ', indent + 2);
+                        if (i > 0) try w.splatByteAll(' ', indent + 2);
                         try w.print("{s}: ", .{k});
                         try emitYaml(w, v, indent + 4);
                     }
@@ -284,7 +296,7 @@ fn emitYaml(w: anytype, n: ynode.Node, indent: usize) anyerror!void {
         .map => |m| {
             try w.writeByte('\n');
             for (m.keys, m.values) |k, v| {
-                try w.writeByteNTimes(' ', indent);
+                try w.splatByteAll(' ', indent);
                 try w.print("{s}: ", .{k});
                 try emitYaml(w, v, indent + 2);
             }
@@ -309,8 +321,8 @@ fn jsonValue(a: Allocator, n: ynode.Node) !std.json.Value {
             break :blk .{ .array = arr };
         },
         .map => |m| blk: {
-            var obj = std.json.ObjectMap.init(a);
-            for (m.keys, m.values) |k, v| try obj.put(k, try jsonValue(a, v));
+            var obj: std.json.ObjectMap = .empty;
+            for (m.keys, m.values) |k, v| try obj.put(a, k, try jsonValue(a, v));
             break :blk .{ .object = obj };
         },
     };
@@ -323,13 +335,13 @@ fn deepMerge(a: Allocator, base: *std.json.ObjectMap, over: std.json.ObjectMap) 
             try deepMerge(a, &old.object, e.value_ptr.object);
             continue;
         };
-        try base.put(e.key_ptr.*, e.value_ptr.*);
+        try base.put(a, e.key_ptr.*, e.value_ptr.*);
     }
 }
 
 pub fn clangFormatConfig(a: Allocator, t: Target) ![]const u8 {
-    var b = std.ArrayList(u8).init(a);
-    const w = b.writer();
+    var b: std.Io.Writer.Allocating = .init(a);
+    const w = &b.writer;
     try w.print("# {s}; edit `format:` there instead.\n", .{codegen.marker});
     const overrides = t.format.clang_format;
     const defaults = [_][2][]const u8{
@@ -350,7 +362,7 @@ pub fn clangFormatConfig(a: Allocator, t: Target) ![]const u8 {
         try w.print("{s}: ", .{k});
         try emitYaml(w, v, 2);
     };
-    return b.items;
+    return b.written();
 }
 
 /// Bug-finding checks with a low false-positive rate on Objective-C / C++ code.
@@ -366,37 +378,37 @@ pub fn clangTidyConfig(a: Allocator, t: Target) ![]const u8 {
 }
 
 pub fn swiftFormatConfig(a: Allocator, t: Target) ![]const u8 {
-    var root = std.json.ObjectMap.init(a);
-    try root.put("_generated", .{ .string = codegen.marker ++ "; edit `format:` there instead." });
-    try root.put("version", .{ .integer = 1 });
-    var indentation = std.json.ObjectMap.init(a);
-    try indentation.put("spaces", .{ .integer = try std.fmt.parseInt(i64, t.format.indent, 10) });
-    try root.put("indentation", .{ .object = indentation });
+    var root: std.json.ObjectMap = .empty;
+    try root.put(a, "_generated", .{ .string = codegen.marker ++ "; edit `format:` there instead." });
+    try root.put(a, "version", .{ .integer = 1 });
+    var indentation: std.json.ObjectMap = .empty;
+    try indentation.put(a, "spaces", .{ .integer = try std.fmt.parseInt(i64, t.format.indent, 10) });
+    try root.put(a, "indentation", .{ .object = indentation });
     const len = try std.fmt.parseInt(i64, t.format.line_length, 10);
-    try root.put("lineLength", .{ .integer = if (len == 0) 10000 else len });
-    try root.put("respectsExistingLineBreaks", .{ .bool = true });
-    try root.put("lineBreakBeforeEachArgument", .{ .bool = false });
-    try root.put("maximumBlankLines", .{ .integer = 2 });
+    try root.put(a, "lineLength", .{ .integer = if (len == 0) 10000 else len });
+    try root.put(a, "respectsExistingLineBreaks", .{ .bool = true });
+    try root.put(a, "lineBreakBeforeEachArgument", .{ .bool = false });
+    try root.put(a, "maximumBlankLines", .{ .integer = 2 });
     if (t.format.swift_format) |o| {
         const over = try jsonValue(a, .{ .map = o });
         try deepMerge(a, &root, over.object);
     }
-    var out = std.ArrayList(u8).init(a);
-    try std.json.stringify(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 }, out.writer());
-    try out.append('\n');
-    return out.items;
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 }, &out.writer);
+    try out.writer.writeByte('\n');
+    return out.written();
 }
 
 /// Tool configs in `<target dir>/.idl/quality/<target>/`, passed explicitly.
 const Configs = struct { clang_format: []const u8, clang_tidy: []const u8, swift_format: []const u8 };
 
 fn writeConfigs(a: Allocator, t: Target) !Configs {
-    const dir = try std.fs.path.join(a, &.{ t.dir, ".idl", "quality", t.name });
-    try std.fs.cwd().makePath(dir);
+    const dir = try std.Io.Dir.path.join(a, &.{ t.dir, ".idl", "quality", t.name });
+    try sys.makePath(dir);
     const c: Configs = .{
-        .clang_format = try std.fs.path.join(a, &.{ dir, "clang-format.yml" }),
-        .clang_tidy = try std.fs.path.join(a, &.{ dir, "clang-tidy.yml" }),
-        .swift_format = try std.fs.path.join(a, &.{ dir, "swift-format.json" }),
+        .clang_format = try std.Io.Dir.path.join(a, &.{ dir, "clang-format.yml" }),
+        .clang_tidy = try std.Io.Dir.path.join(a, &.{ dir, "clang-tidy.yml" }),
+        .swift_format = try std.Io.Dir.path.join(a, &.{ dir, "swift-format.json" }),
     };
     _ = try fsutil.writeIfChanged(a, c.clang_format, try clangFormatConfig(a, t));
     _ = try fsutil.writeIfChanged(a, c.clang_tidy, try clangTidyConfig(a, t));
@@ -444,9 +456,9 @@ fn excludedAny(ctx_ptr: *const anyopaque, abs: []const u8) bool {
 }
 
 fn chunks(a: Allocator, items: []const []const u8, n: usize) ![]const []const []const u8 {
-    var out = std.ArrayList([]const []const u8).init(a);
+    var out: std.ArrayList([]const []const u8) = .empty;
     var i: usize = 0;
-    while (i < items.len) : (i += n) try out.append(items[i..@min(items.len, i + n)]);
+    while (i < items.len) : (i += n) try out.append(a, items[i..@min(items.len, i + n)]);
     return out.items;
 }
 
@@ -460,29 +472,29 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
     const clang_format = try findTool(a, tc, tc.cfg.clang_format);
     const swift_format = try findTool(a, tc, tc.cfg.swift_format);
     var seen = std.StringHashMap(void).init(a);
-    var tasks = std.ArrayList(Task).init(a);
-    var originals = std.StringArrayHashMap([]const u8).init(a);
+    var tasks: std.ArrayList(Task) = .empty;
+    var originals: std.array_hash_map.String([]const u8) = .empty;
     var skipped_c: usize = 0;
     var skipped_swift: usize = 0;
     for (targets) |t| {
         const cfgs = try writeConfigs(a, t);
-        var c_files = std.ArrayList([]const u8).init(a);
-        var swift_files = std.ArrayList([]const u8).init(a);
+        var c_files: std.ArrayList([]const u8) = .empty;
+        var swift_files: std.ArrayList([]const u8) = .empty;
         for (try fsutil.discover(a, t.dir, t.sources, "source")) |rel| {
             const abs = try t.path(a, rel);
             if (excludedBy(a, t, t.format.exclude, abs) or seen.contains(abs)) continue;
             try seen.put(abs, {});
             const sfx = fsutil.suffix(rel);
-            if (std.mem.eql(u8, sfx, ".swift")) try swift_files.append(abs) else if (fsutil.oneOf(sfx, &c_like)) try c_files.append(abs) else continue;
-            if (!opts.check) try originals.put(abs, try std.fs.cwd().readFileAlloc(a, abs, 64 << 20));
+            if (std.mem.eql(u8, sfx, ".swift")) try swift_files.append(a, abs) else if (fsutil.oneOf(sfx, &c_like)) try c_files.append(a, abs) else continue;
+            if (!opts.check) try originals.put(a, abs, try sys.readFile(a, abs, 64 << 20));
         }
         if (c_files.items.len > 0) if (clang_format) |cf| {
             const style = try std.fmt.allocPrint(a, "--style=file:{s}", .{cfgs.clang_format});
             for (try chunks(a, c_files.items, 40)) |chunk| {
-                var argv = std.ArrayList([]const u8).init(a);
-                try argv.appendSlice(if (opts.check) &.{ cf, "--dry-run", "-Werror", style } else &.{ cf, "-i", style });
-                try argv.appendSlice(chunk);
-                try tasks.append(.{ .tool = "clang-format", .argv = argv.items, .cwd = root, .label = t.name });
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.appendSlice(a, if (opts.check) &.{ cf, "--dry-run", "-Werror", style } else &.{ cf, "-i", style });
+                try argv.appendSlice(a, chunk);
+                try tasks.append(a, .{ .tool = "clang-format", .argv = argv.items, .cwd = root, .label = t.name });
             }
         } else {
             skipped_c += c_files.items.len;
@@ -490,12 +502,12 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
         if (swift_files.items.len > 0) if (swift_format) |sf| {
             if (opts.check) {
                 // Formatted output vs. the file; reported as one diagnostic per file.
-                for (swift_files.items) |f| try tasks.append(.{ .tool = "swift-format", .argv = try a.dupe([]const u8, &.{ sf, "format", "--configuration", cfgs.swift_format, f }), .cwd = root, .label = f });
+                for (swift_files.items) |f| try tasks.append(a, .{ .tool = "swift-format", .argv = try a.dupe([]const u8, &.{ sf, "format", "--configuration", cfgs.swift_format, f }), .cwd = root, .label = f });
             } else for (try chunks(a, swift_files.items, 40)) |chunk| {
-                var argv = std.ArrayList([]const u8).init(a);
-                try argv.appendSlice(&.{ sf, "format", "--in-place", "--configuration", cfgs.swift_format });
-                try argv.appendSlice(chunk);
-                try tasks.append(.{ .tool = "swift-format", .argv = argv.items, .cwd = root, .label = t.name });
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.appendSlice(a, &.{ sf, "format", "--in-place", "--configuration", cfgs.swift_format });
+                try argv.appendSlice(a, chunk);
+                try tasks.append(a, .{ .tool = "swift-format", .argv = argv.items, .cwd = root, .label = t.name });
             }
         } else {
             skipped_swift += swift_files.items.len;
@@ -508,8 +520,8 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
     // clang-format is not always idempotent in one pass (alignment that depends
     // on its own earlier changes); repeat until the files stop changing.
     if (!opts.check) {
-        var previous = std.StringArrayHashMap([]const u8).init(a);
-        for (originals.keys()) |path| try previous.put(path, std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch "");
+        var previous: std.array_hash_map.String([]const u8) = .empty;
+        for (originals.keys()) |path| try previous.put(a, path, sys.readFile(a, path, 64 << 20) catch "");
         var pass: usize = 1;
         while (pass < 4) : (pass += 1) {
             for (tasks.items) |*t| {
@@ -521,7 +533,7 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
             try runAll(a, tc, tasks.items, opts.jobs, false);
             var moved = false;
             for (previous.keys(), previous.values()) |path, *content| {
-                const now = std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch continue;
+                const now = sys.readFile(a, path, 64 << 20) catch continue;
                 if (!std.mem.eql(u8, now, content.*)) {
                     moved = true;
                     content.* = now;
@@ -531,13 +543,13 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
         }
     }
 
-    var diags = std.ArrayList(Diagnostic).init(a);
+    var diags: std.ArrayList(Diagnostic) = .empty;
     for (tasks.items) |task| {
         if (opts.check and std.mem.eql(u8, task.tool, "swift-format")) {
             if (task.ok) {
-                const current = try std.fs.cwd().readFileAlloc(a, task.label, 64 << 20);
+                const current = try sys.readFile(a, task.label, 64 << 20);
                 if (!std.mem.eql(u8, current, task.stdout))
-                    try diags.append(.{ .tool = "swift-format", .file = task.label, .line = 1, .col = 1, .severity = .@"error", .message = "code should be swift-formatted", .flag = "", .detail = "" });
+                    try diags.append(a, .{ .tool = "swift-format", .file = task.label, .line = 1, .col = 1, .severity = .@"error", .message = "code should be swift-formatted", .flag = "", .detail = "" });
                 continue;
             }
         }
@@ -545,14 +557,14 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
     }
     if (opts.check) {
         // One line per file is enough for a format check.
-        var per_file = std.ArrayList(Diagnostic).init(a);
+        var per_file: std.ArrayList(Diagnostic) = .empty;
         var files = std.StringHashMap(void).init(a);
         for (diags.items) |d| {
             if (d.line > 0 and files.contains(d.file)) continue;
             try files.put(d.file, {});
             var one = d;
             one.detail = "";
-            try per_file.append(one);
+            try per_file.append(a, one);
         }
         const ctx: ExcludeCtx = .{ .a = a, .targets = targets, .which = .format };
         const final = try finalize(a, per_file.items, root, excludedAny, &ctx);
@@ -561,7 +573,7 @@ pub fn fmt(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Targ
     }
     var changed: usize = 0;
     for (originals.keys(), originals.values()) |path, before| {
-        const after = std.fs.cwd().readFileAlloc(a, path, 64 << 20) catch continue;
+        const after = sys.readFile(a, path, 64 << 20) catch continue;
         if (!std.mem.eql(u8, before, after)) {
             changed += 1;
             if (opts.verbose) diag.info("  formatted {s}", .{path});
@@ -590,10 +602,10 @@ pub const LintOptions = struct {
 const dropped_c = [_][]const u8{ "-w", "-MMD", "-MP", "-Werror" };
 
 fn lintArgv(a: Allocator, argv: []const []const u8, skip_first: bool) !std.ArrayList([]const u8) {
-    var out = std.ArrayList([]const u8).init(a);
+    var out: std.ArrayList([]const u8) = .empty;
     for (argv[if (skip_first) 1 else 0..]) |arg| {
         if (fsutil.oneOf(arg, &dropped_c) or std.mem.startsWith(u8, arg, "-Werror=")) continue;
-        try out.append(arg);
+        try out.append(a, arg);
     }
     return out;
 }
@@ -602,8 +614,8 @@ fn lintArgv(a: Allocator, argv: []const []const u8, skip_first: bool) !std.Array
 pub fn lint(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Target, products: *builder.Products, opts: LintOptions) !bool {
     const clang_tidy = try findTool(a, tc, tc.cfg.clang_tidy);
     const swift_format = try findTool(a, tc, tc.cfg.swift_format);
-    var tasks = std.ArrayList(Task).init(a);
-    var tools_used = std.StringArrayHashMap(void).init(a);
+    var tasks: std.ArrayList(Task) = .empty;
+    var tools_used: std.array_hash_map.String(void) = .empty;
     for (targets) |t| {
         if (t.builder != .direct) {
             diag.warn("{s}: xtool targets are not linted", .{t.name});
@@ -618,53 +630,53 @@ pub fn lint(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Tar
             if (excludedBy(a, t, t.lint.exclude, src.path)) continue;
             // 1. compiler warnings with the target's real flags
             var argv = try lintArgv(a, src.argv, false);
-            try argv.appendSlice(t.lint.warnings);
-            try argv.appendSlice(&.{ "-fsyntax-only", src.path });
-            try tasks.append(.{ .tool = "clang", .argv = argv.items, .cwd = t.dir, .label = src.path });
-            try tools_used.put("clang", {});
+            try argv.appendSlice(a, t.lint.warnings);
+            try argv.appendSlice(a, &.{ "-fsyntax-only", src.path });
+            try tasks.append(a, .{ .tool = "clang", .argv = argv.items, .cwd = t.dir, .label = src.path });
+            try tools_used.put(a, "clang", {});
             // 2. static analyzer
             if (opts.analyze or t.lint.analyze) {
                 var an = try lintArgv(a, src.argv, false);
-                try an.appendSlice(&.{ "--analyze", "-Xanalyzer", "-analyzer-output=text", "-o", "/dev/null", src.path });
-                try tasks.append(.{ .tool = "analyzer", .argv = an.items, .cwd = t.dir, .label = src.path });
-                try tools_used.put("analyzer", {});
+                try an.appendSlice(a, &.{ "--analyze", "-Xanalyzer", "-analyzer-output=text", "-o", "/dev/null", src.path });
+                try tasks.append(a, .{ .tool = "analyzer", .argv = an.items, .cwd = t.dir, .label = src.path });
+                try tools_used.put(a, "analyzer", {});
             }
             // 3. clang-tidy, with the same flags after `--`
             if (want_tidy) if (clang_tidy) |tidy| {
-                var ti = std.ArrayList([]const u8).init(a);
-                try ti.appendSlice(&.{ tidy, "--quiet", try std.fmt.allocPrint(a, "--config-file={s}", .{cfgs.clang_tidy}), src.path, "--" });
-                try ti.appendSlice((try lintArgv(a, src.argv, true)).items);
-                try tasks.append(.{ .tool = "clang-tidy", .argv = ti.items, .cwd = t.dir, .label = src.path });
-                try tools_used.put("clang-tidy", {});
+                var ti: std.ArrayList([]const u8) = .empty;
+                try ti.appendSlice(a, &.{ tidy, "--quiet", try std.fmt.allocPrint(a, "--config-file={s}", .{cfgs.clang_tidy}), src.path, "--" });
+                try ti.appendSlice(a, (try lintArgv(a, src.argv, true)).items);
+                try tasks.append(a, .{ .tool = "clang-tidy", .argv = ti.items, .cwd = t.dir, .label = src.path });
+                try tools_used.put(a, "clang-tidy", {});
             };
         }
         if (inv.swift) |swift_argv| {
             // 4. Swift type-check with warnings on (one whole-module run)
-            var argv = std.ArrayList([]const u8).init(a);
-            for (swift_argv) |arg| if (!fsutil.oneOf(arg, &.{ "-suppress-warnings", "-warnings-as-errors" })) try argv.append(arg);
-            try argv.appendSlice(t.lint.swift_flags);
-            try argv.append("-typecheck");
-            try tasks.append(.{ .tool = "swiftc", .argv = argv.items, .cwd = t.dir, .label = t.name });
-            try tools_used.put("swiftc", {});
+            var argv: std.ArrayList([]const u8) = .empty;
+            for (swift_argv) |arg| if (!fsutil.oneOf(arg, &.{ "-suppress-warnings", "-warnings-as-errors" })) try argv.append(a, arg);
+            try argv.appendSlice(a, t.lint.swift_flags);
+            try argv.append(a, "-typecheck");
+            try tasks.append(a, .{ .tool = "swiftc", .argv = argv.items, .cwd = t.dir, .label = t.name });
+            try tools_used.put(a, "swiftc", {});
             // 5. swift-format style rules
             if (t.lint.swift_format) {
                 const sf = swift_format orelse return diag.fail("{s}: lint.swift_format is on but swift-format was not found ({s})", .{ t.name, tc.cfg.swift_format });
-                var files = std.ArrayList([]const u8).init(a);
-                for (inv.swift_files) |f| if (!excludedBy(a, t, t.lint.exclude, f)) try files.append(f);
+                var files: std.ArrayList([]const u8) = .empty;
+                for (inv.swift_files) |f| if (!excludedBy(a, t, t.lint.exclude, f)) try files.append(a, f);
                 for (try chunks(a, files.items, 60)) |chunk| {
-                    var sl = std.ArrayList([]const u8).init(a);
-                    try sl.appendSlice(&.{ sf, "lint", "--configuration", cfgs.swift_format });
-                    try sl.appendSlice(chunk);
-                    try tasks.append(.{ .tool = "swift-format", .argv = sl.items, .cwd = t.dir, .label = t.name });
+                    var sl: std.ArrayList([]const u8) = .empty;
+                    try sl.appendSlice(a, &.{ sf, "lint", "--configuration", cfgs.swift_format });
+                    try sl.appendSlice(a, chunk);
+                    try tasks.append(a, .{ .tool = "swift-format", .argv = sl.items, .cwd = t.dir, .label = t.name });
                 }
-                try tools_used.put("swift-format", {});
+                try tools_used.put(a, "swift-format", {});
             }
         }
     }
     if (clang_tidy == null) diag.info("note: clang-tidy not found ({s}); skipping that pass", .{tc.cfg.clang_tidy});
     diag.info("==> linting {d} target(s): {d} tool run(s) [{s}]", .{ targets.len, tasks.items.len, try std.mem.join(a, ", ", tools_used.keys()) });
     try runAll(a, tc, tasks.items, opts.jobs, opts.verbose);
-    var diags = std.ArrayList(Diagnostic).init(a);
+    var diags: std.ArrayList(Diagnostic) = .empty;
     for (tasks.items) |task| try collect(a, task, &diags);
     const ctx: ExcludeCtx = .{ .a = a, .targets = targets, .which = .lint };
     const final = try finalize(a, diags.items, root, excludedAny, &ctx);
@@ -691,7 +703,7 @@ const BundleCheck = struct {
     checked: usize = 0,
 
     fn add(b: *BundleCheck, sev: Severity, comptime f: []const u8, args: anytype) !void {
-        try b.issues.append(.{ .severity = sev, .msg = try std.fmt.allocPrint(b.a, f, args) });
+        try b.issues.append(b.a, .{ .severity = sev, .msg = try std.fmt.allocPrint(b.a, f, args) });
     }
 
     fn rel(b: *BundleCheck, path: []const u8) []const u8 {
@@ -734,9 +746,9 @@ const BundleCheck = struct {
             return false;
         }
         if (std.mem.startsWith(u8, dep, "@loader_path/"))
-            return fsutil.kind(try std.fs.path.resolve(b.a, &.{ loader_dir, dep["@loader_path/".len..] })) == .file;
+            return fsutil.kind(try sys.resolve(b.a, &.{ loader_dir, dep["@loader_path/".len..] })) == .file;
         if (std.mem.startsWith(u8, dep, "@executable_path/")) {
-            for (b.exe_dirs.items) |d| if (fsutil.kind(try std.fs.path.resolve(b.a, &.{ d, dep["@executable_path/".len..] })) == .file) return true;
+            for (b.exe_dirs.items) |d| if (fsutil.kind(try sys.resolve(b.a, &.{ d, dep["@executable_path/".len..] })) == .file) return true;
             return false;
         }
         return false;
@@ -759,14 +771,14 @@ const BundleCheck = struct {
             var buf: [32]u8 = undefined;
             try b.add(.@"error", "{s}: minimum iOS {s} is above the app's MinimumOSVersion {s}", .{ r, macho.formatVersion(&buf, v), b.min_os });
         };
-        const dir = std.fs.path.dirname(path).?;
-        var rpaths = std.ArrayList([]const u8).init(b.a);
+        const dir = std.Io.Dir.path.dirname(path).?;
+        var rpaths: std.ArrayList([]const u8) = .empty;
         for (info.rpaths) |rp| {
             if (std.mem.startsWith(u8, rp, "@loader_path")) {
-                try rpaths.append(try std.fs.path.resolve(b.a, &.{ dir, rp["@loader_path".len..] }));
+                try rpaths.append(b.a, try sys.resolve(b.a, &.{ dir, rp["@loader_path".len..] }));
             } else if (std.mem.startsWith(u8, rp, "@executable_path")) {
-                for (b.exe_dirs.items) |d| try rpaths.append(try std.fs.path.resolve(b.a, &.{ d, std.mem.trimLeft(u8, rp["@executable_path".len..], "/") }));
-            } else try rpaths.append(rp);
+                for (b.exe_dirs.items) |d| try rpaths.append(b.a, try sys.resolve(b.a, &.{ d, std.mem.trimStart(u8, rp["@executable_path".len..], "/") }));
+            } else try rpaths.append(b.a, rp);
         }
         for (info.dylibs) |dep| {
             const weak = for (info.weak_dylibs) |w| {
@@ -786,8 +798,8 @@ const BundleCheck = struct {
 
     fn checkBundle(b: *BundleCheck, dir: []const u8) !void {
         const r = b.rel(dir);
-        const label = if (r.len == 0 or std.mem.eql(u8, dir, b.app)) std.fs.path.basename(dir) else r;
-        const info_path = try std.fs.path.join(b.a, &.{ dir, "Info.plist" });
+        const label = if (r.len == 0 or std.mem.eql(u8, dir, b.app)) std.Io.Dir.path.basename(dir) else r;
+        const info_path = try std.Io.Dir.path.join(b.a, &.{ dir, "Info.plist" });
         const info = plist.readFile(b.a, info_path) catch {
             try b.add(.@"error", "{s}: missing or unreadable Info.plist", .{label});
             return;
@@ -795,7 +807,7 @@ const BundleCheck = struct {
         defer info.deinit();
         const exe = try info.getString(b.a, "CFBundleExecutable");
         if (exe) |e| {
-            if (fsutil.kind(try std.fs.path.join(b.a, &.{ dir, e })) != .file) try b.add(.@"error", "{s}: CFBundleExecutable {s} does not exist", .{ label, e });
+            if (fsutil.kind(try std.Io.Dir.path.join(b.a, &.{ dir, e })) != .file) try b.add(.@"error", "{s}: CFBundleExecutable {s} does not exist", .{ label, e });
         } else try b.add(.@"error", "{s}: no CFBundleExecutable", .{label});
         for ([_][]const u8{ "CFBundleVersion", "CFBundleShortVersionString" }) |k| {
             const node = try info.get(b.a, k);
@@ -812,23 +824,23 @@ const BundleCheck = struct {
     }
 
     fn walk(b: *BundleCheck, dir: []const u8) !void {
-        var d = try std.fs.cwd().openDir(dir, .{ .iterate = true, .no_follow = true });
-        defer d.close();
+        var d = try sys.cwd().openDir(sys.io, dir, .{ .iterate = true, .follow_symlinks = false });
+        defer d.close(sys.io);
         var it = d.iterate();
-        while (try it.next()) |e| {
-            const p = try std.fs.path.join(b.a, &.{ dir, e.name });
+        while (try it.next(sys.io)) |e| {
+            const p = try std.Io.Dir.path.join(b.a, &.{ dir, e.name });
             switch (e.kind) {
                 .directory => {
                     if (fsutil.oneOf(fsutil.suffix(e.name), &.{ ".appex", ".framework" })) try b.checkBundle(p);
                     try b.walk(p);
                 },
                 .file => {
-                    const f = try std.fs.cwd().openFile(p, .{});
-                    defer f.close();
+                    const f = try sys.cwd().openFile(sys.io, p, .{});
+                    defer f.close(sys.io);
                     var magic: [4]u8 = undefined;
-                    if (try f.readAll(&magic) < 4) continue;
+                    if (try f.readPositionalAll(sys.io, &magic, 0) < 4) continue;
                     const m = std.mem.readInt(u32, &magic, .little);
-                    if (m == 0xfeedfacf or m == 0xfeedface or m == 0xbebafeca) try b.checkMachO(p, try std.fs.cwd().readFileAlloc(b.a, p, 1 << 30));
+                    if (m == 0xfeedfacf or m == 0xfeedface or m == 0xbebafeca) try b.checkMachO(p, try sys.readFile(b.a, p, 1 << 30));
                 },
                 .sym_link => try b.add(.@"error", "{s}: symlink in bundle", .{b.rel(p)}),
                 else => {},
@@ -838,7 +850,7 @@ const BundleCheck = struct {
 };
 
 fn checkApp(a: Allocator, tc: *Toolchain, t: Target, app: []const u8) ![]const Issue {
-    const info = try plist.readFile(a, try std.fs.path.join(a, &.{ app, "Info.plist" }));
+    const info = try plist.readFile(a, try std.Io.Dir.path.join(a, &.{ app, "Info.plist" }));
     defer info.deinit();
     var b: BundleCheck = .{
         .a = a,
@@ -847,16 +859,16 @@ fn checkApp(a: Allocator, tc: *Toolchain, t: Target, app: []const u8) ![]const I
         .app_id = try a.dupe(u8, (try info.getString(a, "CFBundleIdentifier")) orelse t.bundle_id),
         .min_os = try a.dupe(u8, (try info.getString(a, "MinimumOSVersion")) orelse t.min_ios),
         .signed = t.signs(),
-        .exe_dirs = std.ArrayList([]const u8).init(a),
-        .issues = std.ArrayList(Issue).init(a),
+        .exe_dirs = .empty,
+        .issues = .empty,
     };
-    try b.exe_dirs.append(app);
-    const plugins = try std.fs.path.join(a, &.{ app, "PlugIns" });
-    if (std.fs.cwd().openDir(plugins, .{ .iterate = true })) |d_| {
+    try b.exe_dirs.append(a, app);
+    const plugins = try std.Io.Dir.path.join(a, &.{ app, "PlugIns" });
+    if (sys.cwd().openDir(sys.io, plugins, .{ .iterate = true })) |d_| {
         var d = d_;
-        defer d.close();
+        defer d.close(sys.io);
         var it = d.iterate();
-        while (try it.next()) |e| if (std.mem.endsWith(u8, e.name, ".appex")) try b.exe_dirs.append(try std.fs.path.join(a, &.{ plugins, e.name }));
+        while (try it.next(sys.io)) |e| if (std.mem.endsWith(u8, e.name, ".appex")) try b.exe_dirs.append(a, try std.Io.Dir.path.join(a, &.{ plugins, e.name }));
     } else |_| {}
     try b.checkBundle(app);
     try b.walk(app);
@@ -868,7 +880,8 @@ fn checkApp(a: Allocator, tc: *Toolchain, t: Target, app: []const u8) ![]const I
 /// Bundle checks for each app's built Payload, then its `tests:` commands.
 /// The targets must already be built.
 pub fn runTests(a: Allocator, tc: *Toolchain, apps: []const Target, opts: TestOptions) !bool {
-    const w = std.io.getStdOut().writer();
+    var stdout_w = sys.stdoutWriter();
+    const w = &stdout_w.interface;
     var failed: usize = 0;
     var passed: usize = 0;
     for (apps) |t| {
@@ -889,28 +902,24 @@ pub fn runTests(a: Allocator, tc: *Toolchain, apps: []const Target, opts: TestOp
             passed += 1;
             try w.print("PASS {s} bundle checks\n", .{t.name});
         }
-        var env = std.process.EnvMap.init(a);
+        var env = std.process.Environ.Map.init(a);
         var it = tc.env.iterator();
         while (it.next()) |kv| try env.put(kv.key_ptr.*, kv.value_ptr.*);
         try env.put("IDL_IPA", try t.ipaPath(a));
         try env.put("IDL_APP", app);
         try env.put("IDL_BUILD_DIR", build_dir);
         try env.put("IDL_TARGET", t.name);
-        try env.put("IDL", try std.fs.selfExePathAlloc(a));
+        try env.put("IDL", try sys.selfExePath(a));
         for (t.tests) |argv| {
             const label = try std.mem.join(a, " ", argv);
             diag.info("==> {s}: {s}", .{ t.name, label });
             if (opts.verbose) diag.info("  (cwd {s})", .{t.dir});
-            var child = std.process.Child.init(argv, a);
-            child.cwd = t.dir;
-            child.env_map = &env;
             const ok = blk: {
-                child.spawn() catch |err| {
+                var child = sys.spawn(argv, .{ .cwd = t.dir, .env = &env }) catch |err| {
                     diag.warn("cannot run {s}: {s}", .{ argv[0], @errorName(err) });
                     break :blk false;
                 };
-                const term = try child.wait();
-                break :blk term == .Exited and term.Exited == 0;
+                break :blk sys.succeeded(try sys.wait(&child));
             };
             if (ok) passed += 1 else failed += 1;
             try w.print("{s} {s}: {s}\n", .{ if (ok) "PASS" else "FAIL", t.name, label });
@@ -928,7 +937,7 @@ test "diagnostic headers, flags and details" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var out = std.ArrayList(Diagnostic).init(a);
+    var out: std.ArrayList(Diagnostic) = .empty;
     const text =
         \\Sources/a.m:12:5: warning: unused variable 'x' [-Wunused-variable]
         \\   12 |     int x;

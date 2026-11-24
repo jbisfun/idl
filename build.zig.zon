@@ -2,23 +2,23 @@
     .name = .idl,
     .version = "0.1.0",
     .fingerprint = 0xfdd2aa6d8a8624e1,
-    .minimum_zig_version = "0.14.1",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.10.0.tar.gz",
-            .hash = "clap-0.10.0-oBajB434AQBDh-Ei3YtoKIRxZacVPF1iSwp3IX_ZB8f0",
+            .url = "git+https://github.com/Hejsil/zig-clap#05faf3905e8548f5cc269a8836e154065e70128d",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
         },
         .yaml = .{
-            .url = "https://github.com/kubkon/zig-yaml/archive/refs/tags/0.1.1.tar.gz",
-            .hash = "zig_yaml-0.1.0-C1161miEAgBCwL3YAEQZwV_4GyaaT2Xqj9nKB6hNe_TL",
+            .url = "git+https://github.com/siketyan/zig-yaml#3613ef28e92455c76358958174c9204ea9fbb8f4",
+            .hash = "zig_yaml-0.3.0-C1161muYAgAoM158nWby6A6pqeFpBdye-7wh8qtq0r2g",
         },
         .libplist = .{
             .url = "git+https://github.com/libimobiledevice/libplist?ref=2.8.1#678b1a34693b86ae1787fa470dcb7203ffd0ef3f",
             .hash = "N-V-__8AAOJ8XABuk8XuBSKoGz6r5jr4yTsg5JmiG7SG-lof",
         },
         .xml = .{
-            .url = "git+https://github.com/ianprime0509/zig-xml#9f3eeea9dd7e5132cf55e48b97894c1fa6d298ea",
-            .hash = "xml-0.1.0-ZTbP37xkAgADF05rGyhfP4G7qg-gKsnevXdXCBhTUTB2",
+            .url = "git+https://github.com/ianprime0509/zig-xml?ref=0.2.2#4beab29d68ab308af4bd12a4fc4187c24fdad0d6",
+            .hash = "xml-0.2.2-ZTbP35N4AgAN3HBgWmBp_LAQ0MIPKW17GAGMwx4DHGYK",
         },
     },
     .paths = .{

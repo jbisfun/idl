@@ -48,7 +48,7 @@ pub fn buildVars(a: Allocator, t: Target) !plist.Vars {
 /// Info.plist with `info:` overrides applied, variables expanded and
 /// MinimumOSVersion forced to the target's deployment version. `generated`
 /// (keys produced by resource compilers, e.g. app icons) is merged last.
-pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.EnvMap, generated: ?plist.Plist) ![]const u8 {
+pub fn processInfoPlist(a: Allocator, t: Target, env: ?*const std.process.Environ.Map, generated: ?plist.Plist) ![]const u8 {
     const root = if (t.info_plist) |f| try plist.readFile(a, try t.path(a, f)) else plist.Plist.newDict();
     defer root.deinit();
     if (!root.isDict()) return diag.fail("{s}: root must be a dictionary", .{t.info_plist orelse "info"});
@@ -117,7 +117,7 @@ test "YAML entitlement map is expanded and preserves bool and array types" {
 }
 
 /// No implicit capabilities: absent entitlements means no entitlement file.
-pub fn entitlements(a: Allocator, t: Target, env: ?*const std.process.EnvMap) !?[]const u8 {
+pub fn entitlements(a: Allocator, t: Target, env: ?*const std.process.Environ.Map) !?[]const u8 {
     if (t.entitlements == null and t.entitlement_values == null) return null;
     const root = if (t.entitlements) |f| try plist.readFile(a, try t.path(a, f)) else plist.Plist.newDict();
     defer root.deinit();

@@ -4,6 +4,7 @@
 //! "pbxprojgen:<section>:<key>"), so regenerating yields byte-identical output
 //! and the IDs match projects produced by the previous Python generator.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 
@@ -86,13 +87,13 @@ fn isBare(value: []const u8) bool {
 pub fn quote(a: Allocator, value: []const u8) ![]const u8 {
     if (fsutil.hasControlCharacters(value)) return diag.fail("OpenStep value contains control characters", .{});
     if (isBare(value) and !std.mem.eql(u8, value, "YES") and !std.mem.eql(u8, value, "NO")) return value;
-    var out = std.ArrayList(u8).init(a);
-    try out.append('"');
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '"');
     for (value) |c| {
-        if (c == '\\' or c == '"') try out.append('\\');
-        try out.append(c);
+        if (c == '\\' or c == '"') try out.append(a, '\\');
+        try out.append(a, c);
     }
-    try out.append('"');
+    try out.append(a, '"');
     return out.items;
 }
 
@@ -106,13 +107,13 @@ fn safeComment(a: Allocator, value: []const u8) ![]const u8 {
 
 fn xmlAttribute(a: Allocator, value: []const u8) ![]const u8 {
     if (fsutil.hasControlCharacters(value)) return diag.fail("XML attribute contains control characters", .{});
-    var out = std.ArrayList(u8).init(a);
+    var out: std.ArrayList(u8) = .empty;
     for (value) |c| switch (c) {
-        '&' => try out.appendSlice("&amp;"),
-        '<' => try out.appendSlice("&lt;"),
-        '>' => try out.appendSlice("&gt;"),
-        '"' => try out.appendSlice("&quot;"),
-        else => try out.append(c),
+        '&' => try out.appendSlice(a, "&amp;"),
+        '<' => try out.appendSlice(a, "&lt;"),
+        '>' => try out.appendSlice(a, "&gt;"),
+        '"' => try out.appendSlice(a, "&quot;"),
+        else => try out.append(a, c),
     };
     return out.items;
 }
@@ -147,21 +148,21 @@ pub const Generator = struct {
     project_base: []const u8,
     sources: []const []const u8,
     resources: []const []const u8,
-    objects: [std.meta.fields(Section).len]std.ArrayListUnmanaged(Object) = @splat(.empty),
+    objects: [std.meta.fieldNames(Section).len]std.ArrayList(Object) = @splat(.empty),
     comments: std.StringHashMapUnmanaged([]const u8) = .empty,
     target_id: []const u8 = "",
     project_id: []const u8 = "",
 
     pub fn init(a: Allocator, m: Manifest, root_dir: []const u8, output: []const u8) !Generator {
         const root = try fsutil.resolveLenient(a, root_dir);
-        const out = try fsutil.join(a, try fsutil.resolveLenient(a, std.fs.path.dirname(output) orelse "."), std.fs.path.basename(output));
+        const out = try fsutil.join(a, try fsutil.resolveLenient(a, std.Io.Dir.path.dirname(output) orelse "."), std.Io.Dir.path.basename(output));
         if (!std.mem.eql(u8, fsutil.suffix(out), ".xcodeproj")) return diag.fail("output must end in .xcodeproj", .{});
         var g: Generator = .{
             .a = a,
             .m = m,
             .root = root,
             .output = out,
-            .project_base = std.fs.path.dirname(out).?,
+            .project_base = std.Io.Dir.path.dirname(out).?,
             .sources = try fsutil.discover(a, root, m.sources, "source"),
             .resources = try fsutil.discover(a, root, m.resources, "resource"),
         };
@@ -200,13 +201,13 @@ pub const Generator = struct {
 
     fn projectRelative(g: *Generator, rel_to_root: []const u8) ![]const u8 {
         const abs = try fsutil.join(g.a, g.root, rel_to_root);
-        return std.fs.path.relative(g.a, g.project_base, abs);
+        return sys.relative(g.a, g.project_base, abs);
     }
 
     fn fileReference(g: *Generator, rel_to_root: []const u8, group_name: []const u8) ![]const u8 {
         const relative = try g.projectRelative(rel_to_root);
         const body = try std.fmt.allocPrint(g.a, "{{isa = PBXFileReference; lastKnownFileType = {s}; path = {s}; sourceTree = \"<group>\"; }}", .{ fileType(rel_to_root), try quote(g.a, relative) });
-        return g.add(.PBXFileReference, try std.fmt.allocPrint(g.a, "{s}:{s}", .{ group_name, relative }), std.fs.path.basename(rel_to_root), body);
+        return g.add(.PBXFileReference, try std.fmt.allocPrint(g.a, "{s}:{s}", .{ group_name, relative }), std.Io.Dir.path.basename(rel_to_root), body);
     }
 
     fn buildFile(g: *Generator, file_id: []const u8, phase_name: []const u8) ![]const u8 {
@@ -216,21 +217,21 @@ pub const Generator = struct {
     }
 
     fn group(g: *Generator, name: []const u8, children: []const []const u8, key: ?[]const u8) ![]const u8 {
-        var b = std.ArrayList(u8).init(g.a);
-        const w = b.writer();
+        var b: std.Io.Writer.Allocating = .init(g.a);
+        const w = &b.writer;
         try w.writeAll("{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n");
         for (children) |child| try w.print("\t\t\t\t{s},\n", .{try g.ref(child)});
         try w.print("\t\t\t);\n\t\t\tname = {s};\n\t\t\tsourceTree = \"<group>\";\n\t\t}}", .{try quote(g.a, name)});
-        return g.add(.PBXGroup, key orelse name, name, b.items);
+        return g.add(.PBXGroup, key orelse name, name, b.written());
     }
 
     fn phase(g: *Generator, section: Section, name: []const u8, files: []const []const u8) ![]const u8 {
-        var b = std.ArrayList(u8).init(g.a);
-        const w = b.writer();
+        var b: std.Io.Writer.Allocating = .init(g.a);
+        const w = &b.writer;
         try w.print("{{\n\t\t\tisa = {s};\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n", .{@tagName(section)});
         for (files) |f| try w.print("\t\t\t\t{s},\n", .{try g.ref(f)});
         try w.writeAll("\t\t\t);\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}");
-        return g.add(section, name, name, b.items);
+        return g.add(section, name, name, b.written());
     }
 
     fn settingLines(g: *Generator, settings: []Setting) ![]const u8 {
@@ -240,8 +241,8 @@ pub const Generator = struct {
             }
         }.lt);
         const indent = "\t\t\t\t";
-        var b = std.ArrayList(u8).init(g.a);
-        const w = b.writer();
+        var b: std.Io.Writer.Allocating = .init(g.a);
+        const w = &b.writer;
         try w.writeAll("{\n");
         for (settings) |s| switch (s.value) {
             .str => |v| try w.print(indent ++ "{s} = {s};\n", .{ s.key, try quote(g.a, v) }),
@@ -252,7 +253,7 @@ pub const Generator = struct {
             },
         };
         try w.writeAll("\t\t\t}");
-        return b.items;
+        return b.written();
     }
 
     fn configurationList(g: *Generator, owner: []const u8, debug: []Setting, release: []Setting) ![]const u8 {
@@ -271,43 +272,43 @@ pub const Generator = struct {
 
     pub fn generate(g: *Generator) ![]const u8 {
         const a = g.a;
-        var source_refs = std.ArrayList([]const u8).init(a);
-        var source_builds = std.ArrayList([]const u8).init(a);
+        var source_refs: std.ArrayList([]const u8) = .empty;
+        var source_builds: std.ArrayList([]const u8) = .empty;
         for (g.sources) |path| {
             const r = try g.fileReference(path, "Sources");
-            try source_refs.append(r);
-            if (fsutil.oneOf(fsutil.suffix(path), &fsutil.source_extensions)) try source_builds.append(try g.buildFile(r, "Sources"));
+            try source_refs.append(a, r);
+            if (fsutil.oneOf(fsutil.suffix(path), &fsutil.source_extensions)) try source_builds.append(a, try g.buildFile(r, "Sources"));
         }
-        var resource_refs = std.ArrayList([]const u8).init(a);
-        var resource_builds = std.ArrayList([]const u8).init(a);
+        var resource_refs: std.ArrayList([]const u8) = .empty;
+        var resource_builds: std.ArrayList([]const u8) = .empty;
         for (g.resources) |path| {
             const r = try g.fileReference(path, "Resources");
-            try resource_refs.append(r);
-            try resource_builds.append(try g.buildFile(r, "Resources"));
+            try resource_refs.append(a, r);
+            try resource_builds.append(a, try g.buildFile(r, "Resources"));
         }
-        var extra_refs = std.ArrayList([]const u8).init(a);
-        try extra_refs.append(try g.fileReference(g.m.info_plist, "Project"));
-        if (g.m.entitlements) |e| try extra_refs.append(try g.fileReference(e, "Project"));
+        var extra_refs: std.ArrayList([]const u8) = .empty;
+        try extra_refs.append(a, try g.fileReference(g.m.info_plist, "Project"));
+        if (g.m.entitlements) |e| try extra_refs.append(a, try g.fileReference(e, "Project"));
 
-        var names = std.ArrayList([]const u8).init(a);
+        var names: std.ArrayList([]const u8) = .empty;
         for (g.m.frameworks) |f| {
             const n = if (std.mem.endsWith(u8, f, ".framework")) f else try std.fmt.allocPrint(a, "{s}.framework", .{f});
             for (names.items) |existing| {
                 if (std.mem.eql(u8, existing, n)) break;
-            } else try names.append(n);
+            } else try names.append(a, n);
         }
         std.mem.sort([]const u8, names.items, {}, struct {
             fn lt(_: void, l: []const u8, r: []const u8) bool {
                 return std.mem.lessThan(u8, l, r);
             }
         }.lt);
-        var framework_refs = std.ArrayList([]const u8).init(a);
-        var framework_builds = std.ArrayList([]const u8).init(a);
+        var framework_refs: std.ArrayList([]const u8) = .empty;
+        var framework_builds: std.ArrayList([]const u8) = .empty;
         for (names.items) |n| {
             const body = try std.fmt.allocPrint(a, "{{isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = {s}; path = {s}; sourceTree = SDKROOT; }}", .{ try quote(a, n), try quote(a, try std.fmt.allocPrint(a, "System/Library/Frameworks/{s}", .{n})) });
             const r = try g.add(.PBXFileReference, try std.fmt.allocPrint(a, "framework:{s}", .{n}), n, body);
-            try framework_refs.append(r);
-            try framework_builds.append(try g.buildFile(r, "Frameworks"));
+            try framework_refs.append(a, r);
+            try framework_builds.append(a, try g.buildFile(r, "Frameworks"));
         }
 
         const app_name = try std.fmt.allocPrint(a, "{s}.app", .{g.m.name});
@@ -317,11 +318,11 @@ pub const Generator = struct {
         const resource_group: ?[]const u8 = if (resource_refs.items.len > 0) try g.group("Resources", resource_refs.items, null) else null;
         const framework_group = try g.group("Frameworks", framework_refs.items, null);
         const products_group = try g.group("Products", &.{product_ref}, null);
-        var main_children = std.ArrayList([]const u8).init(a);
-        try main_children.append(source_group);
-        if (resource_group) |rg| try main_children.append(rg);
-        try main_children.appendSlice(extra_refs.items);
-        try main_children.appendSlice(&.{ framework_group, products_group });
+        var main_children: std.ArrayList([]const u8) = .empty;
+        try main_children.append(a, source_group);
+        if (resource_group) |rg| try main_children.append(a, rg);
+        try main_children.appendSlice(a, extra_refs.items);
+        try main_children.appendSlice(a, &.{ framework_group, products_group });
         const main_group = try g.group(g.m.name, main_children.items, "main");
 
         const sources_phase = try g.phase(.PBXSourcesBuildPhase, "Sources", source_builds.items);
@@ -346,8 +347,8 @@ pub const Generator = struct {
             .{ .key = "VALIDATE_PRODUCT", .value = .{ .str = "YES" } },
         }));
 
-        var target_common = std.ArrayList(Setting).init(a);
-        try target_common.appendSlice(&.{
+        var target_common: std.ArrayList(Setting) = .empty;
+        try target_common.appendSlice(a, &.{
             .{ .key = "CODE_SIGN_STYLE", .value = .{ .str = "Automatic" } },
             .{ .key = "CURRENT_PROJECT_VERSION", .value = .{ .str = g.m.build_number } },
             .{ .key = "GENERATE_INFOPLIST_FILE", .value = .{ .str = "NO" } },
@@ -363,10 +364,10 @@ pub const Generator = struct {
             .{ .key = "TARGETED_DEVICE_FAMILY", .value = .{ .str = g.m.device_family } },
         });
         for (g.resources) |r| if (std.mem.eql(u8, fsutil.suffix(r), ".xcassets")) {
-            try target_common.append(.{ .key = "ASSETCATALOG_COMPILER_APPICON_NAME", .value = .{ .str = g.m.app_icon } });
+            try target_common.append(a, .{ .key = "ASSETCATALOG_COMPILER_APPICON_NAME", .value = .{ .str = g.m.app_icon } });
             break;
         };
-        if (g.m.entitlements) |e| try target_common.append(.{ .key = "CODE_SIGN_ENTITLEMENTS", .value = .{ .str = try g.projectRelative(e) } });
+        if (g.m.entitlements) |e| try target_common.append(a, .{ .key = "CODE_SIGN_ENTITLEMENTS", .value = .{ .str = try g.projectRelative(e) } });
         const target_configs = if (g.m.profiles) |profiles|
             try g.configurationList("target", try g.profileSettings(target_common.items, profiles[0]), try g.profileSettings(target_common.items, profiles[1]))
         else
@@ -396,35 +397,35 @@ pub const Generator = struct {
     }
 
     fn profileSettings(g: *Generator, common: []const Setting, p: Profile) ![]Setting {
-        var out = std.StringArrayHashMap(@TypeOf(@as(Setting, undefined).value)).init(g.a);
-        for (common) |v| try out.put(v.key, v.value);
-        try out.put("PRODUCT_BUNDLE_IDENTIFIER", .{ .str = p.bundle_id });
-        try out.put("CONFIGURATION_BUILD_DIR", .{ .str = try std.fmt.allocPrint(g.a, "$(SRCROOT)/{s}", .{p.output_dir}) });
-        try out.put("CODE_SIGNING_ALLOWED", .{ .str = if (p.sign) "YES" else "NO" });
-        try out.put("INFOPLIST_FILE", .{ .str = try g.projectRelative(p.info_plist) });
+        var out: std.array_hash_map.String(@TypeOf(@as(Setting, undefined).value)) = .empty;
+        for (common) |v| try out.put(g.a, v.key, v.value);
+        try out.put(g.a, "PRODUCT_BUNDLE_IDENTIFIER", .{ .str = p.bundle_id });
+        try out.put(g.a, "CONFIGURATION_BUILD_DIR", .{ .str = try std.fmt.allocPrint(g.a, "$(SRCROOT)/{s}", .{p.output_dir}) });
+        try out.put(g.a, "CODE_SIGNING_ALLOWED", .{ .str = if (p.sign) "YES" else "NO" });
+        try out.put(g.a, "INFOPLIST_FILE", .{ .str = try g.projectRelative(p.info_plist) });
         _ = out.swapRemove("CODE_SIGN_ENTITLEMENTS");
-        if (p.entitlements) |e| try out.put("CODE_SIGN_ENTITLEMENTS", .{ .str = try g.projectRelative(e) });
-        try out.put("GCC_OPTIMIZATION_LEVEL", .{ .str = if (std.mem.startsWith(u8, p.opt, "-O")) p.opt[2..] else "s" });
-        try out.put("SWIFT_OPTIMIZATION_LEVEL", .{ .str = p.swift_opt });
-        try out.put("DEBUG_INFORMATION_FORMAT", .{ .str = "dwarf" });
-        try out.put("GCC_GENERATE_DEBUGGING_SYMBOLS", .{ .str = if (p.debug_symbols) "YES" else "NO" });
-        try out.put("GCC_PREPROCESSOR_DEFINITIONS", .{ .list = p.defines });
-        var conditions = std.ArrayList([]const u8).init(g.a);
-        for (p.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try conditions.append(d);
-        try out.put("SWIFT_ACTIVE_COMPILATION_CONDITIONS", .{ .list = conditions.items });
-        try out.put("OTHER_CFLAGS", .{ .list = p.cflags });
-        try out.put("OTHER_SWIFT_FLAGS", .{ .list = p.swiftflags });
-        var link_flags = std.ArrayList([]const u8).init(g.a);
-        for (p.ldflags) |f| try link_flags.appendSlice(&.{ "-Xlinker", f });
-        try out.put("OTHER_LDFLAGS", .{ .list = link_flags.items });
+        if (p.entitlements) |e| try out.put(g.a, "CODE_SIGN_ENTITLEMENTS", .{ .str = try g.projectRelative(e) });
+        try out.put(g.a, "GCC_OPTIMIZATION_LEVEL", .{ .str = if (std.mem.startsWith(u8, p.opt, "-O")) p.opt[2..] else "s" });
+        try out.put(g.a, "SWIFT_OPTIMIZATION_LEVEL", .{ .str = p.swift_opt });
+        try out.put(g.a, "DEBUG_INFORMATION_FORMAT", .{ .str = "dwarf" });
+        try out.put(g.a, "GCC_GENERATE_DEBUGGING_SYMBOLS", .{ .str = if (p.debug_symbols) "YES" else "NO" });
+        try out.put(g.a, "GCC_PREPROCESSOR_DEFINITIONS", .{ .list = p.defines });
+        var conditions: std.ArrayList([]const u8) = .empty;
+        for (p.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) try conditions.append(g.a, d);
+        try out.put(g.a, "SWIFT_ACTIVE_COMPILATION_CONDITIONS", .{ .list = conditions.items });
+        try out.put(g.a, "OTHER_CFLAGS", .{ .list = p.cflags });
+        try out.put(g.a, "OTHER_SWIFT_FLAGS", .{ .list = p.swiftflags });
+        var link_flags: std.ArrayList([]const u8) = .empty;
+        for (p.ldflags) |f| try link_flags.appendSlice(g.a, &.{ "-Xlinker", f });
+        try out.put(g.a, "OTHER_LDFLAGS", .{ .list = link_flags.items });
         const result = try g.a.alloc(Setting, out.count());
         for (out.keys(), out.values(), result) |k, v, *item| item.* = .{ .key = k, .value = v };
         return result;
     }
 
     fn render(g: *Generator) ![]const u8 {
-        var b = std.ArrayList(u8).init(g.a);
-        const w = b.writer();
+        var b: std.Io.Writer.Allocating = .init(g.a);
+        const w = &b.writer;
         try w.writeAll("// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {};\n\tobjectVersion = 56;\n\tobjects = {\n\n");
         for (&g.objects, 0..) |*list, i| {
             if (list.items.len == 0) continue;
@@ -443,13 +444,13 @@ pub const Generator = struct {
             try w.print("/* End {s} section */\n\n", .{name});
         }
         try w.print("\t}};\n\trootObject = {s} /* Project object */;\n}}\n", .{g.project_id});
-        return b.items;
+        return b.written();
     }
 
     pub fn scheme(g: *Generator) ![]const u8 {
         const name = try xmlAttribute(g.a, g.m.name);
         const app = try xmlAttribute(g.a, try std.fmt.allocPrint(g.a, "{s}.app", .{g.m.name}));
-        const container = try xmlAttribute(g.a, std.fs.path.basename(g.output));
+        const container = try xmlAttribute(g.a, std.Io.Dir.path.basename(g.output));
         const buildable = try std.fmt.allocPrint(g.a, "<BuildableReference BuildableIdentifier=\"primary\" BlueprintIdentifier=\"{s}\" BuildableName=\"{s}\" BlueprintName=\"{s}\" ReferencedContainer=\"container:{s}\"/>", .{ g.target_id, app, name, container });
         return std.fmt.allocPrint(g.a,
             \\<?xml version="1.0" encoding="UTF-8"?>
@@ -481,79 +482,79 @@ pub const Generator = struct {
 
 // ------------------------------------------------- safe atomic publishing
 
-fn openOrCreateDirNoFollow(path: []const u8) !std.fs.Dir {
-    if (!std.fs.path.isAbsolute(path)) return diag.fail("output parent must be absolute", .{});
-    var dir = try std.fs.openDirAbsolute("/", .{});
-    errdefer dir.close();
+fn openOrCreateDirNoFollow(path: []const u8) !std.Io.Dir {
+    if (!std.Io.Dir.path.isAbsolute(path)) return diag.fail("output parent must be absolute", .{});
+    var dir = try std.Io.Dir.openDirAbsolute(sys.io, "/", .{});
+    errdefer dir.close(sys.io);
     var it = std.mem.tokenizeScalar(u8, path, '/');
     while (it.next()) |part| {
-        dir.makeDir(part) catch |err| switch (err) {
+        dir.createDir(sys.io, part, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
-        const next = try dir.openDir(part, .{ .no_follow = true });
-        dir.close();
+        const next = try dir.openDir(sys.io, part, .{ .follow_symlinks = false });
+        dir.close(sys.io);
         dir = next;
     }
     return dir;
 }
 
 /// Remove `name` inside `parent` without ever following symlinks.
-fn removeEntryAt(parent: std.fs.Dir, name: []const u8) !void {
-    const st = posix.fstatat(parent.fd, name, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+fn removeEntryAt(parent: std.Io.Dir, name: []const u8) !void {
+    const st = parent.statFile(sys.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    if (st.mode & posix.S.IFMT != posix.S.IFDIR) return parent.deleteFile(name);
-    var child = try parent.openDir(name, .{ .iterate = true, .no_follow = true });
+    if (st.kind != .directory) return parent.deleteFile(sys.io, name);
+    var child = try parent.openDir(sys.io, name, .{ .iterate = true, .follow_symlinks = false });
     {
-        defer child.close();
+        defer child.close(sys.io);
         var it = child.iterate();
-        while (try it.next()) |entry| try removeEntryAt(child, entry.name);
+        while (try it.next(sys.io)) |entry| try removeEntryAt(child, entry.name);
     }
-    try parent.deleteDir(name);
+    try parent.deleteDir(sys.io, name);
 }
 
-fn writeNew(dir: std.fs.Dir, name: []const u8, data: []const u8) !void {
-    var f = try dir.createFile(name, .{ .exclusive = true, .mode = 0o644 });
-    defer f.close();
-    try f.writeAll(data);
+fn writeNew(dir: std.Io.Dir, name: []const u8, data: []const u8) !void {
+    var f = try dir.createFile(sys.io, name, .{ .exclusive = true, .permissions = .fromMode(0o644) });
+    defer f.close(sys.io);
+    try f.writeStreamingAll(sys.io, data);
 }
 
 /// Build the project in a private sibling directory, then swap it into place
 /// using directory-FD-relative operations that never follow symlinks.
 pub fn publish(g: *Generator, before_publish: ?*const fn () anyerror!void) !void {
-    var parent = try openOrCreateDirNoFollow(std.fs.path.dirname(g.output).?);
-    defer parent.close();
-    const out_name = std.fs.path.basename(g.output);
+    var parent = try openOrCreateDirNoFollow(std.Io.Dir.path.dirname(g.output).?);
+    defer parent.close(sys.io);
+    const out_name = std.Io.Dir.path.basename(g.output);
     var rnd: [12]u8 = undefined;
-    std.crypto.random.bytes(&rnd);
+    sys.io.random(&rnd);
     const tmp_name = try std.fmt.allocPrint(g.a, ".{s}.tmp-{s}", .{ out_name, std.fmt.bytesToHex(rnd, .lower) });
     var published = false;
     defer if (!published) removeEntryAt(parent, tmp_name) catch {};
 
-    try parent.makeDir(tmp_name);
+    try parent.createDir(sys.io, tmp_name, .default_dir);
     {
-        var tmp = try parent.openDir(tmp_name, .{ .no_follow = true });
-        defer tmp.close();
+        var tmp = try parent.openDir(sys.io, tmp_name, .{ .follow_symlinks = false });
+        defer tmp.close(sys.io);
         try writeNew(tmp, "project.pbxproj", try g.generate());
-        try tmp.makeDir("xcshareddata");
-        var shared = try tmp.openDir("xcshareddata", .{ .no_follow = true });
-        defer shared.close();
-        try shared.makeDir("xcschemes");
-        var schemes = try shared.openDir("xcschemes", .{ .no_follow = true });
-        defer schemes.close();
+        try tmp.createDir(sys.io, "xcshareddata", .default_dir);
+        var shared = try tmp.openDir(sys.io, "xcshareddata", .{ .follow_symlinks = false });
+        defer shared.close(sys.io);
+        try shared.createDir(sys.io, "xcschemes", .default_dir);
+        var schemes = try shared.openDir(sys.io, "xcschemes", .{ .follow_symlinks = false });
+        defer schemes.close(sys.io);
         try writeNew(schemes, try std.fmt.allocPrint(g.a, "{s}.xcscheme", .{g.m.name}), try g.scheme());
     }
     if (before_publish) |hook| try hook();
     try removeEntryAt(parent, out_name);
-    try posix.renameat(parent.fd, tmp_name, parent.fd, out_name);
+    try parent.rename(tmp_name, parent, out_name, sys.io);
     published = true;
 }
 
 /// Validate the requested output path and generate the project.
 pub fn generateProject(a: Allocator, m: Manifest, root_dir: []const u8, output: []const u8) ![]const u8 {
-    if (fsutil.hasControlCharacters(std.fs.path.basename(output))) return diag.fail("output filename contains control characters", .{});
+    if (fsutil.hasControlCharacters(std.Io.Dir.path.basename(output))) return diag.fail("output filename contains control characters", .{});
     switch (fsutil.kind(output)) {
         .symlink => return diag.fail("output may not be a symlink: {s}", .{output}),
         .missing => {},
@@ -576,7 +577,7 @@ const Fixture = struct {
 
     fn init() !Fixture {
         var f: Fixture = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator), .tmp = testing.tmpDir(.{}), .root = "" };
-        f.root = try f.tmp.dir.realpathAlloc(f.arena.allocator(), ".");
+        f.root = try f.tmp.dir.realPathFileAlloc(sys.io, ".", f.arena.allocator());
         return f;
     }
 
@@ -586,16 +587,16 @@ const Fixture = struct {
     }
 
     fn write(f: *Fixture, rel: []const u8, data: []const u8) !void {
-        if (std.fs.path.dirname(rel)) |d| try f.tmp.dir.makePath(d);
-        try f.tmp.dir.writeFile(.{ .sub_path = rel, .data = data });
+        if (std.Io.Dir.path.dirname(rel)) |d| try f.tmp.dir.createDirPath(sys.io, d);
+        try f.tmp.dir.writeFile(sys.io, .{ .sub_path = rel, .data = data });
     }
 
     fn path(f: *Fixture, rel: []const u8) ![]const u8 {
-        return std.fs.path.join(f.arena.allocator(), &.{ f.root, rel });
+        return std.Io.Dir.path.join(f.arena.allocator(), &.{ f.root, rel });
     }
 
     fn read(f: *Fixture, rel: []const u8) ![]const u8 {
-        return f.tmp.dir.readFileAlloc(f.arena.allocator(), rel, 1 << 20);
+        return f.tmp.dir.readFileAlloc(sys.io, rel, f.arena.allocator(), .limited(1 << 20));
     }
 
     fn standard(f: *Fixture) !Manifest {
@@ -683,7 +684,7 @@ test "rejects symlinks in inputs, ancestors and packages" {
         var f = try Fixture.init();
         defer f.deinit();
         const m = try f.standard();
-        try f.tmp.dir.symLink("main.swift", "Sources/linked.swift", .{});
+        try f.tmp.dir.symLink(sys.io, "main.swift", "Sources/linked.swift", .{});
         try testing.expectError(error.Invalid, f.gen(m, "GeneratedApp.xcodeproj"));
         try testing.expect(contains(diag.msg, "symlinks are not allowed"));
     }
@@ -692,7 +693,7 @@ test "rejects symlinks in inputs, ancestors and packages" {
         defer f.deinit();
         var m = try f.standard();
         try f.write("outside/main.swift", "import UIKit\n");
-        try f.tmp.dir.symLink("outside", "Alias", .{ .is_directory = true });
+        try f.tmp.dir.symLink(sys.io, "outside", "Alias", .{ .is_directory = true });
         m.sources = &.{"Alias"};
         try testing.expectError(error.Invalid, f.gen(m, "GeneratedApp.xcodeproj"));
         try testing.expect(contains(diag.msg, "symlinks are not allowed"));
@@ -701,8 +702,8 @@ test "rejects symlinks in inputs, ancestors and packages" {
         var f = try Fixture.init();
         defer f.deinit();
         const m = try f.standard();
-        try f.tmp.dir.makePath("Resources/Assets.xcassets");
-        try f.tmp.dir.symLink("../data.json", "Resources/Assets.xcassets/linked.json", .{});
+        try f.tmp.dir.createDirPath(sys.io, "Resources/Assets.xcassets");
+        try f.tmp.dir.symLink(sys.io, "../data.json", "Resources/Assets.xcassets/linked.json", .{});
         try testing.expectError(error.Invalid, f.gen(m, "GeneratedApp.xcodeproj"));
         try testing.expect(contains(diag.msg, "symlinks are not allowed"));
     }
@@ -714,8 +715,8 @@ test "rejects symlinked output files and directories" {
         defer f.deinit();
         const m = try f.standard();
         try f.write("external.pbxproj", "unchanged");
-        try f.tmp.dir.makePath("GeneratedApp.xcodeproj");
-        try f.tmp.dir.symLink("../external.pbxproj", "GeneratedApp.xcodeproj/project.pbxproj", .{});
+        try f.tmp.dir.createDirPath(sys.io, "GeneratedApp.xcodeproj");
+        try f.tmp.dir.symLink(sys.io, "../external.pbxproj", "GeneratedApp.xcodeproj/project.pbxproj", .{});
         try testing.expectError(error.Invalid, f.gen(m, "GeneratedApp.xcodeproj"));
         try testing.expect(contains(diag.msg, "output contains a symlink"));
         try testing.expectEqualStrings("unchanged", try f.read("external.pbxproj"));
@@ -725,8 +726,8 @@ test "rejects symlinked output files and directories" {
         defer f.deinit();
         const m = try f.standard();
         try f.write("external-schemes/Keep.xcscheme", "unchanged");
-        try f.tmp.dir.makePath("GeneratedApp.xcodeproj/xcshareddata");
-        try f.tmp.dir.symLink(try f.path("external-schemes"), "GeneratedApp.xcodeproj/xcshareddata/xcschemes", .{ .is_directory = true });
+        try f.tmp.dir.createDirPath(sys.io, "GeneratedApp.xcodeproj/xcshareddata");
+        try f.tmp.dir.symLink(sys.io, try f.path("external-schemes"), "GeneratedApp.xcodeproj/xcshareddata/xcschemes", .{ .is_directory = true });
         try testing.expectError(error.Invalid, f.gen(m, "GeneratedApp.xcodeproj"));
         try testing.expect(contains(diag.msg, "output contains a symlink"));
         try testing.expectEqualStrings("unchanged", try f.read("external-schemes/Keep.xcscheme"));
@@ -737,7 +738,7 @@ var swap_fixture: ?*Fixture = null;
 
 fn swapOutput() anyerror!void {
     const f = swap_fixture.?;
-    try f.tmp.dir.symLink(try f.path("external"), "GeneratedApp.xcodeproj", .{ .is_directory = true });
+    try f.tmp.dir.symLink(sys.io, try f.path("external"), "GeneratedApp.xcodeproj", .{ .is_directory = true });
 }
 
 test "atomic publisher does not follow a symlink swapped in before publish" {

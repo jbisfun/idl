@@ -5,6 +5,7 @@
 //! as versions must be preserved verbatim, so this walks `yaml.Tree` directly
 //! and keeps every scalar as text plus a flag saying whether it was quoted.
 const std = @import("std");
+const sys = @import("sys.zig");
 const yaml = @import("yaml");
 const diag = @import("diag.zig");
 
@@ -37,11 +38,11 @@ pub const Node = union(enum) {
 /// start) and trailing whitespace. zig-yaml 0.1.x mis-parses a plain scalar
 /// followed by spaces/comments, so this runs first; line numbers are preserved.
 pub fn stripComments(arena: Allocator, source: []const u8) ![]const u8 {
-    var out = try std.ArrayList(u8).initCapacity(arena, source.len);
+    var out: std.ArrayList(u8) = try .initCapacity(arena, source.len);
     var lines = std.mem.splitScalar(u8, source, '\n');
     var first = true;
     while (lines.next()) |line| {
-        if (!first) try out.append('\n');
+        if (!first) try out.append(arena, '\n');
         first = false;
         var quote: u8 = 0;
         var end: usize = line.len;
@@ -65,7 +66,7 @@ pub fn stripComments(arena: Allocator, source: []const u8) ![]const u8 {
                 break;
             }
         }
-        try out.appendSlice(std.mem.trimRight(u8, line[0..end], " \t\r"));
+        try out.appendSlice(arena, std.mem.trimEnd(u8, line[0..end], " \t\r"));
     }
     return out.items;
 }
@@ -75,9 +76,8 @@ pub fn parse(arena: Allocator, raw_source: []const u8, file_name: []const u8) !N
     var doc: yaml.Yaml = .{ .source = source };
     doc.load(arena) catch |err| switch (err) {
         error.ParseFailure => {
-            const stderr = std.io.getStdErr();
-            stderr.writer().print("{s}: YAML parse error\n", .{file_name}) catch {};
-            doc.parse_errors.renderToStdErr(.{ .ttyconf = std.io.tty.detectConfig(stderr) });
+            sys.stderrPrint("{s}: YAML parse error\n", .{file_name});
+            doc.parse_errors.renderToStderr(sys.io, .{}, .auto) catch {};
             return diag.fail("could not parse {s}", .{file_name});
         },
         error.DuplicateMapKey => return diag.fail("{s}: duplicate mapping key", .{file_name}),

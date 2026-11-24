@@ -2,12 +2,13 @@
 //! `Localizable.strings` / `Localizable.stringsdict` files. `xcstringstool` is
 //! a macOS binary, so this is the Linux replacement.
 const std = @import("std");
+const sys = @import("sys.zig");
 const plist = @import("plist.zig");
 const diag = @import("diag.zig");
 
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
-const Table = std.StringArrayHashMapUnmanaged([]const u8);
+const Table = std.array_hash_map.String([]const u8);
 
 fn obj(v: ?Json) ?std.json.ObjectMap {
     const value = v orelse return null;
@@ -36,7 +37,7 @@ fn formatSpecifier(s: []const u8) []const u8 {
 
 fn tableFor(a: Allocator, map: anytype, language: []const u8) !@TypeOf(&map.values()[0]) {
     const gop = try map.getOrPut(a, language);
-    if (!gop.found_existing) gop.value_ptr.* = .{};
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
     return gop.value_ptr;
 }
 
@@ -74,7 +75,7 @@ fn pluralRule(a: Allocator, plural: std.json.ObjectMap, spec: []const u8) !plist
     return rule.node;
 }
 
-pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
+pub fn convert(a: Allocator, source: []const u8, out_dir: std.Io.Dir) !void {
     const root = std.json.parseFromSliceLeaky(Json, a, source, .{}) catch |err|
         return diag.fail("invalid xcstrings JSON: {s}", .{@errorName(err)});
     const catalog = obj(root) orelse return diag.fail("xcstrings root must be an object", .{});
@@ -82,16 +83,16 @@ pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
     try validateLanguage(source_language);
     const entries = obj(catalog.get("strings")) orelse return diag.fail("xcstrings is missing \"strings\"", .{});
 
-    var strings: std.StringArrayHashMapUnmanaged(Table) = .empty;
+    var strings: std.array_hash_map.String(Table) = .empty;
     // language -> libplist dict of stringsdict entries
-    var plurals: std.StringArrayHashMapUnmanaged(plist.Plist) = .empty;
+    var plurals: std.array_hash_map.String(plist.Plist) = .empty;
     defer for (plurals.values()) |p| p.deinit();
 
     var it = entries.iterator();
     while (it.next()) |e| {
         const key = e.key_ptr.*;
         const entry = obj(e.value_ptr.*) orelse continue;
-        const localizations = obj(entry.get("localizations")) orelse std.json.ObjectMap.init(a);
+        const localizations = obj(entry.get("localizations")) orelse std.json.ObjectMap.empty;
         const should_translate = if (entry.get("shouldTranslate")) |v| (v != .bool or v.bool) else true;
         if (localizations.get(source_language) == null and should_translate) {
             const t = try tableFor(a, &strings, source_language);
@@ -146,24 +147,25 @@ pub fn convert(a: Allocator, source: []const u8, out_dir: std.fs.Dir) !void {
     }
 
     for (strings.keys(), strings.values()) |language, table| {
-        var dir = try out_dir.makeOpenPath(try std.fmt.allocPrint(a, "{s}.lproj", .{language}), .{});
-        defer dir.close();
-        var out = std.ArrayList(u8).init(a);
+        var dir = try out_dir.createDirPathOpen(sys.io, try std.fmt.allocPrint(a, "{s}.lproj", .{language}), .{});
+        defer dir.close(sys.io);
+        var out: std.Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
         const keys = try a.dupe([]const u8, table.keys());
         std.mem.sort([]const u8, keys, {}, lessThan);
         for (keys) |k| {
-            try out.append('"');
-            try escapeStrings(out.writer(), k);
-            try out.appendSlice("\" = \"");
-            try escapeStrings(out.writer(), table.get(k).?);
-            try out.appendSlice("\";\n");
+            try w.writeByte('"');
+            try escapeStrings(w, k);
+            try w.writeAll("\" = \"");
+            try escapeStrings(w, table.get(k).?);
+            try w.writeAll("\";\n");
         }
-        try dir.writeFile(.{ .sub_path = "Localizable.strings", .data = out.items });
+        try dir.writeFile(sys.io, .{ .sub_path = "Localizable.strings", .data = out.written() });
     }
     for (plurals.keys(), plurals.values()) |language, table| {
-        var dir = try out_dir.makeOpenPath(try std.fmt.allocPrint(a, "{s}.lproj", .{language}), .{});
-        defer dir.close();
-        try dir.writeFile(.{ .sub_path = "Localizable.stringsdict", .data = try table.toXml(a) });
+        var dir = try out_dir.createDirPathOpen(sys.io, try std.fmt.allocPrint(a, "{s}.lproj", .{language}), .{});
+        defer dir.close(sys.io);
+        try dir.writeFile(sys.io, .{ .sub_path = "Localizable.stringsdict", .data = try table.toXml(a) });
     }
 }
 
@@ -180,9 +182,9 @@ test "catalog conversion" {
         \\   "one":{"stringUnit":{"value":"%lld item"}},"other":{"stringUnit":{"value":"%lld items"}}}}}}},
         \\ "Bye":{"shouldTranslate":false}}}
     , tmp.dir);
-    try std.testing.expectEqualStrings("\"Hello\" = \"Hallo \\\"du\\\"\";\n", try tmp.dir.readFileAlloc(a, "de.lproj/Localizable.strings", 4096));
-    try std.testing.expectEqualStrings("\"%lld items\" = \"%lld items\";\n\"Hello\" = \"Hello\";\n", try tmp.dir.readFileAlloc(a, "en.lproj/Localizable.strings", 4096));
-    const dict = try tmp.dir.readFileAlloc(a, "en.lproj/Localizable.stringsdict", 4096);
+    try std.testing.expectEqualStrings("\"Hello\" = \"Hallo \\\"du\\\"\";\n", try tmp.dir.readFileAlloc(sys.io, "de.lproj/Localizable.strings", a, .limited(4096)));
+    try std.testing.expectEqualStrings("\"%lld items\" = \"%lld items\";\n\"Hello\" = \"Hello\";\n", try tmp.dir.readFileAlloc(sys.io, "en.lproj/Localizable.strings", a, .limited(4096)));
+    const dict = try tmp.dir.readFileAlloc(sys.io, "en.lproj/Localizable.stringsdict", a, .limited(4096));
     try std.testing.expect(std.mem.indexOf(u8, dict, "<string>%lld item</string>") != null);
     try std.testing.expectEqualStrings("@", formatSpecifier("%1$@ things"));
     try std.testing.expectEqualStrings("d", formatSpecifier("%d"));
@@ -209,7 +211,7 @@ test "multi-argument plural substitutions become positional stringsdict rules" {
         \\  "a":{"argNum":1,"formatSpecifier":"lld","variations":{"plural":{"one":{"stringUnit":{"value":"%arg file"}},"other":{"stringUnit":{"value":"%arg files"}}}}},
         \\  "b":{"argNum":2,"formatSpecifier":"lld","variations":{"plural":{"other":{"stringUnit":{"value":"%arg dirs"}}}}}}}}}}}
     , tmp.dir);
-    const dict = try plist.parse(try tmp.dir.readFileAlloc(a, "en.lproj/Localizable.stringsdict", 4096));
+    const dict = try plist.parse(try tmp.dir.readFileAlloc(sys.io, "en.lproj/Localizable.stringsdict", a, .limited(4096)));
     defer dict.deinit();
     const entry = try dict.get(a, "moved %lld %lld");
     try std.testing.expectEqualStrings("Moved %1$#@a@ and %2$#@b@.", plist.stringOf(plist.c.plist_dict_get_item(entry, "NSStringLocalizedFormatKey")).?);

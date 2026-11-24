@@ -1,6 +1,7 @@
 //! Structural IPA validation: ZIP CRCs, bundle metadata, executable mode and
 //! Mach-O load commands. Native replacement for `unzip -t` + verify_ipa.py.
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 const zip = @import("zip.zig");
 const plist = @import("plist.zig");
@@ -41,12 +42,12 @@ pub fn verifyBytes(a: Allocator, bytes: []const u8, opts: Options) !Report {
     defer info.deinit();
     if (!info.isDict()) return diag.fail("Info.plist root is not a dictionary", .{});
 
-    var missing = std.ArrayList([]const u8).init(a);
+    var missing: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "CFBundleExecutable", "CFBundleIdentifier", "CFBundlePackageType", "MinimumOSVersion" }) |k| {
         const node = try info.get(a, k);
         if (node == null) {
-            try missing.append(k);
-        } else if (plist.stringOf(node)) |v| if (v.len == 0) try missing.append(k);
+            try missing.append(a, k);
+        } else if (plist.stringOf(node)) |v| if (v.len == 0) try missing.append(a, k);
     }
     if (missing.items.len > 0) return diag.fail("missing plist keys: {s}", .{try std.mem.join(a, ", ", missing.items)});
     const bundle_id = try a.dupe(u8, try info.getString(a, "CFBundleIdentifier") orelse return diag.fail("CFBundleIdentifier is not a string", .{}));
@@ -55,7 +56,7 @@ pub fn verifyBytes(a: Allocator, bytes: []const u8, opts: Options) !Report {
     if (opts.bundle_id) |expected| if (!std.mem.eql(u8, bundle_id, expected))
         return diag.fail("bundle ID is {s}, expected {s}", .{ bundle_id, expected });
 
-    const app_dir = std.fs.path.dirnamePosix(plist_entry.?.name).?;
+    const app_dir = std.Io.Dir.path.dirnamePosix(plist_entry.?.name).?;
     const exe_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ app_dir, exe_name });
     const exe_entry = ar.find(exe_path) orelse return diag.fail("missing executable: {s}", .{exe_path});
     const exe = try ar.read(a, exe_entry);
@@ -68,9 +69,9 @@ pub fn verifyBytes(a: Allocator, bytes: []const u8, opts: Options) !Report {
     const platform = mh.platform orelse return diag.fail("Mach-O has no LC_BUILD_VERSION platform", .{});
     if (platform != macho.platform_ios) return diag.fail("Mach-O platform is {s}, expected iOS", .{macho.platformName(platform)});
 
-    var warnings = std.ArrayList([]const u8).init(a);
+    var warnings: std.ArrayList([]const u8) = .empty;
     for (mh.dylibs) |d| if (!macho.isSystemOrBundled(d))
-        try warnings.append(try std.fmt.allocPrint(a, "non-system dylib dependency: {s}", .{d}));
+        try warnings.append(a, try std.fmt.allocPrint(a, "non-system dylib dependency: {s}", .{d}));
     return .{
         .bundle_id = bundle_id,
         .executable = exe_name,
@@ -83,7 +84,7 @@ pub fn verifyBytes(a: Allocator, bytes: []const u8, opts: Options) !Report {
 }
 
 pub fn verifyFile(a: Allocator, path: []const u8, opts: Options) !Report {
-    const bytes = std.fs.cwd().readFileAlloc(a, path, 2 << 30) catch |err|
+    const bytes = sys.readFile(a, path, 2 << 30) catch |err|
         return diag.fail("cannot read {s}: {s}", .{ path, @errorName(err) });
     const report = verifyBytes(a, bytes, opts) catch |err| switch (err) {
         error.Invalid => return diag.fail("{s}: {s}", .{ path, diag.msg }),

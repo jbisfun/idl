@@ -7,6 +7,7 @@
 //! token from <data>/ipc.token, shut down the write half, then read one JSON
 //! event per line until a terminal event (anything but `progress`).
 const std = @import("std");
+const sys = @import("sys.zig");
 const diag = @import("diag.zig");
 
 const Allocator = std.mem.Allocator;
@@ -16,20 +17,20 @@ pub const port_file = "relaunch.port";
 pub const token_file = "ipc.token";
 
 /// Jimpactor's data dir: $XDG_CONFIG_HOME/Jimpactor, else ~/.config/Jimpactor.
-pub fn defaultDataDir(a: Allocator, env: *const std.process.EnvMap) ![]const u8 {
-    if (env.get("XDG_CONFIG_HOME")) |x| if (x.len > 0) return std.fs.path.join(a, &.{ x, "Jimpactor" });
+pub fn defaultDataDir(a: Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+    if (env.get("XDG_CONFIG_HOME")) |x| if (x.len > 0) return std.Io.Dir.path.join(a, &.{ x, "Jimpactor" });
     const home = env.get("HOME") orelse return diag.fail("HOME is not set; set toolchain.jimpactor_dir", .{});
-    return std.fs.path.join(a, &.{ home, ".config", "Jimpactor" });
+    return std.Io.Dir.path.join(a, &.{ home, ".config", "Jimpactor" });
 }
 
 pub const Endpoint = struct { port: u16, token: []const u8 };
 
 pub fn endpoint(a: Allocator, data_dir: []const u8) !Endpoint {
-    const port_text = std.fs.cwd().readFileAlloc(a, try std.fs.path.join(a, &.{ data_dir, port_file }), 64) catch
+    const port_text = sys.readFile(a, try std.Io.Dir.path.join(a, &.{ data_dir, port_file }), 64) catch
         return diag.fail("Jimpactor is not running (no {s} in {s})", .{ port_file, data_dir });
     const port = std.fmt.parseInt(u16, std.mem.trim(u8, port_text, " \t\r\n"), 10) catch
         return diag.fail("invalid {s} in {s}", .{ port_file, data_dir });
-    const token = std.fs.cwd().readFileAlloc(a, try std.fs.path.join(a, &.{ data_dir, token_file }), 4096) catch
+    const token = sys.readFile(a, try std.Io.Dir.path.join(a, &.{ data_dir, token_file }), 4096) catch
         return diag.fail("the running Jimpactor is too old to accept IPC requests (no {s})", .{token_file});
     return .{ .port = port, .token = std.mem.trim(u8, token, " \t\r\n") };
 }
@@ -58,8 +59,8 @@ pub const Request = union(enum) {
 };
 
 fn encode(a: Allocator, token: []const u8, request: Request) ![]const u8 {
-    var out = std.ArrayList(u8).init(a);
-    var w = std.json.writeStream(out.writer(), .{});
+    var out: std.Io.Writer.Allocating = .init(a);
+    var w: std.json.Stringify = .{ .writer = &out.writer };
     try w.beginObject();
     try w.objectField("version");
     try w.write(protocol_version);
@@ -79,7 +80,7 @@ fn encode(a: Allocator, token: []const u8, request: Request) ![]const u8 {
         else => {},
     }
     try w.endObject();
-    return out.items;
+    return out.written();
 }
 
 pub const ProgressFn = *const fn (message: []const u8, percent: i64) void;
@@ -87,20 +88,30 @@ pub const ProgressFn = *const fn (message: []const u8, percent: i64) void;
 /// Send one request and return the terminal event. `error` events become `error.Invalid`.
 pub fn send(a: Allocator, data_dir: []const u8, request: Request, on_progress: ?ProgressFn) !Event {
     const ep = try endpoint(a, data_dir);
-    const stream = std.net.tcpConnectToAddress(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ep.port)) catch |err|
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(ep.port) };
+    const stream = addr.connect(sys.io, .{ .mode = .stream }) catch |err|
         return diag.fail("could not reach Jimpactor on 127.0.0.1:{d} (is it running?): {s}", .{ ep.port, @errorName(err) });
-    defer stream.close();
-    stream.writeAll(try encode(a, ep.token, request)) catch |err|
-        return diag.fail("could not send the request to Jimpactor: {s}", .{@errorName(err)});
-    std.posix.shutdown(stream.handle, .send) catch |err|
+    defer stream.close(sys.io);
+    var sw = stream.writer(sys.io, &.{});
+    sw.interface.writeAll(try encode(a, ep.token, request)) catch
+        return diag.fail("could not send the request to Jimpactor: {s}", .{@errorName(sw.err orelse error.WriteFailed)});
+    stream.shutdown(sys.io, .send) catch |err|
         return diag.fail("could not send the request to Jimpactor: {s}", .{@errorName(err)});
 
-    var reader = std.io.bufferedReader(stream.reader());
+    var rbuf: [4096]u8 = undefined;
+    var sr = stream.reader(sys.io, &rbuf);
+    const r = &sr.interface;
     while (true) {
-        const line = reader.reader().readUntilDelimiterOrEofAlloc(a, '\n', 16 << 20) catch |err|
-            return diag.fail("lost the connection to Jimpactor: {s}", .{@errorName(err)});
-        const text = std.mem.trim(u8, line orelse break, " \t\r");
-        if (text.len == 0) continue;
+        var line: std.Io.Writer.Allocating = .init(a);
+        _ = r.streamDelimiterLimit(&line.writer, '\n', .limited(16 << 20)) catch |err|
+            return diag.fail("lost the connection to Jimpactor: {s}", .{@errorName(if (err == error.ReadFailed) sr.err orelse err else err)});
+        const at_end = r.bufferedLen() == 0;
+        if (!at_end) r.toss(1);
+        const text = std.mem.trim(u8, line.written(), " \t\r");
+        if (text.len == 0) {
+            if (at_end) break;
+            continue;
+        }
         const event = std.json.parseFromSliceLeaky(Event, a, text, .{ .ignore_unknown_fields = true }) catch
             return diag.fail("unexpected reply from Jimpactor: {s}", .{text});
         if (std.mem.eql(u8, event.event, "progress")) {
@@ -143,21 +154,20 @@ pub fn resolveDevice(devices: []const Device, query: []const u8) !Device {
 const testing = std.testing;
 
 const FakeServer = struct {
-    server: std.net.Server,
+    server: std.Io.net.Server,
     replies: []const []const u8,
     request: [4096]u8 = undefined,
     request_len: usize = 0,
 
     fn run(s: *FakeServer) void {
-        const conn = s.server.accept() catch return;
-        defer conn.stream.close();
+        const conn = s.server.accept(sys.io) catch return;
+        defer conn.close(sys.io);
         // Read until the client shuts down its write half.
-        while (true) {
-            const n = conn.stream.read(s.request[s.request_len..]) catch return;
-            if (n == 0) break;
-            s.request_len += n;
-        }
-        for (s.replies) |r| conn.stream.writeAll(r) catch return;
+        var rbuf: [256]u8 = undefined;
+        var r = conn.reader(sys.io, &rbuf);
+        s.request_len = r.interface.readSliceShort(&s.request) catch return;
+        var w = conn.writer(sys.io, &.{});
+        for (s.replies) |reply| w.interface.writeAll(reply) catch return;
     }
 };
 
@@ -167,15 +177,16 @@ fn withServer(replies: []const []const u8, body: *const fn (Allocator, []const u
     const a = arena.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var fake: FakeServer = .{
-        .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{}),
+        .server = try addr.listen(sys.io, .{}),
         .replies = replies,
     };
-    defer fake.server.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = port_file, .data = try std.fmt.allocPrint(a, "{d}\n", .{fake.server.listen_address.getPort()}) });
-    try tmp.dir.writeFile(.{ .sub_path = token_file, .data = "secret\n" });
+    defer fake.server.deinit(sys.io);
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = port_file, .data = try std.fmt.allocPrint(a, "{d}\n", .{fake.server.socket.address.getPort()}) });
+    try tmp.dir.writeFile(sys.io, .{ .sub_path = token_file, .data = "secret\n" });
     const thread = try std.Thread.spawn(.{}, FakeServer.run, .{&fake});
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(sys.io, ".", a);
     const result = body(a, dir, &fake);
     thread.join();
     return result;
@@ -246,7 +257,7 @@ test "missing port file means not running" {
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const dir = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+    const dir = try tmp.dir.realPathFileAlloc(sys.io, ".", arena.allocator());
     try testing.expectError(error.Invalid, send(arena.allocator(), dir, .info, null));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "not running") != null);
 }
