@@ -4,6 +4,7 @@ const std = @import("std");
 const diag = @import("diag.zig");
 const fsutil = @import("fsutil.zig");
 const config = @import("config.zig");
+const plist = @import("plist.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -260,6 +261,30 @@ pub const Toolchain = struct {
             diag.fail("missing tool: {s} (needed for .xcassets). Build it with `zig build actool` in the idl repo (needs swift), or set toolchain.actool", .{t.cfg.actool});
     }
 
+    // ------------------------------------------------------- app intents
+
+    /// The App Intents metadata processor, or null. Apple's ships with Xcode as a
+    /// macOS binary; on Linux use re-appintentsmetadataprocessor (same CLI).
+    pub fn appIntentsProcessor(t: *const Toolchain) !?[]const u8 {
+        return fsutil.which(t.a, try fsutil.expandHome(t.a, t.cfg.appintents, &t.env), t.pathEnv());
+    }
+
+    /// The SDK bundle's XcodeDefault.xctoolchain (`--toolchain-dir`).
+    pub fn xcodeToolchainDir(t: *const Toolchain) ![]const u8 {
+        return std.fs.path.join(t.a, &.{ t.sdk_bundle, "Developer/Toolchains/XcodeDefault.xctoolchain" });
+    }
+
+    /// ProductBuildVersion of the Xcode the SDK bundle was made from (`--xcode-version`),
+    /// recorded as the metadata's toolsVersion.
+    pub fn xcodeBuildVersion(t: *const Toolchain) []const u8 {
+        const fallback = "16A242d";
+        const path = std.fs.path.join(t.a, &.{ t.sdk_bundle, "Xcode.app/Contents/version.plist" }) catch return fallback;
+        const p = plist.readFile(t.a, path) catch return fallback;
+        defer p.deinit();
+        const v = (p.getString(t.a, "ProductBuildVersion") catch null) orelse return fallback;
+        return t.a.dupe(u8, v) catch fallback;
+    }
+
     // ------------------------------------------------------------ check
 
     pub fn check(t: *const Toolchain) !bool {
@@ -279,6 +304,7 @@ pub const Toolchain = struct {
             .{ "xtool", try fsutil.which(t.a, t.cfg.xtool, t.pathEnv()), true },
             .{ "actool", try t.findActool(), true },
             .{ "rsvg-convert", try fsutil.which(t.a, "rsvg-convert", t.pathEnv()), true },
+            .{ "appintents", try t.appIntentsProcessor(), true },
         };
         for (rows) |r| {
             const why: ?[]const u8 = if (std.mem.eql(u8, r[0], "xtool"))
@@ -287,6 +313,8 @@ pub const Toolchain = struct {
                 "  (only needed for .xcassets; build with `zig build actool`)"
             else if (std.mem.eql(u8, r[0], "rsvg-convert"))
                 "  (only needed for SVG images in .xcassets; librsvg)"
+            else if (std.mem.eql(u8, r[0], "appintents"))
+                "  (only needed for App Intents / WidgetKit targets; re-appintentsmetadataprocessor)"
             else
                 null;
             const optional = why != null;

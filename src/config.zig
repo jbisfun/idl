@@ -92,6 +92,9 @@ pub const ToolchainConfig = struct {
     /// Asset catalog compiler (tools/idl-actool, AssetKit). Path or command name;
     /// also looked up next to the idl executable.
     actool: []const u8 = "idl-actool",
+    /// App Intents metadata processor (Apple's, or the open re-appintentsmetadataprocessor).
+    /// Path or command name; needed by targets with `app_intents`.
+    appintents: []const u8 = "appintentsmetadataprocessor",
     /// 0 = number of CPUs.
     jobs: usize = 0,
     /// Jimpactor data dir (relaunch.port, ipc.token). Default: $XDG_CONFIG_HOME/Jimpactor or ~/.config/Jimpactor.
@@ -155,6 +158,10 @@ pub const Target = struct {
     embed: []const []const u8 = &.{},
     /// Pass `-dead_strip` to the linker.
     dead_strip: bool = true,
+    /// Extract App Intents metadata (Swift const values + appintentsmetadataprocessor)
+    /// into `Metadata.appintents`; static targets hand their const values to the
+    /// bundles linking them. null = when the target links AppIntents or WidgetKit.
+    app_intents: ?bool = null,
     /// Commands (argv lists) run in order after an app's IPA is written. They
     /// run in the target directory with IDL_IPA, IDL_APP, IDL_BUILD_DIR and
     /// IDL_TARGET set. YAML: one argv list, or a list of argv lists.
@@ -203,6 +210,17 @@ pub const Target = struct {
             .sources = t.sources,
             .resources = t.resources,
         };
+    }
+
+    /// Whether builds extract App Intents metadata; `explicit` tells a request
+    /// (missing tool = error) from the WidgetKit/AppIntents default (warning).
+    /// Static targets only emit const values; the bundles linking them extract.
+    pub fn appIntents(t: Target) struct { enabled: bool, explicit: bool } {
+        if (t.builder != .direct or t.type == .dylib) return .{ .enabled = false, .explicit = false };
+        if (t.app_intents) |v| return .{ .enabled = v, .explicit = v };
+        for (t.frameworks) |f| if (fsutil.oneOf(f, &.{ "AppIntents", "AppIntents.framework", "WidgetKit", "WidgetKit.framework" }))
+            return .{ .enabled = true, .explicit = false };
+        return .{ .enabled = false, .explicit = false };
     }
 
     pub fn signs(t: Target) bool {
@@ -291,9 +309,10 @@ const target_keys = [_][]const u8{
     "framework_dirs",  "link",             "embed",
     "dead_strip",      "post_build",       "quote_include_dirs",
     "tests",           "lint",             "format",
+    "app_intents",
 };
 const default_forbidden = [_][]const u8{ "name", "dir", "bundle_id" };
-const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "jobs", "jimpactor_dir", "clang_format", "clang_tidy", "swift_format" };
+const toolchain_keys = [_][]const u8{ "sdk_bundle", "sdk", "swiftly_bin", "cc", "cxx", "swiftc", "xtool", "ldid", "actool", "appintents", "jobs", "jimpactor_dir", "clang_format", "clang_tidy", "swift_format" };
 const top_keys = [_][]const u8{ "toolchain", "defaults", "targets", "configurations" };
 
 fn checkKeys(m: ynode.Map, allowed: []const []const u8, where: []const u8) !void {
@@ -855,4 +874,39 @@ test "product kinds, link/embed validation and dependency order" {
             return err;
         };
     }
+}
+
+test "app_intents follows WidgetKit/AppIntents unless set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try parse(a,
+        \\targets:
+        \\  - name: App
+        \\    bundle_id: com.example.app
+        \\    embed: [Widgets]
+        \\  - name: Widgets
+        \\    type: appex
+        \\    bundle_id: com.example.app.widgets
+        \\    frameworks: [SwiftUI, WidgetKit]
+        \\  - name: Off
+        \\    type: appex
+        \\    bundle_id: com.example.app.off
+        \\    frameworks: [AppIntents]
+        \\    app_intents: false
+        \\  - name: On
+        \\    type: framework
+        \\    bundle_id: com.example.on
+        \\    app_intents: true
+        \\  - name: Shared
+        \\    type: static
+        \\    frameworks: [AppIntents]
+        \\
+    , "/proj/idlproj.yml");
+    try testing.expect(cfg.targets[4].appIntents().enabled);
+    try testing.expect(!cfg.targets[0].appIntents().enabled);
+    try testing.expect(cfg.targets[1].appIntents().enabled);
+    try testing.expect(!cfg.targets[1].appIntents().explicit);
+    try testing.expect(!cfg.targets[2].appIntents().enabled);
+    try testing.expect(cfg.targets[3].appIntents().enabled and cfg.targets[3].appIntents().explicit);
 }

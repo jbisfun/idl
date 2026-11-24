@@ -18,6 +18,13 @@ their inputs; `--strict` rejects them before app compilation:
 - Metal shaders (`.metal`) are listed in generated Xcode projects but are not
   compiled by `direct` builds.
 
+App Intents metadata needs an external processor (`toolchain.appintents`,
+re-appintentsmetadataprocessor). Intents in linked `static` targets are
+extracted into each bundle that links them; a `framework` target carries its
+own `Metadata.appintents`, but dependents don't reference it
+(`--metadata-file-list`). App Shortcuts phrase localization (`.stringsdata`)
+is not produced.
+
 String Catalogs (`.xcstrings`), storyboards, XIBs and asset catalogs are
 compiled on Linux, with the limits below.
 

@@ -26,6 +26,7 @@ being ignored. Write version numbers as text and quote them when you like:
 | `ldid` | `ldid` | ldid path or command name (needed when a target signs) |
 | `jobs` | `0` | number of parallel compile jobs (`0` = number of CPUs) |
 | `actool` | `idl-actool` | asset catalog compiler (`zig build actool`); a path, or a name looked up on PATH and next to `idl` |
+| `appintents` | `appintentsmetadataprocessor` | App Intents metadata processor ([re-appintentsmetadataprocessor](https://codeberg.org/viraptor/re-appintentsmetadataprocessor), same CLI as Xcode's); a path or a name on PATH. Needed by `app_intents` targets |
 | `jimpactor_dir` | `$XDG_CONFIG_HOME/Jimpactor` or `~/.config/Jimpactor` | Jimpactor data dir, used by `idl devices` and `idl install` |
 
 `~` is expanded in paths.
@@ -70,11 +71,53 @@ they must stay inside it (no absolute paths, no `..`).
 | `weak_frameworks` | `[]` | weakly linked frameworks |
 | `libraries` | `[]` | `-l` libraries, e.g. `[z, sqlite3]` |
 | `build_dir` | `build` | where objects, the app bundle and the IPA go |
+| `app_intents` | on when `frameworks` has `AppIntents` or `WidgetKit`, or a linked static target has intents | extract App Intents metadata into `Metadata.appintents` (see below) |
 
 If a target has any `.swift` file, swiftc compiles all Swift sources in one
 whole-module compilation and links the clang-compiled objects. Debug builds
 compile Swift to a persistent `.swift.o` and link separately, retaining DWARF
 without requiring `dsymutil`. Otherwise clang links. C++ sources add `-lc++`.
+
+### App Intents metadata
+
+iOS reads a bundle's `Metadata.appintents` to find its App Intents: Shortcuts
+actions, `AppIntentConfiguration` widget settings and interactive widget
+buttons (`Button(intent:)`). Without it the intents compile but never run.
+For an `app_intents` target (app, appex or framework) idl does what Xcode's
+ExtractAppIntentsMetadata step does:
+
+1. swiftc writes the module's const values (`-emit-const-values-path` with the
+   App Intents protocol list as `-const-gather-protocols-file`).
+2. After linking, `toolchain.appintents` reads the binary, sources and const
+   values (`--compile-time-extraction`) and writes
+   `<obj>/appintents/Metadata.appintents` (`extract.actionsdata`, `version.json`).
+3. The bundle gets it at its root, e.g. `PlugIns/Widgets.appex/Metadata.appintents`.
+
+A `static` target with `app_intents` only records its const values; every
+bundle that links it extracts the static module together with its own (so an
+intent shared by an app and its widget extension, such as an
+`AudioPlaybackIntent` that must run in the app, lives in one static target
+linked by both). Linking such a target turns extraction on for the bundle.
+
+A module that declares no intents produces no metadata. With the default
+(WidgetKit/AppIntents in `frameworks`) a missing processor is a warning; with
+`app_intents: true` or `--strict` it is an error. `app_intents: false` turns
+it off.
+
+A WidgetKit extension is an `appex` with a Swift `@main WidgetBundle` and no
+`ldflags` entry point:
+
+```yaml
+  - name: Widgets
+    type: appex
+    bundle_id: com.example.app.widgets
+    min_ios: "17.0"
+    sources: [Widgets]
+    frameworks: [SwiftUI, WidgetKit, AppIntents]
+    info:
+      NSExtension:
+        NSExtensionPointIdentifier: com.apple.widgetkit-extension
+```
 
 ### Bundle
 
@@ -171,7 +214,8 @@ first. Cycles are an error. Each kind produces:
   signed with `-I<bundle_id>`), built with `-fapplication-extension` /
   `-application-extension`. Rpaths include `@executable_path/../../Frameworks`.
   Apps embed it under `PlugIns/`. The entry point comes from `ldflags` (e.g.
-  `[-e, _NSExtensionMain]`) or a Swift `@main`.
+  `[-e, _NSExtensionMain]` for principal-class extensions such as keyboards) or
+  a Swift `@main` (WidgetKit `WidgetBundle`, ExtensionKit).
 - `static`: compiled objects plus `<name>.swiftmodule` and `<name>-Swift.h`. A
   linking target receives the objects in its link, `-I` for the module, and the
   header dir. Not signed. No `bundle_id`.

@@ -75,9 +75,14 @@ fn mtime(path: []const u8) ?i128 {
 }
 
 fn commandKey(c: Ctx, argv: []const []const u8) ![]const u8 {
+    return commandKeyProbe(c, argv, true);
+}
+
+/// `probe`: fingerprint `argv[0] --version` output too (tools without it use contents only).
+fn commandKeyProbe(c: Ctx, argv: []const []const u8, probe: bool) ![]const u8 {
     var f: state.Fingerprint = .{};
     for (argv) |arg| f.add(arg);
-    f.add(try c.tc.identity(argv[0], true));
+    f.add(try c.tc.identity(argv[0], probe));
     f.add(c.tc.sdk orelse "");
     f.add(c.tc.sdk_version orelse "");
     f.add(try c.tc.identity(c.tc.ld64, true));
@@ -211,6 +216,10 @@ pub const Product = struct {
     header_dir: ?[]const u8 = null,
     /// App IPA.
     ipa: ?[]const u8 = null,
+    /// Static targets with App Intents: their const values and Swift sources,
+    /// extracted together with the module of the bundle that links them.
+    const_values: ?[]const u8 = null,
+    swift_sources: []const []const u8 = &.{},
 };
 pub const Products = std.StringHashMap(Product);
 
@@ -220,6 +229,9 @@ const Deps = struct {
     link_args: []const []const u8,
     objects: []const []const u8,
     inputs: []const []const u8,
+    /// Linked static targets' App Intents const values and sources.
+    intent_consts: []const []const u8 = &.{},
+    intent_sources: []const []const u8 = &.{},
 };
 
 fn product(c: Ctx, name: []const u8) !Product {
@@ -234,8 +246,14 @@ fn resolveDeps(c: Ctx) !Deps {
     var link_args = std.ArrayList([]const u8).init(a);
     var objects = std.ArrayList([]const u8).init(a);
     var inputs = std.ArrayList([]const u8).init(a);
+    var intent_consts = std.ArrayList([]const u8).init(a);
+    var intent_sources = std.ArrayList([]const u8).init(a);
     for (c.t.link) |name| {
         const p = try product(c, name);
+        if (p.const_values) |cv| {
+            try intent_consts.append(cv);
+            try intent_sources.appendSlice(p.swift_sources);
+        }
         switch (p.kind) {
             .framework => {
                 const bin = p.link_binary.?;
@@ -259,7 +277,7 @@ fn resolveDeps(c: Ctx) !Deps {
         }
         if (p.header_dir) |d| try c_flags.appendSlice(&.{ "-I", d });
     }
-    return .{ .swift_flags = swift_flags.items, .c_flags = c_flags.items, .link_args = link_args.items, .objects = objects.items, .inputs = inputs.items };
+    return .{ .swift_flags = swift_flags.items, .c_flags = c_flags.items, .link_args = link_args.items, .objects = objects.items, .inputs = inputs.items, .intent_consts = intent_consts.items, .intent_sources = intent_sources.items };
 }
 
 /// Like Xcode: only a file named main.swift may hold top-level code; every
@@ -272,9 +290,92 @@ fn parseAsLibrary(t: Target, swift: []const []const u8) bool {
 
 const SwiftOut = struct { obj: []const u8, module_dir: ?[]const u8, header_dir: ?[]const u8, changed: bool };
 
+// ------------------------------------------------------------ app intents
+
+/// Protocols whose conformances swiftc records as const values for the App
+/// Intents metadata processor (Xcode's SWIFT_EMIT_CONST_VALUE_PROTOCOLS).
+/// Refinements such as WidgetConfigurationIntent are found through AppIntent.
+const app_intents_protocols = [_][]const u8{
+    "AppIntent",                 "EntityQuery",                    "AppEntity",
+    "TransientEntity",           "AppEnum",                        "AppShortcutProviding",
+    "AppShortcutsProvider",      "AnyResolverProviding",           "AppIntentsPackage",
+    "DynamicOptionsProvider",    "_IntentValueRepresentable",      "_AssistantIntentsProvider",
+    "_GenerativeFunctionExtractable", "IntentValueQuery",
+};
+
+/// The metadata processor for a target that extracts App Intents metadata, or
+/// null. Without the tool, an explicit `app_intents: true` (or `--strict`) fails;
+/// the WidgetKit/AppIntents default only warns (`warn`), since the app still
+/// builds but its intents and widget configuration won't work on a device.
+/// `linked_intents`: a linked static target carries App Intents, which turns
+/// extraction on for this bundle too.
+fn appIntentsTool(tc: *Toolchain, t: Target, strict: bool, warn: bool, linked_intents: bool) !?[]const u8 {
+    const mode = t.appIntents();
+    if (t.type == .static or t.app_intents == false or !(mode.enabled or linked_intents)) return null;
+    if (try tc.appIntentsProcessor()) |tool| return tool;
+    if (mode.explicit or strict or t.strict)
+        return diag.fail("{s}: app_intents needs {s} (re-appintentsmetadataprocessor, e.g. `nix profile install nixpkgs#re-appintentsmetadataprocessor`), or set toolchain.appintents", .{ t.name, tc.cfg.appintents });
+    if (warn) diag.warn("{s}: {s} not found; skipping App Intents metadata (intents and widget configuration won't work on a device). Set `app_intents: false` to silence", .{ t.name, tc.cfg.appintents });
+    return null;
+}
+
+fn constValuesPath(a: Allocator, obj_dir: []const u8, t: Target) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}.swiftconstvalues", .{ obj_dir, t.name });
+}
+
+/// swiftc flags that write the module's const values for the metadata processor.
+fn constValueFlags(a: Allocator, obj_dir: []const u8, t: Target) ![]const []const u8 {
+    try std.fs.cwd().makePath(obj_dir);
+    const protocols = try std.fmt.allocPrint(a, "{s}/{s}.const_extract_protocols.json", .{ obj_dir, t.name });
+    var json = std.ArrayList(u8).init(a);
+    try std.json.stringify(app_intents_protocols, .{}, json.writer());
+    _ = try fsutil.writeIfChanged(a, protocols, json.items);
+    return a.dupe([]const u8, &.{ "-emit-const-values-path", try constValuesPath(a, obj_dir, t), "-Xfrontend", "-const-gather-protocols-file", "-Xfrontend", protocols });
+}
+
+/// Run the metadata processor over the linked binary and the module's const
+/// values. Returns `<obj>/appintents/Metadata.appintents`, or null when the
+/// module declares no intents (the processor writes nothing).
+fn extractAppIntents(c: Ctx, tool: []const u8, linked: []const u8, swift: []const []const u8, obj_dir: []const u8, deps: Deps, changed: bool) !?[]const u8 {
+    const a = c.a;
+    const t = c.t;
+    const out_dir = try std.fs.path.join(a, &.{ obj_dir, "appintents" });
+    const result = try std.fs.path.join(a, &.{ out_dir, "Metadata.appintents" });
+    const consts = try constValuesPath(a, obj_dir, t);
+    const source_list = try std.fmt.allocPrint(a, "{s}/{s}.SwiftFileList", .{ obj_dir, t.name });
+    const const_list = try std.fmt.allocPrint(a, "{s}/{s}.SwiftConstValuesFileList", .{ obj_dir, t.name });
+    // Linked static modules are extracted with this one, under their own module names.
+    const sources = try std.mem.concat(a, []const u8, &.{ swift, deps.intent_sources });
+    const const_files = try std.mem.concat(a, []const u8, &.{ &.{consts}, deps.intent_consts });
+    _ = try fsutil.writeIfChanged(a, source_list, try std.mem.concat(a, u8, &.{ try std.mem.join(a, "\n", sources), "\n" }));
+    _ = try fsutil.writeIfChanged(a, const_list, try std.mem.concat(a, u8, &.{ try std.mem.join(a, "\n", const_files), "\n" }));
+    const argv = [_][]const u8{
+        tool,                  "--output",              out_dir,
+        "--toolchain-dir",     try c.tc.xcodeToolchainDir(), "--module-name",
+        t.name,                "--sdk-root",            c.tc.sdk.?,
+        "--xcode-version",     c.tc.xcodeBuildVersion(), "--platform-family",
+        "iOS",                 "--deployment-target",   t.min_ios,
+        "--target-triple",     try c.tc.triple(t),      "--binary-file",
+        linked,                "--bundle-identifier",   t.bundle_id,
+        "--source-file-list",  source_list,             "--swift-const-vals-list",
+        const_list,            "--compile-time-extraction", "--force",
+    };
+    const key = try commandKeyProbe(c, &argv, false);
+    const stamp = try std.fs.path.join(a, &.{ obj_dir, "appintents.extract" });
+    if (!changed and try upToDate(a, stamp, key, try std.mem.concat(a, []const u8, &.{ &.{ linked, source_list, const_list }, const_files }), t.dir))
+        return if (fsutil.kind(result) == .dir) result else null;
+    try std.fs.cwd().deleteTree(out_dir);
+    try std.fs.cwd().makePath(out_dir);
+    if (!c.opts.verbose) diag.info("  INTENTS [{s}]", .{t.name});
+    try run(c, &argv, t.dir);
+    try std.fs.cwd().writeFile(.{ .sub_path = stamp, .data = "" });
+    try writeStamp(a, stamp, key);
+    return if (fsutil.kind(result) == .dir) result else null;
+}
+
 /// Whole-module Swift compile to one object. Runs before the C-family compile
 /// so Objective-C in the same target can import the generated `<Module>-Swift.h`.
-fn compileSwift(c: Ctx, swift: []const []const u8, obj_dir: []const u8, module_cache: []const u8, deps: Deps, has_c: bool) !SwiftOut {
+fn compileSwift(c: Ctx, swift: []const []const u8, obj_dir: []const u8, module_cache: []const u8, deps: Deps, has_c: bool, const_values: bool) !SwiftOut {
     const a = c.a;
     const t = c.t;
     const obj = try std.fmt.allocPrint(a, "{s}/{s}.swift.o", .{ obj_dir, t.name });
@@ -285,6 +386,7 @@ fn compileSwift(c: Ctx, swift: []const []const u8, obj_dir: []const u8, module_c
     try argv.appendSlice(deps.swift_flags);
     try argv.appendSlice(swift);
     try argv.appendSlice(&.{ "-c", "-o", obj });
+    if (const_values) try argv.appendSlice(try constValueFlags(a, obj_dir, t));
     var module_dir: ?[]const u8 = null;
     var header_dir: ?[]const u8 = null;
     // Emitting the ObjC header implies emitting a module; without an explicit
@@ -490,6 +592,10 @@ pub fn checkTarget(a: Allocator, tc: *Toolchain, t: Target, strict: bool) !void 
         _ = try metadata.processInfoPlist(a, t, &tc.env, null);
         _ = try metadata.entitlements(a, t, &tc.env);
     }
+    if (swift) {
+        // No --version: the processor only takes a full extraction command line.
+        if (try appIntentsTool(tc, t, strict, true, false)) |tool| _ = try tc.identity(tool, false);
+    }
     for (try fsutil.discover(a, t.dir, t.resources, "resource")) |rel| {
         const suffix = fsutil.suffix(rel);
         if (fsutil.oneOf(suffix, &.{ ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".metal", ".mlmodel", ".mlpackage" }) and (strict or t.strict))
@@ -540,8 +646,10 @@ fn buildDirect(c: Ctx) !Product {
     var objects = std.ArrayList([]const u8).init(a);
     var changed = false;
     var swift_out: ?SwiftOut = null;
+    const intents_tool = if (swift.items.len > 0) try appIntentsTool(c.tc, t, c.opts.strict, deps.intent_consts.len > 0, deps.intent_consts.len > 0) else null;
+    const const_values = swift.items.len > 0 and (intents_tool != null or (t.type == .static and t.appIntents().enabled));
     if (swift.items.len > 0) {
-        swift_out = try compileSwift(c, swift.items, obj_dir, module_cache, deps, has_c);
+        swift_out = try compileSwift(c, swift.items, obj_dir, module_cache, deps, has_c, const_values);
         changed = swift_out.?.changed;
     }
     var extra = std.ArrayList([]const u8).init(a);
@@ -554,15 +662,24 @@ fn buildDirect(c: Ctx) !Product {
 
     if (t.type == .static) {
         if (objects.items.len == 0) return diag.fail("target '{s}': no compilable sources found", .{t.name});
-        return .{ .name = t.name, .kind = t.type, .objects = objects.items, .module_dir = if (swift_out) |so| so.module_dir else null, .header_dir = if (swift_out) |so| so.header_dir else null };
+        return .{
+            .name = t.name,
+            .kind = t.type,
+            .objects = objects.items,
+            .module_dir = if (swift_out) |so| so.module_dir else null,
+            .header_dir = if (swift_out) |so| so.header_dir else null,
+            .const_values = if (const_values) try constValuesPath(a, obj_dir, t) else null,
+            .swift_sources = if (const_values) swift.items else &.{},
+        };
     }
     const linked = try linkOutput(a, t, build_dir);
     try link(c, objects.items, changed, swift.items.len > 0, need_cxx, linked, module_cache, deps);
+    const intents = if (intents_tool) |tool| try extractAppIntents(c, tool, linked, swift.items, obj_dir, deps, changed) else null;
     var p: Product = .{ .name = t.name, .kind = t.type, .link_binary = linked, .module_dir = if (swift_out) |so| so.module_dir else null, .header_dir = if (swift_out) |so| so.header_dir else null };
     switch (t.type) {
         .dylib => p.bundle = try assembleDylib(c, linked, build_dir),
-        .framework, .appex => p.bundle = try assembleBundle(c, linked, build_dir),
-        .app => p.ipa = try assembleBundle(c, linked, build_dir),
+        .framework, .appex => p.bundle = try assembleBundle(c, linked, build_dir, intents),
+        .app => p.ipa = try assembleBundle(c, linked, build_dir, intents),
         .static => unreachable,
     }
     return p;
@@ -650,7 +767,7 @@ fn assembleDylib(c: Ctx, linked: []const u8, build_dir: []const u8) ![]const u8 
 
 /// Bundle, sign and (for apps) package an app, framework or extension.
 /// Returns the IPA for apps, otherwise the signed bundle directory.
-fn assembleBundle(c: Ctx, linked: []const u8, build_dir: []const u8) ![]const u8 {
+fn assembleBundle(c: Ctx, linked: []const u8, build_dir: []const u8, intents: ?[]const u8) ![]const u8 {
     const a = c.a;
     const t = c.t;
     const is_app = t.type == .app;
@@ -668,6 +785,12 @@ fn assembleBundle(c: Ctx, linked: []const u8, build_dir: []const u8) ![]const u8
         for (prepared.outputs) |o| if (std.mem.eql(u8, o.dest, dest) or std.mem.startsWith(u8, o.dest, try std.fmt.allocPrint(a, "{s}/", .{dest})))
             return diag.fail("{s}: resource {s} collides with embedded target {s}", .{ t.name, o.owner, name });
         try embeds.append(.{ .src = p.bundle.?, .dest = dest });
+    }
+    // App Intents metadata goes to the bundle root, like Xcode's ExtractAppIntentsMetadata.
+    if (intents) |dir| {
+        for (prepared.outputs) |o| if (std.mem.eql(u8, o.dest, "Metadata.appintents") or std.mem.startsWith(u8, o.dest, "Metadata.appintents/"))
+            return diag.fail("{s}: resource {s} collides with the generated Metadata.appintents", .{ t.name, o.owner });
+        try embeds.append(.{ .src = dir, .dest = "Metadata.appintents" });
     }
 
     var fingerprint: state.Fingerprint = .{};
