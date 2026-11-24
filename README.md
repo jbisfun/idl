@@ -16,7 +16,7 @@ The build steps come from the Linux build used by LiveContainer.
 ## Quick start
 
     xtool setup                   # Darwin SDK -> ~/.swiftpm/swift-sdks/darwin.artifactbundle
-    zig build                     # builds ./zig-out/bin/idl (Zig 0.14.1)
+    zig build                     # builds ./zig-out/bin/idl (Zig 0.17.1)
     ./zig-out/bin/idl check       # verify the toolchain
     zig build actool              # optional: .xcassets compiler (needs swift)
     ./zig-out/bin/idl build --strict -c release  # preflight, then build every example
@@ -48,7 +48,8 @@ See [workflows](docs/workflows.md#strict-preflight-and-build-profiles).
 
     idl fmt [--check]      # clang-format (C/ObjC/C++/ObjC++) + swift-format, configs generated from YAML
     idl lint [--analyze]   # clang -Wall, swiftc -typecheck, clang-tidy, analyzer, all with the real build flags
-    idl test               # bundle checks (arm64/iOS/signed, @rpath resolution, plists) + `tests:` commands
+    idl test               # bundle checks (arm64/iOS/signed, @rpath resolution, plists) + `tests:` commands,
+                           # and `type: test` targets: XCTest/swift-testing (SwiftPM) or C tests run on the Linux host
 
 idl only orchestrates installed tools and merges their diagnostics into one
 report. See [configuration](docs/configuration.md#formatting-linting-and-tests-idl-fmt-idl-lint-idl-test).
@@ -60,7 +61,7 @@ report. See [configuration](docs/configuration.md#formatting-linting-and-tests-i
     src/               the idl tool (see docs/architecture.md)
     tools/idl-actool/  Swift wrapper around AssetKit for .xcassets
     examples/          ObjC, Swift, storyboard/XIB/asset-catalog and xtool/SwiftPM
-                       apps, plus xcconfig patterns
+                       apps, host unit tests (swift-tests, c-tests), plus xcconfig patterns
     docs/              documentation
 
 ## Documentation

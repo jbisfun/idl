@@ -16,7 +16,7 @@ pub const Builder = enum { direct, xtool };
 
 /// What a target produces. Only `app` targets are packaged as IPAs; the other
 /// kinds are built for, linked into and/or embedded in an app via `link` and
-/// `embed`.
+/// `embed`. `test` targets are built and run on the Linux host by `idl test`.
 pub const Kind = enum {
     app,
     /// Dynamic framework: `<name>.framework` (install name `@rpath/<name>.framework/<name>`).
@@ -27,6 +27,11 @@ pub const Kind = enum {
     appex,
     /// Objects + Swift module only; linked directly into dependents.
     static,
+    /// Unit tests compiled for and run on the Linux host (`idl test`), together
+    /// with the sources of the static targets it `link`s. Swift: XCTest /
+    /// swift-testing through a generated SwiftPM package; C/C++: an executable
+    /// whose exit status is the result.
+    @"test",
 
     pub fn bundled(k: Kind) bool {
         return k == .app or k == .framework or k == .appex;
@@ -105,6 +110,10 @@ pub const ToolchainConfig = struct {
     clang_tidy: []const u8 = "clang-tidy",
     swift_format: []const u8 = "swift-format",
 };
+
+/// Frameworks a host (Linux) test target or the code it tests may use: the
+/// Swift toolchain's corelibs. Everything else is iOS-only.
+pub const host_frameworks = [_][]const u8{ "Foundation", "FoundationEssentials", "FoundationNetworking", "FoundationXML", "Dispatch", "XCTest", "Testing" };
 
 pub const Target = struct {
     name: []const u8,
@@ -217,7 +226,7 @@ pub const Target = struct {
     /// (missing tool = error) from the WidgetKit/AppIntents default (warning).
     /// Static targets only emit const values; the bundles linking them extract.
     pub fn appIntents(t: Target) struct { enabled: bool, explicit: bool } {
-        if (t.builder != .direct or t.type == .dylib) return .{ .enabled = false, .explicit = false };
+        if (t.builder != .direct or t.type == .dylib or t.type == .@"test") return .{ .enabled = false, .explicit = false };
         if (t.app_intents) |v| return .{ .enabled = v, .explicit = v };
         for (t.frameworks) |f| if (fsutil.oneOf(f, &.{ "AppIntents", "AppIntents.framework", "WidgetKit", "WidgetKit.framework" }))
             return .{ .enabled = true, .explicit = false };
@@ -225,7 +234,7 @@ pub const Target = struct {
     }
 
     pub fn signs(t: Target) bool {
-        if (t.type == .static) return false;
+        if (t.type == .static or t.type == .@"test") return false;
         return t.sign orelse (t.builder == .direct);
     }
 
@@ -236,7 +245,7 @@ pub const Target = struct {
             .framework => std.fmt.allocPrint(a, "{s}.framework", .{t.name}),
             .appex => std.fmt.allocPrint(a, "{s}.appex", .{t.name}),
             .dylib => std.fmt.allocPrint(a, "{s}.dylib", .{t.name}),
-            .static => t.name,
+            .static, .@"test" => t.name,
         };
     }
 
@@ -471,7 +480,7 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
     };
     const kind_node = m.get("type") orelse if (defaults) |d| d.get("type") else null;
     if (kind_node) |k| t.type = std.meta.stringToEnum(Kind, try c.str(k, "type")) orelse
-        return diag.fail("{s}: type must be app, framework, dylib, appex or static", .{c.where});
+        return diag.fail("{s}: type must be app, framework, dylib, appex, static or test", .{c.where});
     if (m.get("post_build") orelse if (defaults) |d| d.get("post_build") else null) |pb| t.post_build = try c.commands(pb, "post_build");
     if (m.get("tests") orelse if (defaults) |d| d.get("tests") else null) |v| t.tests = try c.commands(v, "tests");
     if (m.get("lint") orelse if (defaults) |d| d.get("lint") else null) |v| t.lint = try c.section(LintConfig, v, "lint");
@@ -509,9 +518,17 @@ fn loadTarget(a: Allocator, root: []const u8, index: usize, node: Node, defaults
         if (t.xcodeproj) return diag.fail("{s}: xcodeproj generation is only supported for app targets", .{c.where});
         if (t.embed.len > 0) return diag.fail("{s}: only app targets can embed other targets", .{c.where});
         if (t.post_build.len > 0) return diag.fail("{s}: post_build is only supported for app targets", .{c.where});
-        if (t.tests.len > 0) return diag.fail("{s}: tests are only supported for app targets", .{c.where});
+        if (t.tests.len > 0) return diag.fail("{s}: `tests:` commands are only supported for app targets{s}", .{ c.where, if (t.type == .@"test") "; a test target's own sources are its tests" else "" });
         if (!t.type.bundled() and (t.resources.len > 0 or t.info_plist != null or t.info != null or t.entitlements != null or t.entitlement_values != null))
             return diag.fail("{s}: {s} targets have no bundle (resources, info and entitlements are not allowed)", .{ c.where, @tagName(t.type) });
+    }
+    if (t.type == .@"test") {
+        // The struct default (UIKit, Foundation) describes iOS targets.
+        if (m.get("frameworks") == null) t.frameworks = &.{};
+        try requireHostFrameworks(c.where, t, null);
+        if (t.weak_frameworks.len > 0 or t.framework_dirs.len > 0) return diag.fail("{s}: test targets run on the Linux host; weak_frameworks and framework_dirs are iOS-only", .{c.where});
+        if (t.bridging_header != null) return diag.fail("{s}: bridging_header is not supported for test targets (SwiftPM modules)", .{c.where});
+        if (t.app_intents == true) return diag.fail("{s}: app_intents is not supported for test targets", .{c.where});
     }
     for (t.framework_dirs) |d| try fsutil.validateRelativePath(d, "framework_dirs");
     for (t.include_dirs) |d| try fsutil.validateRelativePath(d, "include_dirs");
@@ -560,6 +577,16 @@ fn merge(a: Allocator, base: ynode.Map, overlay: ynode.Map) anyerror!ynode.Map {
 }
 
 const empty_map: ynode.Map = .{ .keys = &.{}, .values = &.{} };
+
+fn without(a: Allocator, m: ynode.Map, key: []const u8) !ynode.Map {
+    var keys: std.ArrayList([]const u8) = .empty;
+    var values: std.ArrayList(Node) = .empty;
+    for (m.keys, m.values) |k, v| if (!std.mem.eql(u8, k, key)) {
+        try keys.append(a, k);
+        try values.append(a, v);
+    };
+    return .{ .keys = keys.items, .values = values.items };
+}
 
 fn configurationMap(a: Allocator, node: ?Node, where: []const u8) !ynode.Map {
     const c: Ctx = .{ .a = a, .where = where };
@@ -652,7 +679,11 @@ pub fn parseConfiguration(a: Allocator, source: []const u8, path: []const u8, pr
     const targets = try a.alloc(Target, items.len);
     for (items, targets, 0..) |item, *t, i| {
         if (item != .map) return diag.fail("targets[{d}] must be a mapping", .{i});
-        const base = try merge(a, defaults orelse empty_map, item.map);
+        var base = try merge(a, defaults orelse empty_map, item.map);
+        // iOS frameworks from `defaults:` do not apply to host test targets.
+        if (base.get("type")) |k| if (k == .scalar and std.mem.eql(u8, k.scalar.text, "test") and item.map.get("frameworks") == null) {
+            base = try without(a, base, "frameworks");
+        };
         const variants = try a.create([2]Target);
         variants[0] = try profileTarget(a, root, i, base, global_profiles, "debug");
         variants[1] = try profileTarget(a, root, i, base, global_profiles, "release");
@@ -663,6 +694,17 @@ pub fn parseConfiguration(a: Allocator, source: []const u8, path: []const u8, pr
     cfg.targets = targets;
     try validateGraph(a, cfg.targets);
     return cfg;
+}
+
+/// Test targets and the static targets they test are compiled for the host,
+/// where only the Swift corelibs exist.
+fn requireHostFrameworks(where: []const u8, t: Target, tested_by: ?[]const u8) !void {
+    for (t.frameworks) |f| {
+        const base = if (std.mem.endsWith(u8, f, ".framework")) f[0 .. f.len - ".framework".len] else f;
+        if (fsutil.oneOf(base, &host_frameworks)) continue;
+        if (tested_by) |tt| return diag.fail("{s}: framework '{s}' is iOS-only, but test target '{s}' compiles this target for the Linux host; tested code must be host-portable (Foundation, XCTest, Testing)", .{ where, f, tt });
+        return diag.fail("{s}: framework '{s}' is iOS-only; test targets run on the Linux host and may only use Foundation, XCTest or Testing (set `frameworks: [Foundation]`)", .{ where, f });
+    }
 }
 
 fn findTarget(targets: []const Target, name: []const u8) ?Target {
@@ -678,6 +720,8 @@ fn validateGraph(a: Allocator, targets: []const Target) !void {
             const dep = findTarget(targets, n) orelse return diag.fail("target '{s}': link: unknown target '{s}'", .{ t.name, n });
             if (!fsutil.oneOf(@tagName(dep.type), &.{ "framework", "dylib", "static" }))
                 return diag.fail("target '{s}': cannot link {s} target '{s}'", .{ t.name, @tagName(dep.type), n });
+            if (t.type == .@"test" and dep.type != .static)
+                return diag.fail("test target '{s}': can only link static targets ('{s}' is a {s}; it would not run on the Linux host)", .{ t.name, n, @tagName(dep.type) });
         }
         for (t.embed) |n| {
             const dep = findTarget(targets, n) orelse return diag.fail("target '{s}': embed: unknown target '{s}'", .{ t.name, n });
@@ -687,6 +731,9 @@ fn validateGraph(a: Allocator, targets: []const Target) !void {
     }
     // Ordering doubles as cycle detection.
     _ = try buildOrder(a, targets, targets);
+    for (targets) |t| if (t.type == .@"test") for (try buildOrder(a, targets, &.{t})) |dep| {
+        if (dep.type == .static) try requireHostFrameworks(try std.fmt.allocPrint(a, "target '{s}'", .{dep.name}), dep, t.name);
+    };
 }
 
 /// `selected` plus everything it links or embeds (transitively), ordered so
@@ -909,4 +956,63 @@ test "app_intents follows WidgetKit/AppIntents unless set" {
     try testing.expect(!cfg.targets[1].appIntents().explicit);
     try testing.expect(!cfg.targets[2].appIntents().enabled);
     try testing.expect(cfg.targets[3].appIntents().enabled and cfg.targets[3].appIntents().explicit);
+}
+
+test "test targets: host frameworks, static links and profiles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source =
+        \\defaults:
+        \\  frameworks: [UIKit, Foundation]
+        \\targets:
+        \\  - name: App
+        \\    bundle_id: com.example.app
+        \\    link: [Core]
+        \\  - name: Core
+        \\    type: static
+        \\    frameworks: [Foundation]
+        \\  - name: CoreTests
+        \\    type: test
+        \\    sources: [Tests]
+        \\    link: [Core]
+        \\
+    ;
+    const cfg = try parse(a, source, "/proj/idlproj.yml");
+    const t = cfg.targets[2];
+    try testing.expectEqual(Kind.@"test", t.type);
+    try testing.expectEqual(@as(usize, 0), t.frameworks.len); // `defaults:` iOS frameworks are not inherited
+    try testing.expectEqualStrings("", t.bundle_id);
+    try testing.expect(!t.signs());
+    try testing.expect(!t.appIntents().enabled);
+    const order = try buildOrder(a, cfg.targets, &.{t});
+    try testing.expectEqual(@as(usize, 2), order.len);
+    try testing.expectEqualStrings("Core", order[0].name);
+    const d = (try parseConfiguration(a, source, "/proj/idlproj.yml", "debug")).targets[2];
+    try testing.expectEqualStrings("build/debug", d.build_dir);
+    try testing.expectEqualStrings("DEBUG", d.defines[d.defines.len - 1]);
+    const explicit = try parse(a, "targets:\n  - name: T\n    type: test\n    frameworks: [Foundation, XCTest]\n", "/p/idlproj.yml");
+    try testing.expectEqual(@as(usize, 2), explicit.targets[0].frameworks.len);
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "targets:\n  - name: T\n    type: test\n    frameworks: [UIKit]\n", "framework 'UIKit' is iOS-only" },
+        .{ "targets:\n  - name: S\n    type: static\n  - name: T\n    type: test\n    link: [S]\n", "tested code must be host-portable" },
+        .{ "targets:\n  - name: F\n    type: framework\n    bundle_id: com.example.f\n  - name: T\n    type: test\n    link: [F]\n", "can only link static targets" },
+        .{ "targets:\n  - name: T\n    type: test\n  - name: A\n    bundle_id: com.example.a\n    link: [T]\n", "cannot link test target" },
+        .{ "targets:\n  - name: T\n    type: test\n  - name: A\n    bundle_id: com.example.a\n    embed: [T]\n", "cannot embed test target" },
+        .{ "targets:\n  - name: T\n    type: test\n    tests: [sh, run.sh]\n", "a test target's own sources are its tests" },
+        .{ "targets:\n  - name: T\n    type: test\n    post_build: [sh, x.sh]\n", "post_build is only supported for app targets" },
+        .{ "targets:\n  - name: T\n    type: test\n    xcodeproj: true\n", "xcodeproj generation is only supported for app targets" },
+        .{ "targets:\n  - name: T\n    type: test\n    resources: [R]\n", "have no bundle" },
+        .{ "targets:\n  - name: T\n    type: test\n    builder: xtool\n", "only app targets can use builder: xtool" },
+        .{ "targets:\n  - name: T\n    type: test\n    bridging_header: B.h\n", "bridging_header is not supported" },
+        .{ "targets:\n  - name: T\n    type: unit\n", "static or test" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.Invalid, parse(a, case[0], "/p/idlproj.yml"));
+        testing.expect(std.mem.indexOf(u8, diag.msg, case[1]) != null) catch |err| {
+            std.debug.print("expected '{s}' in '{s}'\n", .{ case[1], diag.msg });
+            return err;
+        };
+    }
 }

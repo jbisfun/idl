@@ -28,7 +28,9 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("scaffold_main_m", .{ .root_source_file = b.path("examples/objc-app/Sources/main.m") });
     mod.addAnonymousImport("scaffold_main_swift", .{ .root_source_file = b.path("examples/swift-app/Sources/main.swift") });
 
-    const exe = b.addExecutable(.{ .name = "idl", .root_module = mod });
+    // LLVM even in Debug: the self-hosted x86_64 backend's unoptimized SHA-256
+    // makes tool fingerprinting (hundreds of MB per build) take ~20x longer.
+    const exe = b.addExecutable(.{ .name = "idl", .root_module = mod, .use_llvm = true });
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -48,7 +50,7 @@ pub fn build(b: *std.Build) void {
     actool_install.step.dependOn(&actool_build.step);
     b.step("actool", "Build and install idl-actool (AssetKit asset catalog compiler; needs swift)").dependOn(&actool_install.step);
 
-    const tests = b.addTest(.{ .root_module = mod });
+    const tests = b.addTest(.{ .root_module = mod, .use_llvm = true });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 
     // Convenience wrappers around the CLI for this repository's idlproj.yml.

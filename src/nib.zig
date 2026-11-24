@@ -320,7 +320,7 @@ pub fn encode(a: Allocator, root: *const Obj) ![]u8 {
         value_count += o.values.items.len;
         for (o.values.items) |v| {
             try writeFlex(a, &vals, v.key);
-            try vals.append(a, @intFromEnum(v.type));
+            try vals.append(a, @backingInt(v.type));
             switch (v.type) {
                 .int8 => try vals.append(a, @bitCast(@as(i8, @intCast(v.int)))),
                 .int16 => try putInt(a, &vals, i16, @intCast(v.int)),

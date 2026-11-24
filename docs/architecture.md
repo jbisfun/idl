@@ -29,6 +29,7 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/resources.zig` | resource cache, strict validation, output collision plan and storyboard/nib reference checks |
 | `src/buildstate.zig` | SHA-256 tree fingerprints, cache records/output integrity and per-directory OS locks |
 | `src/builder.zig` | parallel incremental compile, link, bundle assembly, signing, packaging, xtool runs, clean |
+| `src/hosttest.zig` | `type: test` targets: SwiftPM package (copied sources) + `swift test`, or host clang build + run |
 | `src/codegen.zig` | `xtool.yml`, `Package.swift`, `compile_commands.json`, protection against overwriting non-generated files |
 | `src/pbxproj.zig` | deterministic Xcode project + scheme; atomic, symlink-safe publishing |
 | `src/metadata.zig` | YAML-driven Info.plist and entitlements, shared by direct, Xcode and xtool builds |
@@ -45,13 +46,15 @@ idlproj.yml ──► config ──► codegen ─► .xcodeproj, xtool.yml, Pac
 | `src/scaffold.zig` | `idl init` (sources are embedded from `examples/` by `build.zig`) |
 | `src/fsutil.zig` | discovery rules shared with Xcode, path validation, symlink checks |
 | `src/diag.zig` | the single user-facing error message channel |
+| `src/sys.zig` | process-wide `std.Io` and environment (set once in `main`), file/process helpers |
 
 ## Dependencies
 
 All dependencies are pinned in `build.zig.zon`:
 
 - **zig-clap**: argument parsing and help text.
-- **zig-yaml**: YAML tokenizer and parser. `idl` walks its `Tree` directly
+- **zig-yaml**: YAML tokenizer and parser, pinned to a Zig 0.17 port of
+  upstream `main` (0.3.0; upstream has no 0.17 release). `idl` walks its `Tree` directly
   rather than using `Yaml.parse`, because the typed parser coerces `16.10` to
   a float and drops quoting.
 - **libplist** (libimobiledevice): reads and writes XML, binary, JSON and
@@ -59,11 +62,12 @@ All dependencies are pinned in `build.zig.zon`:
   and compiled from C source by `buildLibplist` in `build.zig` instead of its
   autotools build. Only the C core is built, not libplist++.
 - **zig-xml** (ianprime0509): XML reader for Interface Builder documents.
-  Pinned to the last commit that supports Zig 0.14.
+  Pinned to release 0.2.2 (Zig 0.16/0.17).
 - **AssetKit** (xtool-org): `.xcassets` to `Assets.car`, used only by
   `tools/idl-actool` (Swift package, pinned to 1.0.0). It is not linked into
   `idl`.
-- **Zig std**: deflate, CRC-32, SHA-1, JSON and processes. `idl` makes no
+- **Zig std**: deflate, CRC-32, SHA-1, JSON, processes and `translate-c`
+  (`plist.h` is translated by `build.zig`; Zig 0.16+ has no `@cImport`). `idl` makes no
   network requests except to Jimpactor on 127.0.0.1.
 
 ## Design notes

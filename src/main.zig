@@ -53,7 +53,8 @@ const usage_text =
     \\                         build, then sign + install through the running Jimpactor
     \\  fmt [target...]        format sources (clang-format, swift-format; --check to verify)
     \\  lint [target...]       compiler warnings, clang-tidy, analyzer, swift-format lint
-    \\  test [target...]       build, check app bundles, then run each app's `tests:`
+    \\  test [target...]       check app bundles + run apps' `tests:`; build and run
+    \\                         `type: test` targets on the host (default: all)
     \\
     \\Build/check/install: --strict rejects unsupported inputs.
     \\Project commands: -c debug|release selects isolated profile outputs.
@@ -167,6 +168,20 @@ fn parseSub(a: Allocator, comptime name: []const u8, comptime params: anytype, c
 
 const Project = struct { cfg: config.Config, tc: Toolchain };
 
+/// Targets built for iOS: everything but host `type: test` targets.
+fn iosTargets(a: Allocator, targets: []const config.Target) ![]const config.Target {
+    var out: std.ArrayList(config.Target) = .empty;
+    for (targets) |t| if (t.type != .@"test") try out.append(a, t);
+    return out.items;
+}
+
+/// Explicitly naming a test target for an iOS command is a mistake.
+fn rejectTestTargets(names: []const []const u8, selected: []const config.Target, command: []const u8) !void {
+    if (names.len == 0) return;
+    for (selected) |t| if (t.type == .@"test")
+        return diag.fail("{s}: '{s}' is a test target (built and run on the host by `idl test {s}`)", .{ command, t.name, t.name });
+}
+
 fn loadProject(a: Allocator, g: Global) !Project {
     return loadProjectConfiguration(a, g, null);
 }
@@ -251,7 +266,9 @@ fn cmdInstall(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
         try ipas.append(a, try sys.realpath(a, ipa));
     } else {
         var p = try loadProjectConfiguration(a, g, res.args.configuration);
-        const selected = try p.cfg.select(a, res.positionals[1]);
+        const named = try p.cfg.select(a, res.positionals[1]);
+        try rejectTestTargets(res.positionals[1], named, "install");
+        const selected = try iosTargets(a, named);
         const targets = if (res.args.@"no-build" == 0) try config.buildOrder(a, p.cfg.targets, selected) else selected;
         var session: ?builder.Session = if (res.args.@"no-build" == 0) try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0) else null;
         defer if (session) |*s| s.release();
@@ -285,13 +302,16 @@ fn cmdBuild(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const res = try parseSub(a, "build", &params, parsers, iter);
     var p = try loadProjectConfiguration(a, g, res.args.configuration);
     // Selected targets plus everything they link or embed, dependencies first.
-    const targets = try config.buildOrder(a, p.cfg.targets, try p.cfg.select(a, res.positionals[0]));
+    // Host test targets are left to `idl test`.
+    const selected = try p.cfg.select(a, res.positionals[0]);
+    try rejectTestTargets(res.positionals[0], selected, "build");
+    const targets = try config.buildOrder(a, p.cfg.targets, try iosTargets(a, selected));
     var session = try builder.prepareAll(a, &p.tc, targets, res.args.strict != 0, g.verbose or res.args.verbose != 0);
     defer session.release();
     var ipas: std.ArrayList([]const u8) = .empty;
     var products = builder.Products.init(a);
     for (targets, 0..) |t, i| {
-        if (res.args.gen != 0) try codegen.generate(a, &p.tc, t, .{});
+        if (res.args.gen != 0) try codegen.generate(a, &p.tc, p.cfg.targets, t, .{});
         const built = try builder.build(a, &p.tc, t, .{ .jobs = res.args.jobs orelse p.cfg.toolchain.jobs, .verbose = g.verbose or res.args.verbose != 0, .locked = true, .prepared = session.prepared[i], .strict = res.args.strict != 0, .products = &products, .post_build = res.args.@"no-post-build" == 0 });
         if (built.ipa) |ipa| try ipas.append(a, ipa);
     }
@@ -314,14 +334,14 @@ fn cmdGen(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     defer for (locks) |*lock| lock.release();
     for (targets) |t| {
         diag.info("==> {s}", .{t.name});
-        try codegen.generate(a, &p.tc, t, .{});
+        try codegen.generate(a, &p.tc, p.cfg.targets, t, .{});
         try quality.genEditorConfigs(a, t);
     }
 }
 
 /// Build `selected` plus dependencies (no post_build) and return the products.
 fn buildForQuality(a: Allocator, p: *Project, selected: []const config.Target, jobs: ?usize, verbose: bool, strict: bool) !builder.Products {
-    const targets = try config.buildOrder(a, p.cfg.targets, selected);
+    const targets = try config.buildOrder(a, p.cfg.targets, try iosTargets(a, selected));
     var session = try builder.prepareAll(a, &p.tc, targets, strict, verbose);
     defer session.release();
     var products = builder.Products.init(a);
@@ -364,7 +384,9 @@ fn cmdLint(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     );
     const res = try parseSub(a, "lint", &params, parsers, iter);
     var p = try loadProjectConfiguration(a, g, res.args.configuration);
-    const targets = try p.cfg.select(a, res.positionals[0]);
+    const named = try p.cfg.select(a, res.positionals[0]);
+    try rejectTestTargets(res.positionals[0], named, "lint");
+    const targets = try iosTargets(a, named);
     const verbose = g.verbose or res.args.verbose != 0;
     // Dependencies' modules and generated Swift headers come from a build.
     var products = try buildForQuality(a, &p, targets, res.args.jobs, verbose, false);
@@ -397,13 +419,20 @@ fn cmdTest(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     var p = try loadProjectConfiguration(a, g, res.args.configuration);
     const selected = try p.cfg.select(a, res.positionals[0]);
     const verbose = g.verbose or res.args.verbose != 0;
-    if (res.args.@"no-build" == 0) _ = try buildForQuality(a, &p, selected, res.args.jobs, verbose, res.args.strict != 0);
     var apps: std.ArrayList(config.Target) = .empty;
-    for (selected) |t| if (t.type == .app) try apps.append(a, t);
-    if (apps.items.len == 0) return diag.fail("test: no app targets selected", .{});
-    const locks = try builder.lockTargets(a, apps.items);
+    var tests: std.ArrayList(config.Target) = .empty;
+    for (selected) |t| switch (t.type) {
+        .app => try apps.append(a, t),
+        .@"test" => try tests.append(a, t),
+        else => {},
+    };
+    if (apps.items.len == 0 and tests.items.len == 0) return diag.fail("test: no app or test targets selected", .{});
+    // Apps (and whatever else was selected) are built for iOS; test targets
+    // are built for the host by runTests.
+    if (res.args.@"no-build" == 0 and apps.items.len > 0) _ = try buildForQuality(a, &p, selected, res.args.jobs, verbose, res.args.strict != 0);
+    const locks = try builder.lockTargets(a, try std.mem.concat(a, config.Target, &.{ apps.items, tests.items }));
     defer for (locks) |*lock| lock.release();
-    if (!try quality.runTests(a, &p.tc, apps.items, .{ .verbose = verbose })) return diag.fail("tests failed", .{});
+    if (!try quality.runTests(a, &p.tc, p.cfg.targets, apps.items, tests.items, .{ .verbose = verbose, .no_build = res.args.@"no-build" != 0 })) return diag.fail("tests failed", .{});
 }
 
 fn cmdCheck(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
@@ -420,7 +449,7 @@ fn cmdCheck(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
         const cfg = try config.loadConfiguration(a, file, res.args.configuration);
         var tc = try Toolchain.init(a, cfg.toolchain, cfg.root);
         _ = try tc.check(); // informational inventory; requirements are target-specific
-        var session = try builder.prepareAll(a, &tc, try config.buildOrder(a, cfg.targets, try cfg.select(a, res.positionals[0])), res.args.strict != 0, g.verbose);
+        var session = try builder.prepareAll(a, &tc, try config.buildOrder(a, cfg.targets, try iosTargets(a, try cfg.select(a, res.positionals[0]))), res.args.strict != 0, g.verbose);
         defer session.release();
         diag.info("preflight passed (no application sources compiled)", .{});
     } else {
@@ -440,7 +469,8 @@ fn cmdList(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void {
     const p = try loadProjectConfiguration(a, g, res.args.configuration);
     for (p.cfg.targets) |t| {
         const rel = try sys.relative(a, p.cfg.root, t.dir);
-        diag.info("{s:<24} {s:<9} {s:<7} {s:<36} iOS {s:<6} {s}", .{ t.name, @tagName(t.type), @tagName(t.builder), t.bundle_id, t.min_ios, if (rel.len == 0) "." else rel });
+        const platform = if (t.type == .@"test") "host" else try std.fmt.allocPrint(a, "iOS {s}", .{t.min_ios});
+        diag.info("{s:<24} {s:<9} {s:<7} {s:<36} {s:<10} {s}", .{ t.name, @tagName(t.type), @tagName(t.builder), t.bundle_id, platform, if (rel.len == 0) "." else rel });
     }
 }
 
@@ -499,6 +529,7 @@ fn cmdXcodeproj(a: Allocator, iter: *std.process.Args.Iterator, g: Global) !void
     const p = try loadProjectConfiguration(a, g, res.args.configuration);
     const name = res.positionals[0] orelse return diag.fail("xcodeproj: expected a target name", .{});
     const t = (try p.cfg.select(a, &.{name}))[0];
+    if (t.type == .@"test") return diag.fail("xcodeproj: '{s}' is a test target; Xcode projects describe iOS targets", .{t.name});
     const out = res.args.output orelse try std.fmt.allocPrint(a, "{s}/{s}.xcodeproj", .{ t.dir, t.name });
     var lock = try @import("buildstate.zig").Lock.acquire(a, t.dir);
     defer lock.release();
@@ -623,4 +654,5 @@ test {
     _ = @import("nib.zig");
     _ = @import("ibtool.zig");
     _ = @import("quality.zig");
+    _ = @import("hosttest.zig");
 }

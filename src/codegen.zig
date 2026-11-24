@@ -194,6 +194,81 @@ pub fn packageSwift(a: Allocator, t: Target) ![]const u8 {
     return b.written();
 }
 
+/// One SwiftPM target of a host test package (see hosttest.zig).
+pub const SwiftModule = struct {
+    target: Target,
+    /// Directory relative to the package root.
+    path: []const u8,
+    /// Module names it depends on.
+    deps: []const []const u8,
+    tests: bool = false,
+};
+
+/// SwiftPM language mode for a `swift_version` (4, 4.2, 5, 6).
+fn languageMode(v: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, v, "6")) return ".v6";
+    if (std.mem.eql(u8, v, "4.2")) return ".v4_2";
+    if (std.mem.startsWith(u8, v, "4")) return ".v4";
+    return ".v5";
+}
+
+/// Package.swift for a `type: test` target: one library target per tested
+/// static target, one test target. Built for the Linux host, so only Swift
+/// settings that make sense there are carried over.
+pub fn testPackageSwift(a: Allocator, name: []const u8, modules: []const SwiftModule) ![]const u8 {
+    var b: std.Io.Writer.Allocating = .init(a);
+    const w = &b.writer;
+    try w.writeAll("// swift-tools-version: 6.0\n// " ++ marker ++ " for `idl test`; edit idlproj.yml instead.\nimport PackageDescription\n\nlet package = Package(\n    name: ");
+    try swiftString(w, name);
+    try w.writeAll(",\n    targets: [\n");
+    for (modules) |m| {
+        const t = m.target;
+        try w.print("        .{s}(\n            name: ", .{if (m.tests) "testTarget" else "target"});
+        try swiftString(w, t.name);
+        try w.writeAll(",\n            dependencies: ");
+        try swiftStringList(w, m.deps);
+        try w.writeAll(",\n            path: ");
+        try swiftString(w, m.path);
+        try w.print(",\n            swiftSettings: [.swiftLanguageMode({s})", .{languageMode(t.swift_version)});
+        for (t.defines) |d| if (std.mem.indexOfScalar(u8, d, '=') == null) {
+            try w.writeAll(", .define(");
+            try swiftString(w, d);
+            try w.writeByte(')');
+        };
+        var flags: std.ArrayList([]const u8) = .empty;
+        for (t.include_dirs) |inc| try flags.appendSlice(a, &.{ "-I", try t.path(a, inc) });
+        for (t.quote_include_dirs) |d| try flags.appendSlice(a, &.{ "-Xcc", "-iquote", "-Xcc", try t.path(a, d) });
+        try flags.appendSlice(a, t.swiftflags);
+        if (flags.items.len > 0) {
+            try w.writeAll(", .unsafeFlags(");
+            try swiftStringList(w, flags.items);
+            try w.writeByte(')');
+        }
+        try w.writeByte(']');
+        if (t.libraries.len > 0 or t.ldflags.len > 0) {
+            try w.writeAll(",\n            linkerSettings: [");
+            for (t.libraries, 0..) |l, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll(".linkedLibrary(");
+                try swiftString(w, l);
+                try w.writeByte(')');
+            }
+            if (t.ldflags.len > 0) {
+                var xl: std.ArrayList([]const u8) = .empty;
+                for (t.ldflags) |l| try xl.appendSlice(a, &.{ "-Xlinker", l });
+                if (t.libraries.len > 0) try w.writeAll(", ");
+                try w.writeAll(".unsafeFlags(");
+                try swiftStringList(w, xl.items);
+                try w.writeByte(')');
+            }
+            try w.writeByte(']');
+        }
+        try w.writeAll("\n        ),\n");
+    }
+    try w.writeAll("    ]\n)\n");
+    return b.written();
+}
+
 pub fn genXtool(a: Allocator, t: Target) !void {
     try genMetadata(a, t);
     const yml = try t.path(a, "xtool.yml");
@@ -274,7 +349,14 @@ pub fn genMetadata(a: Allocator, t: Target) !void {
     }
 }
 
-pub fn generate(a: Allocator, tc: *const Toolchain, t: Target, opts: Options) !void {
+pub fn generate(a: Allocator, tc: *const Toolchain, all: []const Target, t: Target, opts: Options) !void {
+    if (t.type == .@"test") {
+        if (opts.compile_commands and t.compile_commands) {
+            const path = try t.path(a, "compile_commands.json");
+            report(path, try fsutil.writeIfChanged(a, path, try @import("hosttest.zig").compileCommandsJson(a, tc, all, t)));
+        }
+        return;
+    }
     if (t.builder == .xtool) try genXtool(a, t);
     if (opts.xcodeproj and t.xcodeproj) {
         try genXcodeMetadata(a, t);
@@ -373,4 +455,39 @@ test "xtool.yml passes plain resources through verbatim" {
     try std.testing.expect(xtoolCompiledResource("Assets/Assets.xcassets"));
     try std.testing.expect(xtoolCompiledResource("Base.lproj/Main.storyboard"));
     try std.testing.expect(!xtoolCompiledResource("Assets/en.lproj"));
+}
+
+test "Package.swift for a host test target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try config.parse(a, "targets:\n  - name: Core\n    type: static\n    frameworks: [Foundation]\n    defines: [FAST, LEVEL=2]\n    swiftflags: [-warnings-as-errors]\n  - name: CoreTests\n    type: test\n    link: [Core]\n    swift_version: \"6.0\"\n    libraries: [m]\n", "/p/idlproj.yml");
+    try std.testing.expectEqualStrings(
+        \\// swift-tools-version: 6.0
+        \\// Generated by idl from idlproj.yml for `idl test`; edit idlproj.yml instead.
+        \\import PackageDescription
+        \\
+        \\let package = Package(
+        \\    name: "CoreTests",
+        \\    targets: [
+        \\        .target(
+        \\            name: "Core",
+        \\            dependencies: [],
+        \\            path: "Sources/Core",
+        \\            swiftSettings: [.swiftLanguageMode(.v5), .define("FAST"), .unsafeFlags(["-warnings-as-errors"])]
+        \\        ),
+        \\        .testTarget(
+        \\            name: "CoreTests",
+        \\            dependencies: ["Core"],
+        \\            path: "Tests/CoreTests",
+        \\            swiftSettings: [.swiftLanguageMode(.v6)],
+        \\            linkerSettings: [.linkedLibrary("m")]
+        \\        ),
+        \\    ]
+        \\)
+        \\
+    , try testPackageSwift(a, "CoreTests", &.{
+        .{ .target = cfg.targets[0], .path = "Sources/Core", .deps = &.{} },
+        .{ .target = cfg.targets[1], .path = "Tests/CoreTests", .deps = &.{"Core"}, .tests = true },
+    }));
 }

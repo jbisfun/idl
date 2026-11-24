@@ -3,7 +3,8 @@
 #
 #   zig build                      # builds ./zig-out/bin/idl
 #   ./zig-out/bin/idl check        # verify toolchain
-#   ./zig-out/bin/idl build        # build every target below
+#   ./zig-out/bin/idl build        # build every target below (except test targets)
+#   ./zig-out/bin/idl test         # app bundle checks + host unit tests (type: test)
 #   ./zig-out/bin/idl gen          # regenerate .xcodeproj / xtool.yml / Package.swift
 
 toolchain:
@@ -73,3 +74,33 @@ targets:
       UISupportedInterfaceOrientations: ["UIInterfaceOrientationPortrait"]
     frameworks: [UIKit]
     configuration: release
+
+  # Host-portable code (Foundation only) shared by apps as a static module,
+  # and its unit tests: `idl test` builds both for Linux and runs XCTest and
+  # swift-testing through a generated SwiftPM package.
+  - name: CalcCore
+    type: static
+    dir: examples/swift-tests/Core
+    sources: [Sources]
+    frameworks: [Foundation]
+    swift_version: "5.0"
+
+  - name: CalcCoreTests
+    type: test
+    dir: examples/swift-tests/Tests
+    sources: [Sources]
+    link: [CalcCore]
+
+  # A C library and a plain C test executable (exit status 0 = pass).
+  - name: MathUtil
+    type: static
+    dir: examples/c-tests/Lib
+    sources: [Sources]
+    include_dirs: [include]
+    frameworks: []
+
+  - name: MathUtilTests
+    type: test
+    dir: examples/c-tests/Tests
+    sources: [Sources]
+    link: [MathUtil]

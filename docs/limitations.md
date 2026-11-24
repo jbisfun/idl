@@ -150,7 +150,7 @@ binary because AssetKit is a Swift library.
   Darwin SDK, ldid and xtool yourself. `idl check` lists what is missing.
   `idl-actool` is built from this repository with `zig build actool`.
 
-## Configuration parsing (zig-yaml 0.1.x)
+## Configuration parsing (zig-yaml)
 
 `idl` uses the subset of YAML that config files need. Known issues with the
 library:

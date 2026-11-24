@@ -40,7 +40,8 @@ pub const Toolchain = struct {
         }) |entry| if (env.get(entry[0]) == null) {
             const value = if (sys.run(a, entry[1], .{})) |r|
                 (if (sys.succeeded(r.term)) std.mem.trim(u8, r.stdout, " \n\r") else "unknown")
-            else |_| "unknown";
+            else |_|
+                "unknown";
             try env.put(entry[0], value);
         };
 
@@ -166,7 +167,7 @@ pub const Toolchain = struct {
             },
             // Extensions live in <app>/PlugIns/<name>.appex and load the app's frameworks.
             .appex => try f.appendSlice(t.a, &.{ "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../Frameworks", "-Xlinker", "-application_extension" }),
-            .app, .static => {},
+            .app, .static, .@"test" => {},
         }
         if (target.dead_strip) try f.appendSlice(t.a, &.{ "-Xlinker", "-dead_strip" });
         for (target.ldflags) |l| try f.appendSlice(t.a, &.{ "-Xlinker", l });
@@ -175,7 +176,7 @@ pub const Toolchain = struct {
     pub fn clangLink(t: *const Toolchain, target: config.Target, objects: []const []const u8, out: []const u8, need_cxx: bool) ![]const []const u8 {
         var f: std.ArrayList([]const u8) = .empty;
         try f.appendSlice(t.a, &.{
-            if (need_cxx) t.cxx orelse t.cc.? else t.cc.?, "-target",                                               try t.triple(target), "-isysroot", t.sdk.?,
+            if (need_cxx) t.cxx orelse t.cc.? else t.cc.?, "-target",                                               try t.triple(target),               "-isysroot",  t.sdk.?,
             "-fuse-ld=lld",                                try std.fmt.allocPrint(t.a, "--ld-path={s}", .{t.ld64}), "-Wl,-headerpad_max_install_names", t.clang_rt.?,
         });
         if (target.type == .framework or target.type == .dylib) try f.append(t.a, "-dynamiclib");

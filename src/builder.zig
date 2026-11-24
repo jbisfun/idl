@@ -83,7 +83,7 @@ fn commandKeyProbe(c: Ctx, argv: []const []const u8, probe: bool) ![]const u8 {
 }
 
 /// Dependencies listed in a Makefile-style depfile written by `clang -MMD`.
-fn depfileInputs(a: Allocator, text: []const u8) ![]const []const u8 {
+pub fn depfileInputs(a: Allocator, text: []const u8) ![]const []const u8 {
     var deps: std.ArrayList([]const u8) = .empty;
     // First rule only: join backslash-continued lines.
     var rule: std.ArrayList(u8) = .empty;
@@ -116,7 +116,7 @@ fn depfileInputs(a: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 /// True if `output` exists, was produced by exactly `cmd`, and is newer than every input.
-fn upToDate(a: Allocator, output: []const u8, cmd: []const u8, inputs: []const []const u8, cwd: []const u8) !bool {
+pub fn upToDate(a: Allocator, output: []const u8, cmd: []const u8, inputs: []const []const u8, cwd: []const u8) !bool {
     const out_time = mtime(output) orelse return false;
     const stamp = try std.fmt.allocPrint(a, "{s}.cmd", .{output});
     const old = sys.readFile(a, stamp, 1 << 20) catch return false;
@@ -129,7 +129,7 @@ fn upToDate(a: Allocator, output: []const u8, cmd: []const u8, inputs: []const [
     return true;
 }
 
-fn writeStamp(a: Allocator, output: []const u8, cmd: []const u8) !void {
+pub fn writeStamp(a: Allocator, output: []const u8, cmd: []const u8) !void {
     try sys.cwd().writeFile(sys.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.cmd", .{output}), .data = cmd });
 }
 
@@ -262,7 +262,7 @@ fn resolveDeps(c: Ctx) !Deps {
                 try objects.appendSlice(a, p.objects);
                 try inputs.appendSlice(a, p.objects);
             },
-            .app, .appex => unreachable, // rejected by config validation
+            .app, .appex, .@"test" => unreachable, // rejected by config validation
         }
         if (p.module_dir) |d| {
             try swift_flags.appendSlice(a, &.{ "-I", d });
@@ -289,10 +289,10 @@ const SwiftOut = struct { obj: []const u8, module_dir: ?[]const u8, header_dir: 
 /// Intents metadata processor (Xcode's SWIFT_EMIT_CONST_VALUE_PROTOCOLS).
 /// Refinements such as WidgetConfigurationIntent are found through AppIntent.
 const app_intents_protocols = [_][]const u8{
-    "AppIntent",                 "EntityQuery",                    "AppEntity",
-    "TransientEntity",           "AppEnum",                        "AppShortcutProviding",
-    "AppShortcutsProvider",      "AnyResolverProviding",           "AppIntentsPackage",
-    "DynamicOptionsProvider",    "_IntentValueRepresentable",      "_AssistantIntentsProvider",
+    "AppIntent",                      "EntityQuery",               "AppEntity",
+    "TransientEntity",                "AppEnum",                   "AppShortcutProviding",
+    "AppShortcutsProvider",           "AnyResolverProviding",      "AppIntentsPackage",
+    "DynamicOptionsProvider",         "_IntentValueRepresentable", "_AssistantIntentsProvider",
     "_GenerativeFunctionExtractable", "IntentValueQuery",
 };
 
@@ -342,15 +342,15 @@ fn extractAppIntents(c: Ctx, tool: []const u8, linked: []const u8, swift: []cons
     _ = try fsutil.writeIfChanged(a, source_list, try std.mem.concat(a, u8, &.{ try std.mem.join(a, "\n", sources), "\n" }));
     _ = try fsutil.writeIfChanged(a, const_list, try std.mem.concat(a, u8, &.{ try std.mem.join(a, "\n", const_files), "\n" }));
     const argv = [_][]const u8{
-        tool,                  "--output",              out_dir,
-        "--toolchain-dir",     try c.tc.xcodeToolchainDir(), "--module-name",
-        t.name,                "--sdk-root",            c.tc.sdk.?,
-        "--xcode-version",     c.tc.xcodeBuildVersion(), "--platform-family",
-        "iOS",                 "--deployment-target",   t.min_ios,
-        "--target-triple",     try c.tc.triple(t),      "--binary-file",
-        linked,                "--bundle-identifier",   t.bundle_id,
-        "--source-file-list",  source_list,             "--swift-const-vals-list",
-        const_list,            "--compile-time-extraction", "--force",
+        tool,                 "--output",                   out_dir,
+        "--toolchain-dir",    try c.tc.xcodeToolchainDir(), "--module-name",
+        t.name,               "--sdk-root",                 c.tc.sdk.?,
+        "--xcode-version",    c.tc.xcodeBuildVersion(),     "--platform-family",
+        "iOS",                "--deployment-target",        t.min_ios,
+        "--target-triple",    try c.tc.triple(t),           "--binary-file",
+        linked,               "--bundle-identifier",        t.bundle_id,
+        "--source-file-list", source_list,                  "--swift-const-vals-list",
+        const_list,           "--compile-time-extraction",  "--force",
     };
     const key = try commandKeyProbe(c, &argv, false);
     const stamp = try std.Io.Dir.path.join(a, &.{ obj_dir, "appintents.extract" });
@@ -672,7 +672,7 @@ fn buildDirect(c: Ctx) !Product {
         .dylib => p.bundle = try assembleDylib(c, linked, build_dir),
         .framework, .appex => p.bundle = try assembleBundle(c, linked, build_dir, intents),
         .app => p.ipa = try assembleBundle(c, linked, build_dir, intents),
-        .static => unreachable,
+        .static, .@"test" => unreachable,
     }
     return p;
 }
@@ -896,6 +896,7 @@ fn buildXtool(c: Ctx) ![]const u8 {
 }
 
 pub fn build(a: Allocator, tc: *Toolchain, t: Target, opts: Options) !Product {
+    if (t.type == .@"test") return diag.fail("'{s}' is a test target; `idl test` builds it for the host", .{t.name});
     var session: ?Session = if (!opts.locked) try prepareAll(a, tc, &.{t}, opts.strict, opts.verbose) else null;
     defer if (session) |*s| s.release();
     var options = opts;

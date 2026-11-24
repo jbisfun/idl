@@ -188,7 +188,7 @@ pub const Generator = struct {
         var buf: [24]u8 = undefined;
         const id = try g.a.dupe(u8, objectId(&buf, @tagName(section), key));
         const c = try safeComment(g.a, comment);
-        try g.objects[@intFromEnum(section)].append(g.a, .{ .id = id, .comment = c, .body = body });
+        try g.objects[@backingInt(section)].append(g.a, .{ .id = id, .comment = c, .body = body });
         try g.comments.put(g.a, id, c);
         return id;
     }
@@ -383,7 +383,7 @@ pub const Generator = struct {
             "{{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {s};\n\t\t\tbuildPhases = (\n\t\t\t\t{s},\n\t\t\t\t{s},\n\t\t\t\t{s},\n\t\t\t);\n\t\t\tbuildRules = ();\n\t\t\tdependencies = ();\n\t\t\tname = {s};\n\t\t\tproductName = {s};\n\t\t\tproductReference = {s};\n\t\t\tproductType = \"com.apple.product-type.application\";\n\t\t}}",
             .{ try g.ref(target_configs), try g.ref(sources_phase), try g.ref(frameworks_phase), try g.ref(resources_phase), try quote(a, g.m.name), try quote(a, g.m.name), try g.ref(product_ref) },
         );
-        try g.objects[@intFromEnum(Section.PBXNativeTarget)].append(a, .{ .id = g.target_id, .comment = g.m.name, .body = target_body });
+        try g.objects[@backingInt(Section.PBXNativeTarget)].append(a, .{ .id = g.target_id, .comment = g.m.name, .body = target_body });
         try g.comments.put(a, g.target_id, g.m.name);
 
         const project_body = try std.fmt.allocPrint(
@@ -391,7 +391,7 @@ pub const Generator = struct {
             "{{\n\t\t\tisa = PBXProject;\n\t\t\tattributes = {{\n\t\t\t\tBuildIndependentTargetsInParallel = 1;\n\t\t\t\tLastSwiftUpdateCheck = 1600;\n\t\t\t\tLastUpgradeCheck = 1600;\n\t\t\t}};\n\t\t\tbuildConfigurationList = {s};\n\t\t\tcompatibilityVersion = \"Xcode 14.0\";\n\t\t\tdevelopmentRegion = en;\n\t\t\thasScannedForEncodings = 0;\n\t\t\tknownRegions = (en, Base);\n\t\t\tmainGroup = {s};\n\t\t\tproductRefGroup = {s};\n\t\t\tprojectDirPath = \"\";\n\t\t\tprojectRoot = \"\";\n\t\t\ttargets = (\n\t\t\t\t{s} /* {s} */ ,\n\t\t\t);\n\t\t}}",
             .{ try g.ref(project_configs), try g.ref(main_group), try g.ref(products_group), g.target_id, g.m.name },
         );
-        try g.objects[@intFromEnum(Section.PBXProject)].append(a, .{ .id = g.project_id, .comment = "Project object", .body = project_body });
+        try g.objects[@backingInt(Section.PBXProject)].append(a, .{ .id = g.project_id, .comment = "Project object", .body = project_body });
         try g.comments.put(a, g.project_id, "Project object");
         return g.render();
     }
@@ -429,7 +429,7 @@ pub const Generator = struct {
         try w.writeAll("// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {};\n\tobjectVersion = 56;\n\tobjects = {\n\n");
         for (&g.objects, 0..) |*list, i| {
             if (list.items.len == 0) continue;
-            const name = @tagName(@as(Section, @enumFromInt(i)));
+            const name = @tagName(@as(Section, @fromBackingInt(@intCast(i))));
             std.mem.sort(Object, list.items, {}, struct {
                 fn lt(_: void, l: Object, r: Object) bool {
                     return switch (std.mem.order(u8, l.comment, r.comment)) {

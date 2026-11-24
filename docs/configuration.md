@@ -196,8 +196,8 @@ before each xtool build. `.idl/` is disposable and should be gitignored.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `type` | `app` | `app`, `framework`, `dylib`, `appex` or `static` |
-| `link` | `[]` | project `framework`/`dylib`/`static` targets to link against |
+| `type` | `app` | `app`, `framework`, `dylib`, `appex`, `static` or `test` |
+| `link` | `[]` | project `framework`/`dylib`/`static` targets to link against (`test` targets: `static` only) |
 | `embed` | `[]` | apps only: project `framework`/`dylib`/`appex` targets to copy into the bundle |
 | `post_build` | `[]` | apps only: command (argv list) or list of commands run in order after the IPA is built and verified; skip with `idl build --no-post-build` |
 
@@ -219,6 +219,8 @@ first. Cycles are an error. Each kind produces:
 - `static`: compiled objects plus `<name>.swiftmodule` and `<name>-Swift.h`. A
   linking target receives the objects in its link, `-I` for the module, and the
   header dir. Not signed. No `bundle_id`.
+- `test`: unit tests for the Linux host, built and run only by `idl test` (see
+  [tests](#host-test-targets-type-test)). `idl build` skips them.
 
 Swift in non-app targets is compiled with `-parse-as-library` and module name
 `<name>`. `post_build` runs in the target directory with `IDL_IPA`, `IDL_APP`,
@@ -294,8 +296,87 @@ checks each app's built bundle:
   `NSExtension`/`EXAppExtensionAttributes`.
 
 After the checks, the `tests:` commands run in the target directory with
-`IDL_IPA`, `IDL_APP`, `IDL_BUILD_DIR`, `IDL_TARGET` and `IDL` set. Output is
-one PASS/FAIL line per check or command, then a summary.
+`IDL_IPA`, `IDL_APP`, `IDL_BUILD_DIR`, `IDL_TARGET` and `IDL` set.
+
+#### Host test targets (`type: test`)
+
+iOS binaries cannot run on Linux and the iPhoneOS SDK has no XCTest, so a
+`type: test` target is compiled for and run on the Linux host, together with
+the `static` targets it `link`s (transitively):
+
+```yaml
+  - name: CalcCore            # code under test; also linked into apps
+    type: static
+    dir: Core
+    sources: [Sources]
+    frameworks: [Foundation]  # tested code must be host-portable
+  - name: CalcCoreTests
+    type: test
+    dir: Tests
+    sources: [Sources]        # the test files
+    link: [CalcCore]          # static targets under test
+```
+
+- Swift: idl writes a SwiftPM package to `<build_dir>/test/<name>/` (one
+  library target per tested static target, named after it, and one test
+  target) and runs `swift build --build-tests` and `swift test` with the
+  `swift` next to `toolchain.swiftc`. SwiftPM discovers XCTest and
+  swift-testing tests; `@testable import CalcCore` works. SwiftPM does not
+  accept target paths outside the package and idl does not create symlinks,
+  so the sources are copied into the package (only changed files are
+  rewritten); paths in compiler and test output point back at the original
+  files. Carried over per target: `swift_version` (language mode), `defines`
+  without `=`, `include_dirs`, `quote_include_dirs`, `swiftflags`,
+  `libraries` and `ldflags`. Without `-c` or with `-c debug` SwiftPM builds
+  debug; `-c release` builds release with `-enable-testing`.
+- C, C++ (Objective-C only with a host runtime): host `toolchain.cc`/`cxx`
+  compiles the test sources and the tested static targets' sources (each with
+  its own `opt`, `defines`, `include_dirs`, `quote_include_dirs`, `cflags`;
+  the tests also get the tested targets' `include_dirs`) into
+  `<build_dir>/test/<name>/<name>`, links `libraries`/`ldflags`, and runs it
+  in the target directory. Exit status 0 is a pass. Incremental like direct
+  builds.
+- One language per target: Swift tests link Swift static targets, C-family
+  tests link C-family ones.
+- `frameworks` may only name Foundation, FoundationEssentials,
+  FoundationNetworking, FoundationXML, Dispatch, XCTest or Testing; the same
+  applies to every static target a test target links. UIKit or SwiftUI code
+  cannot be tested on the host. Test targets do not inherit `frameworks` from
+  `defaults:`.
+- Test targets need no `bundle_id`. Not allowed on them: `builder: xtool`,
+  `xcodeproj`, `post_build`, `tests:`, `embed`, resources, Info.plist,
+  entitlements, `weak_frameworks`, `framework_dirs`, `bridging_header`.
+  Nothing may `link` or `embed` a test target. `configurations:` and the
+  `-c` output directories work as for other targets.
+- `idl gen` writes `compile_commands.json` with host flags for test targets
+  (when `compile_commands: true`). `idl clean` removes `<build_dir>`.
+  `idl lint` skips test targets; `idl fmt` formats them. `idl build`,
+  `idl lint`, `idl install` and `idl xcodeproj` reject an explicitly named
+  test target.
+
+`idl test` with no target names checks every app and runs every test target;
+names select apps and/or test targets. `--no-build` runs the existing outputs
+(`swift test --skip-build`, the existing executable).
+
+Output (stdout) has one result line per app check, `tests:` command and test
+target, then a summary; tool output and `==>` progress lines come between:
+
+```
+PASS <app> bundle checks
+FAIL <app> bundle checks (<n> error(s))   # or "(error)": bundle missing/unreadable
+PASS <app>: <command and arguments>
+FAIL <app>: <command and arguments>
+PASS <test target> tests
+FAIL <test target> tests (build failed)
+FAIL <test target> tests (exit code <n>)
+FAIL <test target> tests (error)          # configuration or missing tool; message on stderr
+
+<passed> passed, <failed> failed
+```
+
+Exit status: 0 when everything passed, 1 when anything failed (stderr ends
+with `error: tests failed`) or the project could not be loaded, 2 for usage
+errors.
 
 Tool paths can be set under `toolchain:` as `clang_format`, `clang_tidy` and
 `swift_format` (swift-format ships with the swiftly toolchain). A missing

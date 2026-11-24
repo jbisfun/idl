@@ -13,6 +13,7 @@ const ynode = @import("ynode.zig");
 const plist = @import("plist.zig");
 const macho = @import("macho.zig");
 const builder = @import("builder.zig");
+const hosttest = @import("hosttest.zig");
 const codegen = @import("codegen.zig");
 const Toolchain = @import("toolchain.zig").Toolchain;
 
@@ -686,7 +687,7 @@ pub fn lint(a: Allocator, tc: *Toolchain, root: []const u8, targets: []const Tar
 
 // ------------------------------------------------------------------ test
 
-pub const TestOptions = struct { verbose: bool = false };
+pub const TestOptions = struct { verbose: bool = false, no_build: bool = false };
 
 const Issue = struct { severity: Severity, msg: []const u8 };
 
@@ -877,9 +878,11 @@ fn checkApp(a: Allocator, tc: *Toolchain, t: Target, app: []const u8) ![]const I
     return b.issues.items;
 }
 
-/// Bundle checks for each app's built Payload, then its `tests:` commands.
-/// The targets must already be built.
-pub fn runTests(a: Allocator, tc: *Toolchain, apps: []const Target, opts: TestOptions) !bool {
+/// Bundle checks for each app's built Payload, then its `tests:` commands,
+/// then each host test target (built and run here). The apps must already be
+/// built. Prints one `PASS <target> ...` / `FAIL <target> ...` line per check
+/// and a final `<n> passed, <m> failed` line.
+pub fn runTests(a: Allocator, tc: *Toolchain, all: []const Target, apps: []const Target, test_targets: []const Target, opts: TestOptions) !bool {
     var stdout_w = sys.stdoutWriter();
     const w = &stdout_w.interface;
     var failed: usize = 0;
@@ -888,8 +891,20 @@ pub fn runTests(a: Allocator, tc: *Toolchain, apps: []const Target, opts: TestOp
         const build_dir = try t.buildPath(a);
         const app = try std.fmt.allocPrint(a, "{s}/Payload/{s}.app", .{ build_dir, t.name });
         diag.info("==> {s}: bundle checks", .{t.name});
-        if (fsutil.kind(app) != .dir) return diag.fail("{s} does not exist; build {s} first", .{ app, t.name });
-        const issues = try checkApp(a, tc, t, app);
+        // A missing or unreadable bundle fails this app and moves on, so every
+        // selected target gets a PASS/FAIL line.
+        const issues = (if (fsutil.kind(app) != .dir)
+            diag.fail("{s} does not exist; build {s} first", .{ app, t.name })
+        else
+            checkApp(a, tc, t, app)) catch |err| switch (err) {
+            error.Invalid => {
+                sys.stderrPrint("error: {s}\n", .{diag.msg});
+                failed += 1;
+                try w.print("FAIL {s} bundle checks (error)\n", .{t.name});
+                continue;
+            },
+            else => return err,
+        };
         var errors: usize = 0;
         for (issues) |i| {
             try w.print("  {s}: {s}\n", .{ @tagName(i.severity), i.msg });
@@ -923,6 +938,31 @@ pub fn runTests(a: Allocator, tc: *Toolchain, apps: []const Target, opts: TestOp
             };
             if (ok) passed += 1 else failed += 1;
             try w.print("{s} {s}: {s}\n", .{ if (ok) "PASS" else "FAIL", t.name, label });
+        }
+    }
+    for (test_targets) |t| {
+        const result = hosttest.run(a, tc, all, t, .{ .verbose = opts.verbose, .no_build = opts.no_build }) catch |err| switch (err) {
+            error.Invalid => {
+                sys.stderrPrint("error: {s}\n", .{diag.msg});
+                failed += 1;
+                try w.print("FAIL {s} tests (error)\n", .{t.name});
+                continue;
+            },
+            else => return err,
+        };
+        switch (result) {
+            .passed => {
+                passed += 1;
+                try w.print("PASS {s} tests\n", .{t.name});
+            },
+            .build_failed => {
+                failed += 1;
+                try w.print("FAIL {s} tests (build failed)\n", .{t.name});
+            },
+            .failed => |code| {
+                failed += 1;
+                try w.print("FAIL {s} tests (exit code {d})\n", .{ t.name, code });
+            },
         }
     }
     try w.print("\n{d} passed, {d} failed\n", .{ passed, failed });

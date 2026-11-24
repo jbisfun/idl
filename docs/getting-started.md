@@ -4,7 +4,7 @@
 
 | Tool | Purpose | Install |
 | --- | --- | --- |
-| Zig 0.14.1 | builds `idl` | distro package or ziglang.org |
+| Zig 0.17.1 | builds `idl` | distro package or ziglang.org |
 | Swift toolchain (clang, clang++, swiftc) | compiles for `arm64-apple-ios` | [swiftly](https://www.swift.org/install/linux/) |
 | xtool + Darwin SDK | iPhoneOS SDK, `ld64.lld`, compiler-rt, Swift resources | [xtool](https://github.com/xtool-org/xtool), then `xtool setup` |
 | ldid | ad-hoc signing | [ProcursusTeam/ldid](https://github.com/ProcursusTeam/ldid) release binary or distro package |
@@ -22,8 +22,11 @@ Mach-O files and handles plists (with libplist) itself.
 
 `zig build` downloads its dependencies, which are pinned in `build.zig.zon`:
 
-- [zig-clap](https://github.com/Hejsil/zig-clap) 0.10.0: command-line parsing
-- [zig-yaml](https://github.com/kubkon/zig-yaml) 0.1.1: `idlproj.yml` parsing
+- [zig-clap](https://github.com/Hejsil/zig-clap) 0.12.0: command-line parsing
+- [zig-yaml](https://github.com/kubkon/zig-yaml) 0.3.0: `idlproj.yml` parsing
+  (upstream has no Zig 0.17 release yet; pinned to the
+  [siketyan/zig-yaml](https://github.com/siketyan/zig-yaml) `zig-0.17.0` port of upstream `main`)
+- [zig-xml](https://github.com/ianprime0509/zig-xml) 0.2.2: Interface Builder documents
 - [libplist](https://github.com/libimobiledevice/libplist) 2.8.1: property
   lists. It is fetched from git and compiled from C source by `build.zig`.
 
